@@ -1,0 +1,39 @@
+# External data-source endpoints. Everything the harvester calls is templated
+# here so an upstream change is a config edit, not a code change.
+#
+# Template variables: {tournament_id} {season_id} {round} {page} {event_id} {league_id} {match_id}
+
+[sofascore]
+base_url = "https://api.sofascore.com"
+# Undocumented Serie C unique-tournament ids (Girone A / B / C).
+tournament_ids = { A = 141, B = 142, C = 143 }
+seasons = "/api/v1/unique-tournament/{tournament_id}/seasons"
+rounds = "/api/v1/unique-tournament/{tournament_id}/season/{season_id}/rounds"
+events_by_round = "/api/v1/unique-tournament/{tournament_id}/season/{season_id}/events/round/{round}"
+events_last = "/api/v1/unique-tournament/{tournament_id}/season/{season_id}/events/last/{page}"
+events_next = "/api/v1/unique-tournament/{tournament_id}/season/{season_id}/events/next/{page}"
+event_statistics = "/api/v1/event/{event_id}/statistics"
+# statistic keys inside statistics[].groups[].statisticsItems[].key
+[sofascore.stat_keys]
+shots = ["totalShotsOnGoal", "shots", "Total shots"]
+shots_target = ["shotsOnGoal", "Shots on target"]
+corners = ["cornerKicks", "Corner kicks"]
+xg = ["expectedGoals", "Expected goals"]
+
+[fotmob]
+base_url = "https://www.fotmob.com"
+# FotMob league ids are not stable across seasons: leave 0 and the harvester
+# resolves them at runtime from `all_leagues` (name match on "Serie C").
+league_ids = { A = 0, B = 0, C = 0 }
+all_leagues = "/api/allLeagues"
+league = "/api/leagues?id={league_id}&tab=matches&type=league"
+match_details = "/api/matchDetails?matchId={match_id}"
+
+[http]
+timeout_seconds = 20.0
+max_retries = 5
+backoff_base_seconds = 1.0
+backoff_max_seconds = 60.0
+max_concurrency = 4
+min_delay_seconds = 0.4
+cache_ttl_hours = 6
