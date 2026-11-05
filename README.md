@@ -73,8 +73,9 @@ python -m src.ingestion.harvester --gironi A B C --out data/processed/matches.cs
 # 4) pipeline sui dati reali con quote bookmaker in data/odds/*.csv
 python main.py --processed data/processed/matches.csv --fixtures data/processed/fixtures.csv --odds data/odds
 
-# 5) dashboard interattiva
+# 5) dashboard interattiva (usa data/processed se presente, altrimenti una lega simulata)
 streamlit run src/dashboard/app.py
+#    variabili utili: SERIEC_FORCE_SIMULATE=1  SERIEC_SIM_ROUNDS=15  SERIEC_SEED=7
 
 # test
 python -m pytest -q
@@ -89,7 +90,10 @@ con `market` in `1X2 | OU1.5 | OU2.5 | OU3.5 | GG/NG` e `selection` in `1,X,2 | 
 - **Dipendenza bassi punteggi**: τ(x,y,λ,μ,ρ) di Dixon–Coles su 0-0, 1-0, 0-1, 1-1.
 - **Ponderazione temporale**: w(t) = exp(−ξ·t), t in giorni dalla partita più recente (ξ default 0.0018).
 - **Identificabilità**: Σα = 0 per ciascun girone (vincolo di uguaglianza SLSQP, o riparametrizzazione con L-BFGS-B).
-- **Gradiente analitico** verificato numericamente nei test; penalità ridge opzionale per campioni piccoli.
+- **Gradiente analitico** verificato numericamente nei test.
+- **Prior gaussiana (stima MAP)** per campioni piccoli: `DixonColesConfig.with_gaussian_prior()` traduce deviazioni
+  standard a priori (α/β 0.30, γ 0.25 ± 0.15, ρ 0.10) in penalità ridge; la ridge su β è centrata per girone così il
+  livello medio dei gol non viene distorto. `main.py` la attiva sotto le 100 partite (`--prior auto|on|off`).
 - **Mercati**: 1X2, Over/Under 1.5-2.5-3.5, Goal/No Goal dalla matrice congiunta 11×11.
 - **Valore**: de-vigging proporzionale (anche power e Shin), EV = P·quota − 1, Kelly frazionario (1/8 o 1/4),
   filtro `REGRESSION_TRAP` (GA ≤ 1 nelle ultime 3 gare ma xGA ≥ 3.5 cumulato).
