@@ -25,6 +25,7 @@ Formulas
 from __future__ import annotations
 
 import math
+import numbers
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field
 from datetime import date, datetime
@@ -148,6 +149,9 @@ _TRAPS_FRAME_DTYPES: Final[dict[str, str]] = {
 _FAIR_BOOK_TOL: Final[float] = 1e-12
 #: Decimal places at which binary floating-point noise is absorbed before rounding stakes.
 _STAKE_NOISE_PLACES: Final[Decimal] = Decimal("1e-9")
+#: Decimal places at which a window xG-against sum is read before it is compared with the
+#: threshold (xG feeds carry 2 decimals; ``0.01 + 2.01 + 1.48`` must read as ``3.5``, not ``3.4999999999999996``).
+_XGA_SUM_PLACES: Final[int] = 6
 
 
 # ----------------------------------------------------------------------------- validation helpers
@@ -191,6 +195,22 @@ def _validate_method(method: str) -> str:
     if text not in DEVIG_METHODS:
         raise ValueError(f"unknown de-vig method {method!r}; choose one of {DEVIG_METHODS}")
     return text
+
+
+def _coerce_finite_real(value: Any, name: str) -> float:
+    """Return ``value`` as a finite ``float`` or raise ``ValueError``.
+
+    Accepts any :class:`numbers.Real` (``int``, ``float``, ``fractions.Fraction`` and the
+    numpy scalars ``np.int64`` / ``np.float32`` / ``np.float64`` that pandas-backed
+    configuration tables produce) and rejects booleans, NaN, infinities and anything
+    that is not a number (strings, ``None``, ``Decimal``...).
+    """
+    if isinstance(value, (bool, np.bool_)) or not isinstance(value, numbers.Real):
+        raise ValueError(f"{name} must be a finite number, got {value!r}")
+    out = float(value)
+    if not math.isfinite(out):
+        raise ValueError(f"{name} must be a finite number, got {value!r}")
+    return out
 
 
 def _coerce_date(value: date | datetime | pd.Timestamp | str) -> date:
@@ -346,10 +366,7 @@ class KellyConfig:
 
     def __post_init__(self) -> None:
         for name in ("fraction", "bankroll_units", "max_stake_units", "min_stake_units", "round_to"):
-            value = getattr(self, name)
-            if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(float(value)):
-                raise ValueError(f"KellyConfig.{name} must be a finite number, got {value!r}")
-            object.__setattr__(self, name, float(value))
+            object.__setattr__(self, name, _coerce_finite_real(getattr(self, name), f"KellyConfig.{name}"))
         if not (0.0 < self.fraction <= 1.0):
             raise ValueError(f"KellyConfig.fraction must satisfy 0 < fraction <= 1, got {self.fraction}")
         if self.bankroll_units <= 0.0:
@@ -544,7 +561,10 @@ def detect_regression_traps(
     For every team the last ``window`` matches by date (ties broken by
     ``match_id``) with ``date <= as_of`` are taken; a team qualifies only when it
     has exactly ``window`` such matches and the opponent's xG is known in all of
-    them. The result is sorted by ``severity`` descending (ties by team name).
+    them. The xG-against sum is rounded to 6 decimals before the ``>= min``
+    comparison (and stored rounded in :attr:`RegressionTrap.xg_against`) so a
+    window that sums exactly to the threshold in decimal is flagged. The result
+    is sorted by ``severity`` descending (ties by team name).
     Pure function: the input frame is never modified.
     """
     window = int(window)
@@ -575,6 +595,10 @@ def detect_regression_traps(
         girone=("girone", "last"),
         match_ids=("match_id", lambda s: tuple(str(m) for m in s)),
     )
+    # The window sum of 2-decimal xG values is a binary float (0.01 + 2.01 + 1.48 -> 3.4999999999999996):
+    # read it at _XGA_SUM_PLACES before comparing, and keep the rounded value so that the stored
+    # ``xg_against``, ``severity`` and ``description()`` agree with the threshold decision.
+    agg = agg.assign(xg_against=agg["xg_against"].round(_XGA_SUM_PLACES))
     eligible = (agg["n"] == window) & (agg["n_xg"] == window)
     flagged = eligible & (agg["goals_against"] <= max_goals_against) & (agg["xg_against"] >= float(min_xg_against))
     hits = agg.loc[flagged]

@@ -14,7 +14,16 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from src.common.schemas import SELECTIONS, Fixture, Girone, Market, MatchPrediction, OddsQuote
+from src.common.schemas import (
+    SELECTIONS,
+    Fixture,
+    Girone,
+    Market,
+    MatchPrediction,
+    MatchRecord,
+    OddsQuote,
+    matches_to_frame,
+)
 from src.engine.value import (
     DEVIG_METHODS,
     FLAG_LONGSHOT,
@@ -63,6 +72,45 @@ def _prediction(fixture: Fixture, lam: float, mu: float, rho: float) -> MatchPre
         probabilities=probs,
         fair_odds=fair,
     )
+
+
+def _synthetic_prediction(fixture: Fixture, probabilities: dict[Market, dict[str, float]]) -> MatchPrediction:
+    """A prediction whose market probabilities are chosen by hand (exact boundary cases)."""
+    for market, probs in probabilities.items():
+        assert set(probs) == set(SELECTIONS[market]) and math.isclose(sum(probs.values()), 1.0, abs_tol=1e-12)
+    fair = {m: {s: 1.0 / p for s, p in d.items()} for m, d in probabilities.items()}
+    return MatchPrediction(
+        fixture=fixture,
+        home_rate=1.3,
+        away_rate=1.1,
+        rho=-0.05,
+        matrix=dixon_coles_matrix(1.3, 1.1, -0.05),
+        probabilities=probabilities,
+        fair_odds=fair,
+    )
+
+
+def _three_match_window(team: str, xg_against: tuple[float, float, float], goals_against: tuple[int, int, int]) -> pd.DataFrame:
+    """Canonical frame where ``team`` plays exactly three matches conceding the given goals / xG."""
+    opponents = ("Trento", "Lecco", "Novara")
+    records: list[MatchRecord] = []
+    for i, (opp, xga, ga) in enumerate(zip(opponents, xg_against, goals_against)):
+        home = i != 1  # the middle match is away so both melt branches are exercised
+        records.append(
+            MatchRecord(
+                match_id=f"SYN-A-{i + 1:02d}",
+                date=date(2025, 9, 7) + timedelta(days=7 * i),
+                round=i + 1,
+                girone=Girone.A,
+                home_team=team if home else opp,
+                away_team=opp if home else team,
+                home_goals=2 if home else ga,
+                away_goals=ga if home else 2,
+                home_xg=1.9 if home else xga,
+                away_xg=xga if home else 1.9,
+            )
+        )
+    return matches_to_frame(records)
 
 
 def _predictions_from_truth(league: SimulatedLeague) -> list[MatchPrediction]:
@@ -159,6 +207,34 @@ class TestImpliedAndDevig:
         assert power["2"] < prop["2"]
         assert power["1"] > prop["1"]
 
+    @pytest.mark.parametrize("book", [ODDS, {"1": 1.3, "X": 5.5, "2": 9.0}, {"Over 2.5": 1.72, "Under 2.5": 2.05}])
+    def test_power_devig_solves_sum_of_q_to_the_k_equals_one(self, book: dict[str, float]) -> None:
+        # p_i = q_i ** k  =>  k = log(p_i) / log(q_i) must be the same for every selection ...
+        q = implied_probabilities(book)
+        p = devig(book, "power")
+        ks = [math.log(p[s]) / math.log(q[s]) for s in book]
+        assert max(ks) - min(ks) < 1e-9
+        k = ks[0]
+        # ... and that k is the root of the defining equation sum((1 / o_i) ** k) == 1, with k > 1 for an over-round book
+        assert math.fsum((1.0 / o) ** k for o in book.values()) == pytest.approx(1.0, abs=1e-9)
+        assert k > 1.0
+        if book is self.ODDS:
+            assert k == pytest.approx(1.0618997401771182, abs=1e-9)
+
+    def test_power_differs_from_shin_on_an_unbalanced_book(self) -> None:
+        book = {"1": 1.3, "X": 5.5, "2": 9.0}
+        power = devig(book, "power")
+        shin = devig(book, "shin")
+        prop = devig(book, "proportional")
+        assert max(abs(power[s] - shin[s]) for s in book) > 1e-3
+        # hard-coded reference values (k = 1.0876096588821311 for the power method)
+        assert power["1"] == pytest.approx(0.7517511644113969, abs=1e-9)
+        assert shin["1"] == pytest.approx(0.7422563047551191, abs=1e-9)
+        # on this book the power method compresses the longshots harder than Shin, both more than proportional
+        assert power["1"] > shin["1"] > prop["1"]
+        assert power["X"] < shin["X"] < prop["X"]
+        assert power["2"] < shin["2"] < prop["2"]
+
     @pytest.mark.parametrize("method", DEVIG_METHODS)
     @pytest.mark.parametrize(
         "bad",
@@ -231,6 +307,31 @@ class TestExpectedValueAndKelly:
         with pytest.raises(ValueError):
             KellyConfig(bankroll_units=0.0)
 
+    def test_kelly_config_accepts_numpy_scalars(self) -> None:
+        cfg = KellyConfig(
+            fraction=np.float32(0.125),
+            bankroll_units=np.int64(100),
+            max_stake_units=np.int64(3),
+            min_stake_units=np.float64(0.1),
+            round_to=np.float64(0.1),
+        )
+        for name in ("fraction", "bankroll_units", "max_stake_units", "min_stake_units", "round_to"):
+            assert type(getattr(cfg, name)) is float
+        assert cfg.fraction == 0.125 and cfg.bankroll_units == 100.0 and cfg.max_stake_units == 3.0
+        assert stake_units(0.55, 2.0, cfg) == stake_units(0.55, 2.0, KellyConfig())
+        assert KellyConfig(fraction=np.float64(0.25)).fraction == KELLY_QUARTER
+        assert KellyConfig(max_stake_units=5).max_stake_units == 5.0
+
+    @pytest.mark.parametrize(
+        "bad",
+        [True, False, np.bool_(True), math.nan, np.float64("nan"), math.inf, -math.inf, np.float32("inf"), "0.125", None, [0.125], 0.125j],
+        ids=repr,
+    )
+    @pytest.mark.parametrize("name", ["fraction", "bankroll_units", "max_stake_units", "min_stake_units", "round_to"])
+    def test_kelly_config_rejects_bool_nan_inf_and_wrong_types(self, name: str, bad: object) -> None:
+        with pytest.raises(ValueError, match=f"KellyConfig.{name}"):
+            KellyConfig(**{name: bad})
+
     def test_stake_rounds_half_up_to_tenth(self) -> None:
         # kelly 0.10 * 0.125 * 100 = 1.25 -> documented rule: round half up -> 1.3
         assert stake_units(0.55, 2.0, KellyConfig(fraction=0.125)) == 1.3
@@ -289,16 +390,50 @@ class TestRegressionTraps:
         detect_regression_traps(trapped_matches)
         pd.testing.assert_frame_equal(trapped_matches, before)
 
-    def test_nan_opponent_xg_in_window_blocks_the_flag(self, trapped_matches: pd.DataFrame) -> None:
-        df = trapped_matches.copy()
+    def test_nan_opponent_xg_in_window_blocks_the_flag(self, league: SimulatedLeague) -> None:
+        # 6.0 xGA over the window (2.0 per match): after NaN-ing one match the two remaining
+        # ones still sum to 4.0 >= 3.5, so only the "xG known in every match" rule can exclude the team
+        intact = inject_regression_trap(league.matches, TRAP_TEAM, xga_total=6.0)
+        before = {t.team: t for t in detect_regression_traps(intact)}
+        assert TRAP_TEAM in before and before[TRAP_TEAM].xg_against == pytest.approx(6.0)
+        df = intact.copy()
         window_ids = _team_window_ids(df, TRAP_TEAM)
         row = df.index[df["match_id"] == window_ids[1]][0]
         column = "away_xg" if df.at[row, "home_team"] == TRAP_TEAM else "home_xg"
         df.loc[row, column] = np.nan
+        remaining = df.loc[df["match_id"].isin(window_ids)]
+        xga_known = np.where(remaining["home_team"] == TRAP_TEAM, remaining["away_xg"], remaining["home_xg"])
+        assert np.isnan(xga_known).sum() == 1 and np.nansum(xga_known) >= 3.5
         teams = {t.team for t in detect_regression_traps(df)}
         assert TRAP_TEAM not in teams
-        # sanity: the team is still detected on the untouched frame
-        assert TRAP_TEAM in {t.team for t in detect_regression_traps(trapped_matches)}
+        # the other traps are unaffected by the edit
+        assert teams == set(before) - {TRAP_TEAM}
+
+    def test_window_summing_exactly_to_the_threshold_in_decimal_is_flagged(self) -> None:
+        # 0.01 + 2.01 + 1.48 == 3.50 in decimal but 3.4999999999999996 as a binary float sum
+        xga = (0.01, 2.01, 1.48)
+        assert float(pd.Series(xga).sum()) < 3.5
+        df = _three_match_window(TRAP_TEAM, xga, goals_against=(1, 0, 0))
+        traps = {t.team: t for t in detect_regression_traps(df, min_xg_against=3.5)}
+        assert TRAP_TEAM in traps
+        trap = traps[TRAP_TEAM]
+        assert trap.xg_against == 3.5  # stored rounded, exactly the decimal sum
+        assert trap.goals_against == 1 and trap.window == 3
+        assert trap.severity == 2.5 and trap.xga_per_match == pytest.approx(3.5 / 3)
+        assert "3.50 xGA" in trap.description()
+        assert list(trap.match_ids) == ["SYN-A-01", "SYN-A-02", "SYN-A-03"]
+        # the opponents each played once: not eligible
+        assert set(traps) == {TRAP_TEAM}
+        # just above the decimal sum the window is (correctly) not flagged; one more goal conceded neither
+        assert detect_regression_traps(df, min_xg_against=3.500001) == []
+        assert detect_regression_traps(_three_match_window(TRAP_TEAM, xga, goals_against=(1, 1, 0))) == []
+
+    def test_injected_total_is_flagged_at_a_threshold_equal_to_the_total(self, trapped_matches: pd.DataFrame) -> None:
+        # inject_regression_trap(..., xga_total=4.2) writes 1.4 + 1.4 + 1.4, whose float sum is 4.199999999999999
+        traps = {t.team: t for t in detect_regression_traps(trapped_matches, min_xg_against=4.2)}
+        assert TRAP_TEAM in traps
+        assert traps[TRAP_TEAM].xg_against == 4.2
+        assert traps[TRAP_TEAM].severity == pytest.approx(3.2)
 
     def test_as_of_before_injected_matches_excludes_team(self, trapped_matches: pd.DataFrame) -> None:
         window_ids = _team_window_ids(trapped_matches, TRAP_TEAM)
@@ -411,6 +546,22 @@ class TestValueEngine:
             else:
                 assert o.stake_units == 0.0
 
+    def test_positive_ev_below_min_ev_has_zero_stake_despite_sizeable_kelly(self) -> None:
+        fx = Fixture("SYN-2", date(2025, 10, 12), 10, Girone.C, "Benevento", "Catania")
+        pred = _synthetic_prediction(fx, {Market.MATCH_ODDS: {"1": 0.52, "X": 0.28, "2": 0.20}})
+        quote = OddsQuote(fx.match_id, "SynBook", Market.MATCH_ODDS, {"1": 2.0, "X": 3.4, "2": 4.8})
+        eng = ValueEngine(min_ev=0.05)
+        home = {o.selection: o for o in eng.evaluate([pred], [quote])}["1"]
+        assert 0.0 < home.ev < eng.min_ev and home.ev == pytest.approx(0.04)
+        # full Kelly 0.04 -> 1/8 Kelly on 100 units = 0.5 units: a sizeable stake if it were a value bet
+        assert home.kelly_full == pytest.approx(0.04)
+        assert stake_units(home.p_model, home.book_odds, eng.kelly) == 0.5
+        assert home.value is False and FLAG_VALUE not in home.flags
+        assert home.stake_units == 0.0
+        # lowering min_ev below the EV turns the very same selection into a 0.5-unit value bet
+        relaxed = {o.selection: o for o in ValueEngine(min_ev=0.03).evaluate([pred], [quote])}["1"]
+        assert relaxed.value is True and relaxed.stake_units == 0.5
+
     def test_sorted_by_ev_desc(self, opportunities: list[ValueOpportunity]) -> None:
         evs = [o.ev for o in opportunities]
         assert evs == sorted(evs, reverse=True)
@@ -497,6 +648,60 @@ class TestValueEngine:
         # the trap is diagnostic: value/stake decisions are unchanged
         baseline = {(o.match_id, o.market, o.selection): (o.value, o.stake_units) for o in engine.evaluate(mini_predictions, mini.odds)}
         assert {(o.match_id, o.market, o.selection): (o.value, o.stake_units) for o in opps} == baseline
+
+    def test_trap_on_away_team_flags_goal_selections_and_unrelated_trap_flags_nothing(
+        self, engine: ValueEngine, mini_predictions: list[MatchPrediction], mini: SimulatedLeague
+    ) -> None:
+        fx = mini.fixtures[0]
+        involved = {fx.home_team, fx.away_team}
+        stranger = next(t for p in mini_predictions for t in (p.fixture.home_team, p.fixture.away_team) if t not in involved)
+        assert stranger not in involved
+        when = fx.date - timedelta(days=7)
+        away_trap = RegressionTrap.from_window(fx.away_team, fx.girone, 3, 0, 4.0, ("a", "b", "c"), when)
+        other_trap = RegressionTrap.from_window("Pro Patria", Girone.A, 3, 1, 5.0, ("d", "e", "f"), when)
+        opps = engine.evaluate(mini_predictions, mini.odds, traps=[away_trap, other_trap])
+        tagged = [o for o in opps if o.match_id == fx.match_id]
+        assert tagged
+        for o in tagged:
+            goals_side = o.selection.startswith("Over") or o.selection == "GG"
+            assert (FLAG_REGRESSION_TRAP in o.flags) == goals_side
+            assert (f"TRAP:{fx.away_team}" in o.flags) == goals_side
+            assert f"TRAP:{fx.home_team}" not in o.flags
+        assert not any(FLAG_REGRESSION_TRAP in o.flags for o in opps if o.match_id != fx.match_id)
+        assert not any("TRAP:Pro Patria" in o.flags for o in opps)
+        # both teams trapped: both TRAP:<team> markers, home first, on the goals selections only
+        home_trap = RegressionTrap.from_window(fx.home_team, fx.girone, 3, 1, 4.2, ("g", "h", "i"), when)
+        both = [o for o in engine.evaluate(mini_predictions, mini.odds, traps=[other_trap, away_trap, home_trap]) if o.match_id == fx.match_id]
+        for o in both:
+            goals_side = o.selection.startswith("Over") or o.selection == "GG"
+            markers = [f for f in o.flags if f.startswith("TRAP:")]
+            assert markers == ([f"TRAP:{fx.home_team}", f"TRAP:{fx.away_team}"] if goals_side else [])
+        # a trap on a team that plays no fixture never shows up anywhere
+        assert not any(FLAG_REGRESSION_TRAP in o.flags for o in engine.evaluate(mini_predictions, mini.odds, traps=[other_trap]))
+
+    def test_flag_boundaries_value_inclusive_longshot_and_suspicious_strict(self) -> None:
+        fx = Fixture("SYN-3", date(2025, 10, 19), 11, Girone.B, "Perugia", "Ascoli")
+        pred = _synthetic_prediction(fx, {Market.MATCH_ODDS: {"1": 0.3, "X": 0.2, "2": 0.5}})
+        quote = OddsQuote(fx.match_id, "SynBook", Market.MATCH_ODDS, {"1": 2.6, "X": 3.6, "2": 2.5})
+
+        def away(eng: ValueEngine) -> ValueOpportunity:
+            return {o.selection: o for o in eng.evaluate([pred], [quote])}["2"]
+
+        # p * odds - 1 == 0.5 * 2.5 - 1 == 0.25 exactly in binary floating point
+        assert away(ValueEngine()).ev == 0.25
+        # VALUE is inclusive: ev == min_ev flags, ev just below does not
+        on = away(ValueEngine(min_ev=0.25))
+        assert on.value is True and FLAG_VALUE in on.flags and on.stake_units > 0.0
+        off = away(ValueEngine(min_ev=0.25 + 1e-9))
+        assert off.value is False and FLAG_VALUE not in off.flags and off.stake_units == 0.0
+        # LONGSHOT is strict: book_odds == longshot_odds is not a longshot, book_odds just above is
+        equal = {o.selection: o for o in ValueEngine(longshot_odds=2.5).evaluate([pred], [quote])}
+        assert FLAG_LONGSHOT not in equal["2"].flags
+        assert FLAG_LONGSHOT in equal["1"].flags and FLAG_LONGSHOT in equal["X"].flags
+        assert FLAG_LONGSHOT in away(ValueEngine(longshot_odds=2.5 - 1e-9)).flags
+        # SUSPICIOUS_EDGE is strict: ev == suspicious_ev is not suspicious, ev just above is
+        assert FLAG_SUSPICIOUS_EDGE not in away(ValueEngine(suspicious_ev=0.25)).flags
+        assert FLAG_SUSPICIOUS_EDGE in away(ValueEngine(suspicious_ev=0.25 - 1e-9)).flags
 
     def test_traps_detected_from_matches_when_not_given(
         self, engine: ValueEngine, mini_predictions: list[MatchPrediction], mini: SimulatedLeague
