@@ -26,9 +26,18 @@ match in days relative to the reference date (:func:`time_weights`).
 Identifiability is imposed with ``sum(alpha) == 0`` *within each girone*: as an
 explicit equality constraint (with Jacobian) for SLSQP, and through a
 reparametrisation (the last alpha of each girone equals minus the sum of the
-others) for L-BFGS-B. Both methods return the same :class:`FittedParams`
-structure. An optional ridge penalty ``l2_penalty * (sum alpha^2 + sum beta^2)``
-is added to the objective to stabilise very small datasets.
+others) for L-BFGS-B. The reparametrised problem cannot box-bound the dependent
+alpha of a girone, so when an L-BFGS-B solution leaves one outside
+``param_bounds`` the engine re-solves the bounded, constrained problem with
+SLSQP and reports the fallback (``FittedParams.method == 'SLSQP'`` plus a note in
+``message``). Both methods return the same :class:`FittedParams` structure. An
+optional ridge penalty ``l2_penalty * (sum alpha^2 + sum beta^2)`` is added to
+the objective to stabilise very small datasets.
+
+Input frames are validated with :func:`src.common.schemas.validate_matches_df`
+and then range-checked: negative goals and rows with ``home_team == away_team``
+raise ``ValueError`` (the same rules :class:`src.common.schemas.MatchRecord`
+enforces), so sentinel values from harvested data can never corrupt a fit.
 
 The objective exposes an analytic gradient (:func:`negative_log_likelihood_grad`)
 which is passed to :func:`scipy.optimize.minimize`.
@@ -438,6 +447,33 @@ def build_team_index(
     return TeamIndex(teams=teams, teams_by_girone=teams_by_girone, gironi=gironi, girone_specific_home=girone_specific_home)
 
 
+def _reject_invalid_rows(df: pd.DataFrame) -> None:
+    """Range-check a frame already coerced by :func:`validate_matches_df`.
+
+    ``validate_matches_df`` fixes dtypes but does not check values; the
+    :class:`src.common.schemas.MatchRecord` constructor does. This applies the
+    same two rules to the DataFrame path so that sentinel scores (``-1`` for a
+    postponed match) or a name-matching collision (``home_team == away_team``)
+    raise ``ValueError`` instead of silently biasing the estimates.
+    """
+    goals = df[["home_goals", "away_goals"]].to_numpy(dtype=np.int64)
+    negative = (goals < 0).any(axis=1)
+    if negative.any():
+        ids = df.loc[negative, "match_id"].astype(str).tolist()
+        raise ValueError(
+            f"{int(negative.sum())} matches have negative goals (match_id: {ids[:10]}{', ...' if len(ids) > 10 else ''}); "
+            "remove postponed/void matches before fitting"
+        )
+    same_team = (df["home_team"] == df["away_team"]).fillna(False).to_numpy(dtype=bool)
+    if same_team.any():
+        ids = df.loc[same_team, "match_id"].astype(str).tolist()
+        teams = sorted(set(df.loc[same_team, "home_team"].astype(str)))
+        raise ValueError(
+            f"{int(same_team.sum())} matches have home_team == away_team (match_id: {ids[:10]}{', ...' if len(ids) > 10 else ''}; "
+            f"teams: {teams[:10]}); check the team-name matching upstream"
+        )
+
+
 def prepare_likelihood_data(
     matches: pd.DataFrame,
     *,
@@ -452,11 +488,14 @@ def prepare_likelihood_data(
 
     Returns the data together with the :class:`TeamIndex` used to position the
     parameters (built from the frame unless ``team_index`` is given). The
-    reference date defaults to the most recent match date.
+    reference date defaults to the most recent match date. ``ValueError`` is
+    raised for an empty frame, negative goals or ``home_team == away_team`` rows
+    (see :func:`_reject_invalid_rows`).
     """
     df = validate_matches_df(matches)
     if df.empty:
         raise ValueError("no valid matches to fit")
+    _reject_invalid_rows(df)
     index = team_index or build_team_index(
         df, girone_specific_home=girone_specific_home, min_matches_per_team=min_matches_per_team
     )
@@ -636,7 +675,10 @@ class FittedParams:
 
     ``log_likelihood`` is the weighted log-likelihood at the optimum *without*
     the ridge penalty (``penalty`` is reported separately); ``effective_n`` is
-    the sum of the time-decay weights.
+    the sum of the time-decay weights. ``method`` is the optimiser that actually
+    produced the parameters: it differs from ``DixonColesConfig.method`` only when
+    an L-BFGS-B solution violated ``param_bounds`` and the engine re-solved with
+    SLSQP, in which case ``message`` documents the fallback.
     """
 
     alpha: dict[str, float]
@@ -763,8 +805,11 @@ class _AlphaReparam:
     """Map between the full ``theta`` and the reduced vector where, inside every
     girone, the last team's alpha is minus the sum of the others.
 
-    The dependent team of each girone is its last member (alphabetically); its
-    alpha is only implicitly bounded through the bounds of the free alphas.
+    The dependent team of each girone is its last member (alphabetically). Its
+    alpha is *not* box-bounded by the free-variable bounds (``-sum(others)`` can
+    exceed ``param_bounds`` when, e.g., the team scored no goals in the window), so
+    :meth:`DixonColesEngine.fit` checks the mapped-back alphas and falls back to
+    SLSQP when any of them is out of range.
     """
 
     def __init__(self, index: TeamIndex) -> None:
@@ -875,10 +920,33 @@ class DixonColesEngine:
 
         theta0 = self._initial_theta(data, index, warm_start)
         scale = 1.0 / max(effective_n, 1e-12)  # optimise the mean weighted NLL per unit weight
+        method_used: str = cfg.method
+        fallback_note = ""
         if cfg.method == "SLSQP":
             result, theta = self._fit_slsqp(theta0, data, index, scale)
         else:
             result, theta = self._fit_lbfgsb(theta0, data, index, scale)
+            offenders = self._alpha_bound_violations(theta, index)
+            if offenders:
+                # The reparametrised problem cannot bound the dependent alpha of a
+                # girone; the bounded + equality-constrained SLSQP problem can.
+                lbfgsb_message = str(result.message)
+                lbfgsb_nit = int(getattr(result, "nit", 0) or 0)
+                log.warning(
+                    "L-BFGS-B left dependent alpha(s) outside param_bounds; re-solving with SLSQP",
+                    extra={
+                        "param_bounds": list(cfg.param_bounds),
+                        "offending_alpha": {t: round(v, 4) for t, v in offenders.items()},
+                        "lbfgsb_message": lbfgsb_message,
+                        "lbfgsb_n_iter": lbfgsb_nit,
+                    },
+                )
+                result, theta = self._fit_slsqp(theta0, data, index, scale)
+                method_used = "SLSQP"
+                fallback_note = (
+                    f"L-BFGS-B solution violated param_bounds {cfg.param_bounds} for the dependent alpha of "
+                    f"{sorted(offenders)} ({lbfgsb_message}; {lbfgsb_nit} iterations); re-solved with SLSQP: "
+                )
 
         theta = self._recentre_alpha(theta, index)
         ll, penalty, grad = _evaluate(theta, data, with_grad=True)
@@ -890,7 +958,7 @@ class DixonColesEngine:
         else:
             gamma_map = {g: float(gamma[0]) for g in Girone}
         converged = bool(result.success)
-        message = str(result.message)
+        message = fallback_note + str(result.message)
         n_iter = int(getattr(result, "nit", 0) or 0)
         seconds = time.perf_counter() - started
         params = FittedParams(
@@ -909,7 +977,7 @@ class DixonColesEngine:
             message=message,
             n_iter=n_iter,
             fit_seconds=float(seconds),
-            method=cfg.method,
+            method=method_used,
             max_goals=cfg.max_goals,
         )
         self._params = params
@@ -918,6 +986,7 @@ class DixonColesEngine:
         log_fn(
             "Dixon-Coles fit finished",
             extra={
+                "method": method_used,
                 "converged": converged,
                 "optimizer_message": message,
                 "n_iter": n_iter,
@@ -940,6 +1009,17 @@ class DixonColesEngine:
             + [cfg.home_bounds] * n_gammas
             + [cfg.rho_bounds]
         )
+
+    def _alpha_bound_violations(self, theta: np.ndarray, index: TeamIndex, *, tol: float = 1e-8) -> dict[str, float]:
+        """Teams whose alpha lies outside ``param_bounds`` (beyond ``tol``), with the offending value.
+
+        Only the dependent alpha of each girone can violate the bounds under the
+        L-BFGS-B reparametrisation; every alpha is checked for robustness.
+        """
+        lo, hi = self.config.param_bounds
+        alpha = np.asarray(theta[: index.n_teams], dtype=float)
+        bad = np.flatnonzero((alpha < lo - tol) | (alpha > hi + tol))
+        return {index.teams[int(i)]: float(alpha[i]) for i in bad}
 
     @staticmethod
     def _clip_to_bounds(theta: np.ndarray, bounds: list[tuple[float, float]]) -> np.ndarray:
@@ -1036,6 +1116,11 @@ class DixonColesEngine:
     def _fit_lbfgsb(
         self, theta0: np.ndarray, data: LikelihoodData, index: TeamIndex, scale: float
     ) -> tuple[OptimizeResult, np.ndarray]:
+        """L-BFGS-B on the reduced (sum-alpha-free) problem; returns the mapped-back full ``theta``.
+
+        The dependent alpha of each girone is unbounded here; :meth:`fit` checks
+        it against ``param_bounds`` and falls back to SLSQP when needed.
+        """
         cfg = self.config
         reparam = _AlphaReparam(index)
         full_bounds = self._bounds(data.n_teams, data.n_gammas)

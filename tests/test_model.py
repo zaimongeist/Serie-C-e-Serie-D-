@@ -68,6 +68,20 @@ def full_fit(full_league):
 
 
 @pytest.fixture(scope="module")
+def multi_season(full_league):
+    """Three independent seasons generated from the seed-3 ``TrueParams`` (~3330 matches).
+
+    ``match_id`` is prefixed per season because ``validate_matches_df`` keeps the
+    last duplicate id; the seasons are dated consecutively.
+    """
+    frames = []
+    for k, seed in enumerate((300, 301, 302)):
+        season = simulate_league(seed=seed, true_params=full_league.true_params, start_date=date(2022 + k, 8, 24), with_odds=False)
+        frames.append(season.matches.assign(match_id=f"S{k}-" + season.matches["match_id"]))
+    return pd.concat(frames, ignore_index=True)
+
+
+@pytest.fixture(scope="module")
 def league12():
     return simulate_league(seed=5, n_rounds=12)
 
@@ -313,9 +327,14 @@ def test_parameter_recovery_full_season(full_league, full_fit):
     0.80 threshold is asserted on the pooled 60-team vector: with 20 teams and
     ~37 matches each, the per-girone beta correlation of the exact MLE swings
     between ~0.6 and ~0.95 across seeds purely from sampling noise, and for
-    seed=3 girone C sits at 0.77 (both optimisers agree, and the fitted
-    log-likelihood exceeds the one at the true parameters, which is asserted
-    below). A per-girone floor of 0.70 guards against gross errors.
+    seed=3 girone C the *true optimum* sits at 0.77 (verified independently with
+    a from-scratch MLE that agrees with the engine to |delta| < 3e-4, and
+    confirmed below: the fitted log-likelihood exceeds the one at the true
+    parameters and the gradient is flat). The spec's per-girone beta threshold
+    is therefore unattainable on this single season by any correct estimator; a
+    per-girone floor of 0.70 guards against gross errors here, and the spec's
+    per-girone thresholds are asserted on a larger sample of the same
+    ``TrueParams`` in :func:`test_parameter_recovery_multi_season_meets_spec_thresholds`.
     """
     engine, params = full_fit
     tp = full_league.true_params
@@ -355,11 +374,44 @@ def test_parameter_recovery_full_season(full_league, full_fit):
     assert np.max(np.abs(negative_log_likelihood_grad(theta_hat, data)[2 * index.n_teams :])) < 1e-2
 
 
+def test_parameter_recovery_multi_season_meets_spec_thresholds(full_league, full_fit, multi_season):
+    """On ~3330 matches from the seed-3 ``TrueParams`` the spec's per-girone
+    thresholds (corr(alpha) > 0.85, corr(beta) > 0.80) hold with a wide margin
+    (observed >= 0.93 for every girone and seed triplet tried), and every error
+    measure shrinks relative to the single-season fit (consistency)."""
+    _, single = full_fit
+    tp = full_league.true_params
+    params = DixonColesEngine(DixonColesConfig(xi=0.0)).fit(multi_season)
+    print(f"\nmulti-season fit: {params.fit_seconds:.2f}s, {params.n_iter} iterations, LL={params.log_likelihood:.2f}")
+
+    assert params.n_matches == len(multi_season) == 3 * single.n_matches
+    assert params.converged, params.message
+    assert params.fit_seconds < 60
+    assert params.teams_by_girone == single.teams_by_girone
+    for g in Girone:
+        a_hat, a_true, b_hat, b_true = _true_vectors(params, tp, g)
+        assert _corr(a_hat, a_true) > 0.85, (g, _corr(a_hat, a_true))
+        assert _corr(b_hat, b_true) > 0.80, (g, _corr(b_hat, b_true))
+        assert abs(params.gamma[g] - tp.gamma[g]) < 0.12, (g, params.gamma[g], tp.gamma[g])
+        assert abs(a_hat.sum()) < 1e-6
+    assert abs(params.rho - tp.rho) < 0.10
+
+    def _rmse(fit: FittedParams) -> tuple[float, float]:
+        a_hat, a_true, b_hat, b_true = _true_vectors(fit, tp)
+        return float(np.sqrt(np.mean((a_hat - a_true) ** 2))), float(np.sqrt(np.mean((b_hat - b_true) ** 2)))
+
+    rmse_a3, rmse_b3 = _rmse(params)
+    rmse_a1, rmse_b1 = _rmse(single)
+    assert rmse_a3 < rmse_a1 and rmse_b3 < rmse_b1, (rmse_a3, rmse_a1, rmse_b3, rmse_b1)
+    assert rmse_a3 < 0.12 and rmse_b3 < 0.12
+
+
 def test_slsqp_and_lbfgsb_agree(fit12_slsqp, fit12_lbfgsb):
     _, p1 = fit12_slsqp
     _, p2 = fit12_lbfgsb
     assert p1.converged and p2.converged
     assert p1.method == "SLSQP" and p2.method == "L-BFGS-B"
+    assert "re-solved with SLSQP" not in p2.message  # no bound violation -> no fallback on clean data
     rel = abs(p1.log_likelihood - p2.log_likelihood) / abs(p1.log_likelihood)
     assert rel < 1e-3, rel
     a1 = np.array([p1.alpha[t] for t in p1.teams])
@@ -644,13 +696,87 @@ def test_fit_rejects_invalid_frames():
         engine.fit(df.iloc[0:0])
 
 
-def test_bounds_are_respected(mini):
-    cfg = DixonColesConfig(l2_penalty=0.0, rho_bounds=(-0.01, 0.01), home_bounds=(0.0, 0.05), param_bounds=(-0.5, 0.5))
+def test_fit_rejects_negative_goals_and_same_team_rows(league12):
+    """``validate_matches_df`` only coerces dtypes; the engine must range-check
+    like ``MatchRecord`` does, otherwise harvested sentinels (-1 = postponed) or a
+    name-matching collision would silently bias the fit."""
+    clean = league12.matches
+    engine = DixonColesEngine(DixonColesConfig(xi=0.0))
+
+    negative = clean.copy()
+    negative.loc[negative.index[:6], "home_goals"] = -1
+    with pytest.raises(ValueError, match="6 matches have negative goals") as exc:
+        engine.fit(negative)
+    assert str(negative.loc[negative.index[0], "match_id"]) in str(exc.value)
+    with pytest.raises(ValueError, match="negative goals"):
+        engine.fit(clean.assign(away_goals=clean["away_goals"].where(clean.index != 3, -2)))
+    with pytest.raises(ValueError, match="negative goals"):
+        prepare_likelihood_data(negative)
+
+    same = clean.copy()
+    same.loc[same.index[0], "away_team"] = same.loc[same.index[0], "home_team"]
+    with pytest.raises(ValueError, match="home_team == away_team") as exc:
+        engine.fit(same)
+    assert str(same.loc[same.index[0], "match_id"]) in str(exc.value)
+    assert str(same.loc[same.index[0], "home_team"]) in str(exc.value)
+    assert not engine.is_fitted  # nothing was stored by the rejected fits
+
+    # the clean frame still fits, and the number of matches is untouched
+    params = engine.fit(clean)
+    assert params.n_matches == len(clean)
+
+
+def test_lbfgsb_falls_back_to_slsqp_when_dependent_alpha_leaves_bounds(league12, caplog):
+    """Regression: under the L-BFGS-B reparametrisation the dependent alpha of a
+    girone (its alphabetically last team) is ``-sum(others)`` and not box-bounded.
+    A team with no goals in the window drives it far below ``param_bounds``; the
+    engine must detect this and re-solve the bounded, constrained problem."""
+    df = league12.matches.copy()
+    teams_a = sorted(set(df.loc[df["girone"] == "A", "home_team"]) | set(df.loc[df["girone"] == "A", "away_team"]))
+    dependent = teams_a[-1]
+    df.loc[df["home_team"] == dependent, "home_goals"] = 0
+    df.loc[df["away_team"] == dependent, "away_goals"] = 0
+    lo, hi = -3.0, 3.0
+
+    engine_slsqp = DixonColesEngine(DixonColesConfig(xi=0.0, method="SLSQP", param_bounds=(lo, hi)))
+    slsqp = engine_slsqp.fit(df)
+    assert slsqp.alpha[dependent] == pytest.approx(lo, abs=1e-6)  # the bound is active at the optimum
+
+    engine = DixonColesEngine(DixonColesConfig(xi=0.0, method="L-BFGS-B", param_bounds=(lo, hi)))
+    with caplog.at_level(logging.WARNING, logger="src.engine.model"):
+        params = engine.fit(df)
+    assert any("outside param_bounds" in rec.getMessage() for rec in caplog.records)
+    assert all(lo - 1e-9 <= a <= hi + 1e-9 for a in params.alpha.values()), min(params.alpha.values())
+    assert params.alpha[dependent] == pytest.approx(lo, abs=1e-6)
+    assert params.converged, params.message
+    assert params.method == "SLSQP"  # the optimiser that produced the parameters
+    assert "re-solved with SLSQP" in params.message and dependent in params.message
+    assert params.log_likelihood == pytest.approx(slsqp.log_likelihood, abs=1e-6)
+    np.testing.assert_allclose([params.alpha[t] for t in slsqp.teams], [slsqp.alpha[t] for t in slsqp.teams], atol=1e-6)
+    for g, teams in params.teams_by_girone.items():
+        assert abs(sum(params.alpha[t] for t in teams)) < 1e-6, g
+    # downstream: the home rate of the zero-goal team is bounded away from zero, as under SLSQP
+    opponent = teams_a[0]
+    lam, _ = engine.rates(dependent, opponent, "A")
+    lam_slsqp, _ = engine_slsqp.rates(dependent, opponent, "A")
+    assert lam == pytest.approx(lam_slsqp, rel=1e-5) and lam > 1e-3
+
+
+@pytest.mark.parametrize("half_width", [0.5, 0.3])
+def test_bounds_are_respected(mini, half_width):
+    """Every parameter honours its bounds under both methods. With ``half_width=0.3``
+    the raw L-BFGS-B dependent alpha of one girone leaves the box on this dataset,
+    so the alpha assertion exercises the SLSQP fallback."""
+    lo, hi = -half_width, half_width
+    cfg = DixonColesConfig(l2_penalty=0.0, rho_bounds=(-0.01, 0.01), home_bounds=(0.0, 0.05), param_bounds=(lo, hi))
     for method in ("SLSQP", "L-BFGS-B"):
         params = DixonColesEngine(replace(cfg, method=method)).fit(mini.matches)
+        assert params.converged, (method, params.message)
         assert -0.01 - 1e-9 <= params.rho <= 0.01 + 1e-9
         assert all(0.0 - 1e-9 <= g <= 0.05 + 1e-9 for g in params.gamma.values())
-        assert all(-0.5 - 1e-9 <= b <= 0.5 + 1e-9 for b in params.beta.values())
-        # free alphas are bounded; the dependent alpha of each girone (L-BFGS-B) is tied by the constraint
+        assert all(lo - 1e-9 <= b <= hi + 1e-9 for b in params.beta.values())
+        # every alpha is bounded under both methods, including the dependent alpha of each
+        # girone that the L-BFGS-B reparametrisation leaves free (SLSQP fallback)
+        assert all(lo - 1e-9 <= a <= hi + 1e-9 for a in params.alpha.values()), (method, min(params.alpha.values()), max(params.alpha.values()))
         for g, teams in params.teams_by_girone.items():
             assert abs(sum(params.alpha[t] for t in teams)) < 1e-6

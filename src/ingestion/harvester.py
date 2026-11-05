@@ -33,7 +33,7 @@ import sys
 import tempfile
 import time
 import tomllib
-from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Coroutine, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
@@ -79,9 +79,14 @@ __all__ = [
     "SofaScoreEndpoints",
     "SofaScoreProvider",
     "load_endpoints",
+    "load_fixtures",
+    "load_processed",
     "main",
     "parse_retry_after",
     "parse_stat_value",
+    "run_concurrently",
+    "save_fixtures",
+    "save_processed",
     "site_origin",
 ]
 
@@ -294,8 +299,44 @@ def _require(section: Mapping[str, Any], key: str, section_name: str, path: Path
         raise ValueError(f"{path}: [{section_name}] is missing required key {key!r}") from exc
 
 
+def _parse_stat_keys(raw: Any, path: Path) -> dict[str, tuple[str, ...]]:
+    """Validate ``[sofascore.stat_keys]``: every metric must map to a non-empty list of
+    non-empty strings.
+
+    A scalar such as ``shots = "totalShotsOnGoal"`` is rejected instead of being
+    silently iterated character by character (which would make every statistic
+    ``None`` while the run reports success). Metrics the parser does not know
+    are kept but logged, since they can never be located.
+    """
+    if raw is None:
+        return {}
+    if not isinstance(raw, Mapping):
+        raise ValueError(f"{path}: [sofascore.stat_keys] must be a table of metric -> list of keys, got {type(raw).__name__}")
+    out: dict[str, tuple[str, ...]] = {}
+    for metric, value in raw.items():
+        valid = (
+            isinstance(value, (list, tuple))
+            and len(value) > 0
+            and all(isinstance(item, str) and item.strip() for item in value)
+        )
+        if not valid:
+            raise ValueError(
+                f"{path}: [sofascore.stat_keys] {metric!r} must be a non-empty list of non-empty strings, got {value!r}"
+            )
+        if str(metric) not in _METRIC_FIELDS:
+            log.warning(
+                "unknown stat_keys metric is never used",
+                extra={"path": str(path), "metric": str(metric), "known": sorted(_METRIC_FIELDS)},
+            )
+        out[str(metric)] = tuple(str(item).strip() for item in value)
+    return out
+
+
 def load_endpoints(path: Path = CONFIG_DIR / "endpoints.toml") -> EndpointsConfig:
-    """Parse ``endpoints.toml`` (stdlib :mod:`tomllib`) into :class:`EndpointsConfig`."""
+    """Parse ``endpoints.toml`` (stdlib :mod:`tomllib`) into :class:`EndpointsConfig`.
+
+    Raises ``ValueError`` on missing keys and on malformed ``stat_keys`` entries.
+    """
     path = Path(path)
     with path.open("rb") as handle:
         raw = tomllib.load(handle)
@@ -314,7 +355,7 @@ def load_endpoints(path: Path = CONFIG_DIR / "endpoints.toml") -> EndpointsConfi
         events_last=str(_require(sofa_raw, "events_last", "sofascore", path)),
         events_next=str(_require(sofa_raw, "events_next", "sofascore", path)),
         event_statistics=str(_require(sofa_raw, "event_statistics", "sofascore", path)),
-        stat_keys={str(k): tuple(str(x) for x in v) for k, v in sofa_raw.get("stat_keys", {}).items()},
+        stat_keys=_parse_stat_keys(sofa_raw.get("stat_keys"), path),
     )
     fotmob = FotMobEndpoints(
         base_url=str(_require(fot_raw, "base_url", "fotmob", path)).rstrip("/"),
@@ -659,7 +700,11 @@ class AsyncHarvesterClient:
         """
         url = self.build_url(path)
         if use_cache and self.cache is not None:
-            cached = self.cache.get(url, params)
+            try:
+                cached = self.cache.get(url, params)
+            except OSError as exc:  # unreadable cache directory: fetch instead
+                cached = None
+                log.warning("cache read failed, fetching", extra={"url": url, "error": str(exc)})
             if cached is not None:
                 self.stats.cache_hits += 1
                 log.debug("cache hit", extra={"url": url})
@@ -668,7 +713,13 @@ class AsyncHarvesterClient:
         async with self._semaphore:
             payload = await self._fetch_with_retry(client, url, params)
         if use_cache and self.cache is not None:
-            self.cache.put(url, payload, params)
+            # A full disk, a read-only volume or a cache directory replaced by a
+            # file must not throw away a payload that was downloaded successfully
+            # (and must not escape as a non-HarvestError that aborts the harvest).
+            try:
+                self.cache.put(url, payload, params)
+            except OSError as exc:
+                log.warning("cache write failed, payload kept", extra={"url": url, "error": str(exc)})
         return payload
 
     async def _fetch_with_retry(self, client: httpx.AsyncClient, url: str, params: Mapping[str, Any] | None) -> Any:
@@ -727,6 +778,48 @@ class AsyncHarvesterClient:
         if last_status == 429:
             raise RateLimitedError(message, url=url, status=last_status, attempts=attempts)
         raise HarvestError(message, url=url, status=last_status, attempts=attempts)
+
+
+# =============================================================================
+# Concurrency helper
+# =============================================================================
+def _first_leaf(group: BaseExceptionGroup) -> BaseException:
+    """First non-group exception inside ``group`` (depth first), preferring a
+    :class:`HarvestError` so callers keep their ``except HarvestError`` contract."""
+    leaves: list[BaseException] = []
+    stack: list[BaseException] = [group]
+    while stack:
+        current = stack.pop(0)
+        if isinstance(current, BaseExceptionGroup):
+            stack[:0] = list(current.exceptions)
+        else:
+            leaves.append(current)
+    for leaf in leaves:
+        if isinstance(leaf, HarvestError):
+            return leaf
+    return leaves[0] if leaves else group
+
+
+async def run_concurrently[T](coroutines: Iterable[Coroutine[Any, Any, T]]) -> list[T]:
+    """Await ``coroutines`` concurrently and return their results in order.
+
+    Unlike a bare :func:`asyncio.gather`, the first failure cancels every
+    sibling task before the exception propagates, so a round that keeps
+    answering 5xx does not leave orphan requests hitting the API (or a closed
+    client) after the caller has already given up. The exception raised is the
+    first child failure itself (a :class:`HarvestError` stays a ``HarvestError``),
+    not an ``ExceptionGroup``.
+    """
+    pending = list(coroutines)
+    if not pending:
+        return []
+    tasks: list[asyncio.Task[T]] = []
+    try:
+        async with asyncio.TaskGroup() as group:
+            tasks = [group.create_task(coro) for coro in pending]
+    except BaseExceptionGroup as group_exc:
+        raise _first_leaf(group_exc) from group_exc
+    return [task.result() for task in tasks]
 
 
 # =============================================================================
@@ -806,6 +899,32 @@ def _team_name(team: Any) -> str | None:
 
 def _empty_stats() -> dict[str, float | None]:
     return {name: None for name in STAT_FIELDS}
+
+
+def _warn_missing_metrics(
+    records: Sequence[MatchRecord], stat_keys: Mapping[str, Sequence[str]], source: str
+) -> list[str]:
+    """Metrics that none of ``records`` (matches whose statistics payload *was*
+    fetched) provides; logged as a warning because it usually means the
+    upstream keys drifted or ``stat_keys`` is misconfigured."""
+    if not records:
+        return []
+    missing = [
+        metric
+        for metric, (home_field, away_field) in _METRIC_FIELDS.items()
+        if all(getattr(r, home_field) is None and getattr(r, away_field) is None for r in records)
+    ]
+    if missing:
+        log.warning(
+            "statistics metrics never located",
+            extra={
+                "source": source,
+                "metrics": missing,
+                "payloads": len(records),
+                "keys": {metric: list(stat_keys.get(metric, ())) for metric in missing},
+            },
+        )
+    return missing
 
 
 # =============================================================================
@@ -1016,8 +1135,15 @@ class SofaScoreProvider:
         g = Girone.parse(girone)
         if season_id is None:
             season_id = await self.current_season_id(g)
-        round_list = sorted({int(r) for r in rounds}) if rounds is not None else await self.rounds(g, season_id)
-        batches = await asyncio.gather(*(self._events_or_empty(g, season_id, r) for r in round_list))
+        if rounds is not None:
+            round_list = sorted({int(r) for r in rounds})
+        else:
+            round_list = await self.rounds(g, season_id)
+            if not round_list:
+                # A payload drift (``{"rounds": []}`` without ``currentRound``) must
+                # surface as a failure, not as a silently empty season.
+                raise HarvestError("rounds payload lists no rounds", url=self.endpoints.url_rounds(g, season_id))
+        batches = await run_concurrently(self._events_or_empty(g, season_id, r) for r in round_list)
 
         matches: dict[str, MatchRecord] = {}
         fixtures: dict[str, Fixture] = {}
@@ -1030,8 +1156,10 @@ class SofaScoreProvider:
                     fixtures[parsed.match_id] = parsed
         ordered = list(matches.values())
         if with_stats and ordered:
-            stats = await asyncio.gather(*(self._safe_statistics(m) for m in ordered))
+            stats = await run_concurrently(self._safe_statistics(m) for m in ordered)
             ordered = [replace(m, **s) if s is not None else m for m, s in zip(ordered, stats, strict=True)]
+            fetched = [m for m, s in zip(ordered, stats, strict=True) if s is not None]
+            _warn_missing_metrics(fetched, self.endpoints.stat_keys, self.name)
         log.info(
             "sofascore harvest complete",
             extra={"girone": g.value, "season_id": season_id, "rounds": len(round_list), "matches": len(ordered), "fixtures": len(fixtures)},
@@ -1214,8 +1342,10 @@ class FotMobProvider:
                 fixtures[parsed.match_id] = parsed
         ordered = list(matches.values())
         if with_stats and ordered:
-            stats = await asyncio.gather(*(self._safe_details(m) for m in ordered))
+            stats = await run_concurrently(self._safe_details(m) for m in ordered)
             ordered = [replace(m, **s) if s is not None else m for m, s in zip(ordered, stats, strict=True)]
+            fetched = [m for m, s in zip(ordered, stats, strict=True) if s is not None]
+            _warn_missing_metrics(fetched, FOTMOB_STAT_KEYS, self.name)
         log.info(
             "fotmob harvest complete",
             extra={"girone": g.value, "league_id": league_id, "matches": len(ordered), "fixtures": len(fixtures)},
@@ -1462,9 +1592,44 @@ class Harvester:
         return out
 
 
+#: Module-level aliases of the persistence helpers: ``main.py`` and other
+#: integrators import ``from src.ingestion.harvester import load_processed, load_fixtures``.
+save_processed = Harvester.save_processed
+load_processed = Harvester.load_processed
+save_fixtures = Harvester.save_fixtures
+load_fixtures = Harvester.load_fixtures
+
+
 # =============================================================================
 # CLI
 # =============================================================================
+def _csv_has_rows(path: Path) -> bool:
+    """``True`` when ``path`` exists and holds at least one data row below the header."""
+    try:
+        with Path(path).open("r", encoding="utf-8") as handle:
+            next(handle)
+            return any(line.strip() for line in handle)
+    except (OSError, StopIteration):
+        return False
+
+
+def _write_decision(result: HarvestResult, out: Path, *, allow_partial: bool) -> tuple[bool, str | None]:
+    """Whether the CLI may write ``result`` to ``out`` (and why not).
+
+    * an empty harvest never overwrites a file that already has rows;
+    * a partial harvest (some girone/provider failed) is written only with
+      ``allow_partial``, so a transient outage cannot replace a complete
+      dataset with a fragment.
+    """
+    if result.matches.empty:
+        if _csv_has_rows(out):
+            return False, f"empty harvest: refusing to overwrite non-empty {out}"
+        return True, None
+    if result.failures and not allow_partial:
+        return False, f"partial harvest ({len(result.failures)} failures): {out} left untouched (use --allow-partial to write anyway)"
+    return True, None
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m src.ingestion.harvester",
@@ -1475,6 +1640,11 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--out", type=Path, default=PROCESSED_DIR / "matches.csv", help="matches CSV output")
     parser.add_argument("--fixtures-out", type=Path, default=PROCESSED_DIR / "fixtures.csv", help="fixtures CSV output")
     parser.add_argument("--no-stats", action="store_true", help="skip per-match statistics calls")
+    parser.add_argument(
+        "--allow-partial",
+        action="store_true",
+        help="write the CSVs even when some girone/provider failed (exit code stays non-zero)",
+    )
     parser.add_argument("--log-json", action="store_true", help="emit JSON-lines logs")
     parser.add_argument("--providers", nargs="+", default=["sofascore"], choices=list(PROVIDER_NAMES), help="ordered provider fallbacks")
     parser.add_argument("--cache-dir", type=Path, default=RAW_DIR, help="raw JSON cache directory")
@@ -1503,16 +1673,24 @@ def main(argv: Sequence[str] | None = None) -> int:
         log.error("harvest failed", extra={"url": exc.url, "status": exc.status, "attempts": exc.attempts})
         print(f"harvest failed: {exc}", file=sys.stderr)
         return 1
-    Harvester.save_processed(result.matches, args.out)
-    Harvester.save_fixtures(result.fixtures, args.fixtures_out)
+    complete = not result.failures and len(result.matches) > 0
+    write, reason = _write_decision(result, args.out, allow_partial=args.allow_partial)
     print(result.summary())
-    print(f"matches -> {args.out}")
-    print(f"fixtures -> {args.fixtures_out}")
+    if write:
+        save_processed(result.matches, args.out)
+        save_fixtures(result.fixtures, args.fixtures_out)
+        print(f"matches -> {args.out}")
+        print(f"fixtures -> {args.fixtures_out}")
+    else:
+        log.error("harvest output not written", extra={"reason": reason, "out": str(args.out)})
+        print(reason, file=sys.stderr)
     if result.unmapped_teams:
         print("unmapped teams: " + ", ".join(f"{name} x{count}" for name, count in result.unmapped_teams.items()))
     for key, message in result.failures.items():
         print(f"failure {key}: {message}", file=sys.stderr)
-    return 0 if not result.failures or len(result.matches) else 1
+    if not complete:
+        print("harvest incomplete: " + ("no matches harvested" if result.matches.empty else f"{len(result.failures)} failures"), file=sys.stderr)
+    return 0 if complete else 1
 
 
 if __name__ == "__main__":  # pragma: no cover - manual entry point

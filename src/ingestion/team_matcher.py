@@ -11,6 +11,16 @@ canonical spelling per club, so every ingested name goes through
    keys, optionally restricted to one girone, accepted only above a threshold
    and only when the best candidate is not ambiguous.
 
+The fuzzy step ranks candidates with a set-based scorer (``token_set_ratio``
+by default) but never trusts it alone: ``token_set_ratio`` returns 100 whenever
+one side's tokens are a subset of the other's, which would map ``"Juventus"``
+onto ``"Juventus Next Gen"`` or ``"Hellas Verona"`` onto the ``"V. Verona"``
+alias of Virtus Verona with maximal confidence. Every candidate is therefore
+re-scored with :func:`confirm_score` -- the similarity of the *whole* strings,
+scaled down by :func:`token_coverage` when whole tokens are missing -- and the
+fuzzy score is ``min(ranking score, confirmation score, MAX_FUZZY_SCORE)``.
+A score of 100 can only come from the exact or alias steps.
+
 When ``thefuzz`` is not importable the module falls back to a
 :mod:`difflib`-based scorer (``DIFFLIB_FALLBACK`` is then ``True``); the flag
 is consulted on every lookup so tests can exercise both code paths.
@@ -40,11 +50,15 @@ except ImportError:  # pragma: no cover - depends on the environment
 
 __all__ = [
     "DIFFLIB_FALLBACK",
+    "MAX_FUZZY_SCORE",
     "MatchMethod",
     "MatchResult",
     "TeamMatcher",
+    "confirm_score",
     "difflib_extract",
     "difflib_score",
+    "token_coverage",
+    "whole_string_score",
 ]
 
 log = get_logger(__name__)
@@ -54,9 +68,14 @@ Scorer = Callable[[str, str], int]
 
 #: How many ranked candidates are kept on a :class:`MatchResult`.
 MAX_CANDIDATES = 5
+#: Upper bound of a fuzzy score: 100 is reserved for the exact / alias steps so
+#: callers can tell a confident guess from a dictionary hit.
+MAX_FUZZY_SCORE = 99
 #: How many raw alias keys are pulled from the similarity search before
-#: collapsing them to distinct canonical names.
-_EXTRACT_LIMIT = 12
+#: re-scoring them and collapsing them to distinct canonical names. Generous on
+#: purpose: token-subset keys score 100 on the ranking pass and must not crowd
+#: out the genuine near-match.
+_EXTRACT_LIMIT = 20
 
 
 @dataclass(frozen=True, slots=True)
@@ -98,6 +117,53 @@ def difflib_extract(
     return scored[: max(limit, 0)]
 
 
+def _sorted_tokens(text: str) -> str:
+    return " ".join(sorted(text.split()))
+
+
+def token_coverage(query: str, choice: str) -> float:
+    """Share of tokens the two spellings have in common when one *contains* the other.
+
+    Returns ``1.0`` unless one token set is a strict subset of the other, in
+    which case it is ``|smaller| / |larger|`` (``"juventus"`` vs
+    ``"juventus next gen"`` -> ``1/3``). Spellings that merely share some
+    tokens (``"hellas verona"`` vs ``"virtus verona"``) are not penalised here;
+    the whole-string similarity already handles them.
+    """
+    query_tokens, choice_tokens = set(query.split()), set(choice.split())
+    if not query_tokens or not choice_tokens or query_tokens == choice_tokens:
+        return 1.0
+    if query_tokens < choice_tokens or choice_tokens < query_tokens:
+        return min(len(query_tokens), len(choice_tokens)) / max(len(query_tokens), len(choice_tokens))
+    return 1.0
+
+
+def whole_string_score(query: str, choice: str) -> int:
+    """Similarity (0-100) of the two *whole* strings, order-sensitive or token-sorted,
+    whichever is higher.
+
+    Unlike ``token_set_ratio`` this cannot reach 100 when one side merely
+    contains the other's tokens, so it is a safe confirmation for a fuzzy hit.
+    Uses ``thefuzz.fuzz.ratio`` / ``token_sort_ratio`` or, on the fallback
+    path, :func:`difflib_score` on the raw and token-sorted strings.
+    """
+    if DIFFLIB_FALLBACK or _thefuzz_fuzz is None:
+        return max(difflib_score(query, choice), difflib_score(_sorted_tokens(query), _sorted_tokens(choice)))
+    return max(int(_thefuzz_fuzz.ratio(query, choice)), int(_thefuzz_fuzz.token_sort_ratio(query, choice)))
+
+
+def confirm_score(query: str, choice: str) -> int:
+    """Confirmation score (0-100) for a fuzzy candidate.
+
+    :func:`whole_string_score` scaled by :func:`token_coverage`, so that a
+    spelling which only drops qualifiers (``"Inter Milan"`` -> ``"inter milan
+    u23"``, ``"Internazionale"`` -> ``"internazionale u23"``) scores far below
+    any sensible threshold while typos and abbreviations (``"Juve Next Gen"``,
+    ``"Pergoletese"``, ``"Juventus NextGen"``) keep their high score.
+    """
+    return int(round(whole_string_score(query, choice) * token_coverage(query, choice)))
+
+
 def _resolve_scorer(name: str) -> Scorer | None:
     """Look ``name`` up in :mod:`thefuzz.fuzz`; ``None`` when thefuzz is absent."""
     if _thefuzz_fuzz is None:
@@ -122,8 +188,10 @@ class TeamMatcher:
         their scores differ by less than this margin the lookup is declared
         ambiguous and returns ``None``.
     scorer:
-        Name of a scorer in :mod:`thefuzz.fuzz` (``token_set_ratio`` by
-        default). Ignored on the difflib fallback path.
+        Name of the *ranking* scorer in :mod:`thefuzz.fuzz` (``token_set_ratio``
+        by default). Ignored on the difflib fallback path. Every candidate it
+        ranks is confirmed with :func:`confirm_score`; the fuzzy score is the
+        lower of the two, capped at :data:`MAX_FUZZY_SCORE`.
 
     Results are memoised per ``(normalised name, girone)``.
     """
@@ -168,13 +236,20 @@ class TeamMatcher:
         ranked = _thefuzz_process.extract(query, list(keys), scorer=self._scorer_fn, limit=limit)
         return [(str(choice), int(score)) for choice, score, *_ in ranked]
 
-    def _collapse(self, ranked: Iterable[tuple[str, int]]) -> tuple[tuple[str, int], ...]:
-        """Best score per distinct canonical, sorted best first."""
+    @staticmethod
+    def fuzzy_score(query: str, key: str, ranking_score: int) -> int:
+        """Final fuzzy score of alias ``key`` for ``query``: the ranking score confirmed
+        by :func:`confirm_score` and capped at :data:`MAX_FUZZY_SCORE`."""
+        return min(int(ranking_score), confirm_score(query, key), MAX_FUZZY_SCORE)
+
+    def _collapse(self, query: str, ranked: Iterable[tuple[str, int]]) -> tuple[tuple[str, int], ...]:
+        """Best confirmed score per distinct canonical, sorted best first."""
         best: dict[str, int] = {}
-        for key, score in ranked:
+        for key, ranking_score in ranked:
             canonical = self._alias_table.get(key)
             if canonical is None:
                 continue
+            score = self.fuzzy_score(query, key, ranking_score)
             if score > best.get(canonical, -1):
                 best[canonical] = score
         ordered = sorted(best.items(), key=lambda item: (-item[1], item[0]))
@@ -193,7 +268,7 @@ class TeamMatcher:
             return MatchResult(query, canonical, 100, "alias", girone, ((canonical, 100),))
 
         keys = self._keys_by_girone.get(girone, ())
-        candidates = self._collapse(self._extract(norm, keys, _EXTRACT_LIMIT)) if keys else ()
+        candidates = self._collapse(norm, self._extract(norm, keys, _EXTRACT_LIMIT)) if keys else ()
         if not candidates:
             return MatchResult(query, None, 0, "none", girone, ())
 
