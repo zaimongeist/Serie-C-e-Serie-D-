@@ -1,0 +1,9 @@
+{
+  "currentRound": {"round": 3},
+  "rounds": [
+    {"round": 1},
+    {"round": 2},
+    {"round": 3},
+    {"round": 39, "name": "Playoff Round 1", "slug": "playoff-round-1", "prefix": "Playoff"}
+  ]
+}

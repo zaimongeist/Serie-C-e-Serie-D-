@@ -1,0 +1,47 @@
+{
+  "events": [
+    {
+      "tournament": {"name": "Serie C, Girone A", "slug": "serie-c-girone-a", "uniqueTournament": {"name": "Serie C, Girone A", "id": 141}, "id": 141},
+      "season": {"name": "Serie C, Girone A 25/26", "year": "25/26", "id": 77030},
+      "roundInfo": {"round": 2},
+      "status": {"code": 100, "description": "Ended", "type": "finished"},
+      "winnerCode": 1,
+      "homeTeam": {"name": "L.R. Vicenza", "slug": "lr-vicenza", "shortName": "Vicenza", "nameCode": "VIC", "id": 2678},
+      "awayTeam": {"name": "Pro Patria", "slug": "pro-patria", "shortName": "Pro Patria", "nameCode": "PRP", "id": 2664},
+      "homeScore": {"current": 3, "display": 3, "period1": 2, "period2": 1, "normaltime": 3},
+      "awayScore": {"current": 0, "display": 0, "period1": 0, "period2": 0, "normaltime": 0},
+      "hasXg": true,
+      "id": 13579111,
+      "startTimestamp": 1756578600,
+      "slug": "lr-vicenza-pro-patria"
+    },
+    {
+      "tournament": {"name": "Serie C, Girone A", "slug": "serie-c-girone-a", "uniqueTournament": {"name": "Serie C, Girone A", "id": 141}, "id": 141},
+      "season": {"name": "Serie C, Girone A 25/26", "year": "25/26", "id": 77030},
+      "roundInfo": {"round": 2},
+      "status": {"code": 60, "description": "Postponed", "type": "postponed"},
+      "homeTeam": {"name": "Lecco", "slug": "lecco", "shortName": "Lecco", "nameCode": "LEC", "id": 2648},
+      "awayTeam": {"name": "Union Brescia", "slug": "union-brescia", "shortName": "Union Brescia", "nameCode": "BRE", "id": 2652},
+      "homeScore": {},
+      "awayScore": {},
+      "id": 13579112,
+      "startTimestamp": 1756645200,
+      "slug": "lecco-union-brescia"
+    },
+    {
+      "tournament": {"name": "Serie C, Girone A", "slug": "serie-c-girone-a", "uniqueTournament": {"name": "Serie C, Girone A", "id": 141}, "id": 141},
+      "season": {"name": "Serie C, Girone A 25/26", "year": "25/26", "id": 77030},
+      "roundInfo": {"round": 2},
+      "status": {"code": 100, "description": "Ended", "type": "finished"},
+      "winnerCode": 1,
+      "homeTeam": {"name": "Cittadella", "slug": "cittadella", "shortName": "Cittadella", "nameCode": "CIT", "id": 2622},
+      "awayTeam": {"name": "Sestri Levante", "slug": "sestri-levante", "shortName": "Sestri Levante", "nameCode": "SES", "id": 65001},
+      "homeScore": {"current": 1, "display": 1, "period1": 0, "period2": 1, "normaltime": 1},
+      "awayScore": {"current": 0, "display": 0, "period1": 0, "period2": 0, "normaltime": 0},
+      "hasXg": false,
+      "id": 13579113,
+      "startTimestamp": 1756645200,
+      "slug": "cittadella-sestri-levante"
+    }
+  ]
+}

@@ -1,0 +1,36 @@
+{
+  "statistics": [
+    {
+      "period": "ALL",
+      "groups": [
+        {
+          "groupName": "Match overview",
+          "statisticsItems": [
+            {"name": "Ball possession", "home": "55%", "away": "45%", "compareCode": 1, "statisticsType": "positive", "valueType": "event", "homeValue": 55, "awayValue": 45, "renderType": 2, "key": "ballPossession"},
+            {"name": "Total shots", "home": "12", "away": "7", "compareCode": 1, "statisticsType": "positive", "valueType": "event", "renderType": 1, "key": "totalShotsOnGoal"},
+            {"name": "Corner kicks", "home": "5", "away": "2", "compareCode": 1, "statisticsType": "positive", "valueType": "event", "renderType": 1, "key": "cornerKicks"}
+          ]
+        },
+        {
+          "groupName": "Shots",
+          "statisticsItems": [
+            {"name": "Shots on target", "home": "4", "away": "3", "compareCode": 1, "statisticsType": "positive", "valueType": "event", "renderType": 1, "key": "shotsOnGoal"},
+            {"name": "Shots off target", "home": "6", "away": "3", "compareCode": 1, "statisticsType": "positive", "valueType": "event", "renderType": 1, "key": "shotsOffGoal"}
+          ]
+        }
+      ]
+    },
+    {
+      "period": "1ST",
+      "groups": [
+        {
+          "groupName": "Match overview",
+          "statisticsItems": [
+            {"name": "Total shots", "home": "5", "away": "4", "key": "totalShotsOnGoal"},
+            {"name": "Corner kicks", "home": "2", "away": "1", "key": "cornerKicks"}
+          ]
+        }
+      ]
+    }
+  ]
+}
