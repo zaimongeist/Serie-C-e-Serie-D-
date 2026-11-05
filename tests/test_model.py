@@ -290,11 +290,13 @@ def test_gradient_matches_central_differences():
     f, g = negative_log_likelihood_and_grad(theta, data)
     assert f == pytest.approx(negative_log_likelihood(theta, data))
     np.testing.assert_allclose(g, analytic)
-    # penalty is really in the objective
+    # penalty is really in the objective (betas are centred within their girone)
     plain, _ = prepare_likelihood_data(df, xi=0.01, l2_penalty=0.0)
     alpha, beta, _, _ = unpack_theta(theta, data.n_teams, data.n_gammas)
+    gidx = data.team_girone_idx
+    beta_dev = beta - (np.bincount(gidx, weights=beta) / np.bincount(gidx))[gidx]
     assert negative_log_likelihood(theta, data) - negative_log_likelihood(theta, plain) == pytest.approx(
-        0.1 * (alpha @ alpha + beta @ beta)
+        0.1 * (alpha @ alpha + beta_dev @ beta_dev)
     )
 
 

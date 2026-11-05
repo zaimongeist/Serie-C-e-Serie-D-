@@ -31,8 +31,12 @@ alpha of a girone, so when an L-BFGS-B solution leaves one outside
 ``param_bounds`` the engine re-solves the bounded, constrained problem with
 SLSQP and reports the fallback (``FittedParams.method == 'SLSQP'`` plus a note in
 ``message``). Both methods return the same :class:`FittedParams` structure. An
-optional ridge penalty ``l2_penalty * (sum alpha^2 + sum beta^2)`` is added to
-the objective to stabilise very small datasets.
+optional ridge penalty ``l2_penalty * (sum alpha^2 + sum (beta - mean beta)^2)``
+(betas centred within their girone, because the mean beta is the model's
+intercept) is added to the objective to stabilise very small datasets; ``l2_penalty_home`` and
+``l2_penalty_rho`` extend it to a full Gaussian (MAP) prior that shrinks the
+home-advantage parameters towards ``home_prior`` and rho towards 0, which keeps a
+20-match sample from driving gamma or rho onto their bounds.
 
 Input frames are validated with :func:`src.common.schemas.validate_matches_df`
 and then range-checked: negative goals and rows with ``home_team == away_team``
@@ -319,15 +323,23 @@ class LikelihoodData(NamedTuple):
     gamma_idx: np.ndarray  #: position of the match's home-advantage parameter
     n_teams: int
     n_gammas: int
-    l2_penalty: float
+    l2_penalty: float  #: ridge strength on alpha and beta (shrinks towards 0)
+    l2_penalty_home: float = 0.0  #: ridge strength on gamma (shrinks towards ``home_prior``)
+    home_prior: float = 0.0  #: prior mean of the home-advantage parameter(s)
+    l2_penalty_rho: float = 0.0  #: ridge strength on rho (shrinks towards 0)
+    team_girone_idx: np.ndarray | None = None  #: girone position of each team; centres the beta ridge per girone
+
+
+_N_REQUIRED_FIELDS = len(LikelihoodData._fields) - len(LikelihoodData._field_defaults)
 
 
 def _as_data(data: tuple[Any, ...]) -> LikelihoodData:
     if len(data) == 1 and isinstance(data[0], LikelihoodData):
         return data[0]
-    if len(data) != len(LikelihoodData._fields):
+    if not _N_REQUIRED_FIELDS <= len(data) <= len(LikelihoodData._fields):
         raise TypeError(
-            f"expected a LikelihoodData instance or its {len(LikelihoodData._fields)} fields, got {len(data)} positional arguments"
+            f"expected a LikelihoodData instance or {_N_REQUIRED_FIELDS}-{len(LikelihoodData._fields)} of its fields, "
+            f"got {len(data)} positional arguments"
         )
     return LikelihoodData(*data)
 
@@ -483,6 +495,9 @@ def prepare_likelihood_data(
     girone_specific_home: bool = True,
     team_index: TeamIndex | None = None,
     min_matches_per_team: int = 1,
+    l2_penalty_home: float = 0.0,
+    home_prior: float = 0.0,
+    l2_penalty_rho: float = 0.0,
 ) -> tuple[LikelihoodData, TeamIndex]:
     """Validate ``matches`` and convert them into :class:`LikelihoodData`.
 
@@ -525,6 +540,10 @@ def prepare_likelihood_data(
         n_teams=index.n_teams,
         n_gammas=index.n_gammas,
         l2_penalty=float(l2_penalty),
+        l2_penalty_home=float(l2_penalty_home),
+        home_prior=float(home_prior),
+        l2_penalty_rho=float(l2_penalty_rho),
+        team_girone_idx=index.team_girone_positions(),
     )
     return data, index
 
@@ -545,7 +564,21 @@ def _evaluate(theta: np.ndarray, d: LikelihoodData, *, with_grad: bool) -> tuple
     t_safe = np.where(clipped, TAU_FLOOR, t)
     ll_terms = np.log(t_safe) + d.x * log_lam - lam + d.y * log_mu - mu
     ll = float(np.dot(d.w, ll_terms))
-    penalty = float(d.l2_penalty * (np.dot(alpha, alpha) + np.dot(beta, beta)))
+    # The mean beta of a girone is the model's only intercept (there is no global
+    # rate parameter), so the beta ridge shrinks towards the girone mean, not 0:
+    # it regularises team differences without biasing the overall goal level.
+    if d.team_girone_idx is not None:
+        counts = np.bincount(d.team_girone_idx).astype(float)
+        beta_mean = np.bincount(d.team_girone_idx, weights=beta) / np.maximum(counts, 1.0)
+        beta_dev = beta - beta_mean[d.team_girone_idx]
+    else:
+        beta_dev = beta
+    gamma_dev = gamma - d.home_prior
+    penalty = float(
+        d.l2_penalty * (np.dot(alpha, alpha) + np.dot(beta_dev, beta_dev))
+        + d.l2_penalty_home * np.dot(gamma_dev, gamma_dev)
+        + d.l2_penalty_rho * rho * rho
+    )
     if not with_grad:
         return ll, penalty, None
 
@@ -564,12 +597,18 @@ def _evaluate(theta: np.ndarray, d: LikelihoodData, *, with_grad: bool) -> tuple
     g_gamma = np.bincount(d.gamma_idx, weights=g_loglam, minlength=d.n_gammas)
     grad = -pack_theta(g_alpha, g_beta, g_gamma, g_rho)
     grad[:n_t] += 2.0 * d.l2_penalty * alpha
-    grad[n_t : 2 * n_t] += 2.0 * d.l2_penalty * beta
+    grad[n_t : 2 * n_t] += 2.0 * d.l2_penalty * beta_dev  # d/d beta of |beta - mean|^2 is 2 (beta - mean)
+    grad[2 * n_t : 2 * n_t + d.n_gammas] += 2.0 * d.l2_penalty_home * gamma_dev
+    grad[-1] += 2.0 * d.l2_penalty_rho * rho
     return ll, penalty, grad
 
 
 def negative_log_likelihood(theta: np.ndarray, *data: Any) -> float:
-    """Penalised negative weighted log-likelihood ``-LL(theta) + l2 * (|alpha|^2 + |beta|^2)``.
+    """Penalised negative weighted log-likelihood.
+
+    ``-LL(theta) + l2 * (|alpha|^2 + |beta - mean_girone(beta)|^2) + l2_home * |gamma - home_prior|^2 + l2_rho * rho^2``
+    (the last two terms vanish with the default zero strengths; without
+    ``team_girone_idx`` the beta term is uncentred, i.e. ``|beta|^2``).
 
     ``data`` is a :class:`LikelihoodData` instance or its unpacked fields.
     """
@@ -602,6 +641,12 @@ class DixonColesConfig:
     estimates a single home advantage that is reported for every girone;
     teams with fewer than ``min_matches_per_team`` matches are still estimated
     but logged.
+
+    ``l2_penalty_home`` shrinks every gamma towards ``home_prior`` (which must lie
+    inside ``home_bounds``) and ``l2_penalty_rho`` shrinks rho towards 0; both are
+    off (0.0) by default so the estimator stays the pure weighted MLE. Use
+    :meth:`with_gaussian_prior` to express the three strengths as prior standard
+    deviations (``l2 = 1 / (2 sigma^2)``).
     """
 
     xi: float = 0.0018
@@ -615,6 +660,9 @@ class DixonColesConfig:
     tol: float = 1e-9
     girone_specific_home: bool = True
     min_matches_per_team: int = 1
+    l2_penalty_home: float = 0.0
+    home_prior: float = 0.0
+    l2_penalty_rho: float = 0.0
 
     def __post_init__(self) -> None:
         if self.xi < 0:
@@ -628,14 +676,52 @@ class DixonColesConfig:
             if not float(lo) < float(hi):
                 raise ValueError(f"{name} must be (low, high) with low < high, got {(lo, hi)}")
             object.__setattr__(self, name, (float(lo), float(hi)))
-        if self.l2_penalty < 0:
-            raise ValueError(f"l2_penalty must be >= 0, got {self.l2_penalty}")
+        for name in ("l2_penalty", "l2_penalty_home", "l2_penalty_rho"):
+            value = getattr(self, name)
+            if not (np.isfinite(value) and value >= 0):
+                raise ValueError(f"{name} must be a finite number >= 0, got {value}")
+        if not np.isfinite(self.home_prior):
+            raise ValueError(f"home_prior must be finite, got {self.home_prior}")
+        lo, hi = self.home_bounds
+        if not lo <= self.home_prior <= hi:
+            raise ValueError(f"home_prior {self.home_prior} must lie within home_bounds {(lo, hi)}")
         if self.max_iter < 1:
             raise ValueError(f"max_iter must be >= 1, got {self.max_iter}")
         if not self.tol > 0:
             raise ValueError(f"tol must be > 0, got {self.tol}")
         if self.min_matches_per_team < 0:
             raise ValueError(f"min_matches_per_team must be >= 0, got {self.min_matches_per_team}")
+
+    @classmethod
+    def with_gaussian_prior(
+        cls,
+        *,
+        sigma_strength: float = 0.30,
+        sigma_home: float = 0.15,
+        home_prior: float = 0.25,
+        sigma_rho: float = 0.10,
+        **overrides: Any,
+    ) -> "DixonColesConfig":
+        """Config whose ridge strengths encode independent Gaussian priors.
+
+        A Normal(0, sigma^2) prior on a parameter contributes ``theta^2 / (2 sigma^2)``
+        to the negative log-posterior, so ``l2 = 1 / (2 sigma^2)``. The defaults
+        (alpha/beta sd 0.30, home advantage 0.25 +- 0.15, rho sd 0.10) are typical
+        of European football and make a 20-match sample fit regular; on a full
+        season the data dominate and the MAP estimate is close to the MLE.
+        Other :class:`DixonColesConfig` fields can be passed as keyword overrides.
+        """
+        for name, value in (("sigma_strength", sigma_strength), ("sigma_home", sigma_home), ("sigma_rho", sigma_rho)):
+            if not (np.isfinite(value) and value > 0):
+                raise ValueError(f"{name} must be a finite number > 0, got {value}")
+        to_l2 = lambda sigma: 1.0 / (2.0 * float(sigma) ** 2)  # noqa: E731
+        return cls(
+            l2_penalty=to_l2(sigma_strength),
+            l2_penalty_home=to_l2(sigma_home),
+            home_prior=float(home_prior),
+            l2_penalty_rho=to_l2(sigma_rho),
+            **overrides,
+        )
 
     def to_dict(self) -> dict[str, Any]:
         """JSON-serialisable representation (bounds as lists)."""
@@ -902,6 +988,9 @@ class DixonColesEngine:
             l2_penalty=cfg.l2_penalty,
             girone_specific_home=cfg.girone_specific_home,
             min_matches_per_team=cfg.min_matches_per_team,
+            l2_penalty_home=cfg.l2_penalty_home,
+            home_prior=cfg.home_prior,
+            l2_penalty_rho=cfg.l2_penalty_rho,
         )
         effective_n = float(data.w.sum())
         log.info(
@@ -913,6 +1002,8 @@ class DixonColesEngine:
                 "method": cfg.method,
                 "xi": cfg.xi,
                 "l2_penalty": cfg.l2_penalty,
+                "l2_penalty_home": cfg.l2_penalty_home,
+                "l2_penalty_rho": cfg.l2_penalty_rho,
                 "reference_date": ref_date.isoformat(),
                 "effective_n": round(effective_n, 3),
             },

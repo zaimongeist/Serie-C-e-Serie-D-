@@ -196,3 +196,56 @@ def test_difflib_scoring_helpers() -> None:
     assert 0 <= tm.difflib_score("vicenza", "catania") < 100
     ranked = tm.difflib_extract("pergolettese", ["pergolettese", "pro patria", "catania"], limit=2)
     assert ranked[0] == ("pergolettese", 100) and len(ranked) == 2
+
+
+# ------------------------------------------------------- token-subset guard (review)
+@pytest.mark.parametrize(
+    "name",
+    ["Hellas Verona", "Inter Milan", "Internazionale", "Inter", "Juventus", "Atalanta", "Milano", "Union", "Team", "Pesaro", "Vis", "U23"],
+)
+def test_token_subset_is_not_fuzzy_evidence(matcher: TeamMatcher, name: str) -> None:
+    """Parent clubs / bare qualifiers must not collapse onto the U23 or namesake Serie C sides."""
+    result = matcher.match(name)
+    assert result.canonical is None and result.method == "none", (name, result)
+    assert result.score < matcher.threshold
+
+
+def test_token_subset_guard_holds_with_girone_restriction(matcher: TeamMatcher) -> None:
+    assert matcher.match("Juventus", Girone.B).canonical is None
+    assert matcher.match("Inter Milan", Girone.A).canonical is None
+    assert matcher.match("Hellas Verona", "A").canonical is None
+    # candidates still show what was considered, with the confirmed (low) score
+    considered = matcher.match("Juventus", Girone.B)
+    assert considered.candidates[0][0] == "Juventus Next Gen" and considered.candidates[0][1] < matcher.threshold
+
+
+def test_fuzzy_score_is_capped_below_100(matcher: TeamMatcher) -> None:
+    reordered = matcher.match("Next Gen Juventus")  # token_set/token_sort both say 100: still only fuzzy evidence
+    assert reordered.canonical == "Juventus Next Gen" and reordered.method == "fuzzy"
+    assert reordered.score == tm.MAX_FUZZY_SCORE == 99
+    assert matcher.match("Juventus Next Gen").score == 100 and matcher.match("Juventus U23").score == 100
+    # genuine typos / abbreviations keep their scores
+    assert matcher.match("Juve Next Gen").score == 87 and matcher.match("Pergoletese").score == 96
+
+
+def test_confirmation_helpers() -> None:
+    assert tm.token_coverage("juventus", "juventus next gen") == pytest.approx(1 / 3)
+    assert tm.token_coverage("hellas verona", "verona") == pytest.approx(0.5)
+    assert tm.token_coverage("hellas verona", "virtus verona") == 1.0  # overlap, not containment
+    assert tm.token_coverage("vicenza", "vicenza") == 1.0 and tm.token_coverage("", "x") == 1.0
+    assert tm.whole_string_score("juve next gen", "juventus next gen") == 87
+    assert tm.whole_string_score("gen next juventus", "juventus next gen") == 100
+    assert tm.whole_string_score("juventus", "juventus next gen") < 70
+    assert tm.confirm_score("internazionale", "internazionale u23") == round(88 * 0.5)
+    assert tm.confirm_score("inter milan", "inter milan u23") < 60
+    assert TeamMatcher.fuzzy_score("juventus", "juventus next gen", 100) < 30
+    assert TeamMatcher.fuzzy_score("gen next juventus", "juventus next gen", 100) == tm.MAX_FUZZY_SCORE
+
+
+def test_token_subset_guard_on_difflib_fallback(monkeypatch: pytest.MonkeyPatch, registry: TeamRegistry) -> None:
+    monkeypatch.setattr(tm, "DIFFLIB_FALLBACK", True)
+    fallback = TeamMatcher(registry)
+    assert fallback.match("Internazionale").canonical is None  # difflib ratio alone would be 88
+    assert fallback.match("Juventus").canonical is None
+    assert fallback.match("Juve Next Gen").canonical == "Juventus Next Gen"
+    assert tm.whole_string_score("gen next juventus", "juventus next gen") == 100  # token-sorted difflib path

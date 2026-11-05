@@ -23,7 +23,7 @@ from __future__ import annotations
 import argparse
 import sys
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date
 from pathlib import Path
 from typing import Iterable, Sequence
@@ -140,7 +140,10 @@ def run_pipeline(
     t0 = time.perf_counter()
     params = engine.fit(matches)
     say(f"metodo: {params.method}   convergenza: {params.converged} ({params.message})   iterazioni: {params.n_iter}   tempo: {params.fit_seconds:.2f}s")
-    say(f"log-likelihood pesata: {params.log_likelihood:.3f}   n={params.n_matches}   n_eff={params.effective_n:.1f}   xi={params.xi}   penalità L2={config.l2_penalty}")
+    say(
+        f"log-likelihood pesata: {params.log_likelihood:.3f}   n={params.n_matches}   n_eff={params.effective_n:.1f}   xi={params.xi}   "
+        f"prior: l2(alpha,beta)={config.l2_penalty:.2f} l2(gamma->{config.home_prior})={config.l2_penalty_home:.2f} l2(rho)={config.l2_penalty_rho:.2f}   penalità={params.penalty:.3f}"
+    )
     say(f"rho (correlazione bassi punteggi): {params.rho:+.4f}")
     for g, gamma in params.gamma.items():
         alphas = [params.alpha[t] for t in params.teams_by_girone.get(g, ())]
@@ -254,7 +257,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--odds", type=Path, help="directory of bookmaker odds CSVs (with --processed)")
     p.add_argument("--method", choices=["SLSQP", "L-BFGS-B"], default="SLSQP")
     p.add_argument("--xi", type=float, default=None, help="time-decay per day (default 0 for simulated data, 0.0018 for real data)")
-    p.add_argument("--l2", type=float, default=None, help="ridge penalty (default 0.1 for the mini dataset, 0 otherwise)")
+    p.add_argument(
+        "--prior",
+        choices=["auto", "on", "off"],
+        default="auto",
+        help="Gaussian (MAP) prior on alpha/beta, home advantage and rho: auto = on below 100 matches (default), off = pure MLE",
+    )
+    p.add_argument("--l2", type=float, default=None, help="override the alpha/beta ridge strength (default from the prior)")
     p.add_argument("--kelly", type=float, choices=[0.125, 0.25], default=0.125, help="Kelly fraction")
     p.add_argument("--bankroll", type=float, default=100.0, help="bankroll in units")
     p.add_argument("--min-ev", type=float, default=0.035, help="EV threshold (fraction)")
@@ -284,7 +293,6 @@ def main(argv: Sequence[str] | None = None) -> PipelineOutput:
     if args.processed:
         matches, fixtures, quotes = load_real_data(args.processed, args.fixtures, args.odds)
         xi = 0.0018 if args.xi is None else args.xi
-        l2 = 0.0 if args.l2 is None else args.l2
         source = f"dati reali: {args.processed}"
     else:
         league = simulate_mini_dataset(seed=args.seed) if args.mode == "mini" else simulate_league(seed=args.seed, n_rounds=30)
@@ -293,11 +301,21 @@ def main(argv: Sequence[str] | None = None) -> PipelineOutput:
             league.matches = inject_regression_trap(league.matches, trap_team)
         matches, fixtures, quotes = league.matches, league.fixtures, league.odds
         xi = 0.0 if args.xi is None else args.xi
-        l2 = (0.1 if args.mode == "mini" else 0.0) if args.l2 is None else args.l2
         source = f"dataset simulato ({args.mode}, seed={args.seed})" + (f", trappola di regressione iniettata su {trap_team}" if trap_team else "")
 
+    use_prior = (len(matches) < 100) if args.prior == "auto" else (args.prior == "on")
+    if use_prior:
+        # Small sample: a Gaussian prior (alpha/beta sd 0.30, home advantage 0.25 +- 0.15,
+        # rho sd 0.10) keeps gamma and rho off their bounds. With a full season the data
+        # dominate and the MAP estimate is practically the MLE.
+        config = DixonColesConfig.with_gaussian_prior(xi=xi, method=args.method)
+        source += " | stima MAP con prior gaussiana (campione piccolo)"
+    else:
+        config = DixonColesConfig(xi=xi, method=args.method)
+    if args.l2 is not None:
+        config = replace(config, l2_penalty=args.l2)
+
     _banner(f"SERIE C QUANT LAB -- {source}")
-    config = DixonColesConfig(xi=xi, method=args.method, l2_penalty=l2)
     value_engine = ValueEngine(min_ev=args.min_ev, kelly=KellyConfig(fraction=args.kelly, bankroll_units=args.bankroll))
     out = run_pipeline(matches, fixtures, quotes, config=config, value_engine=value_engine, export=None if args.no_export else args.export)
 

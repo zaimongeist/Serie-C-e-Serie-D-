@@ -8,6 +8,7 @@ import json
 import logging
 import random
 import re
+import shutil
 from collections.abc import Callable
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -1007,3 +1008,259 @@ def test_cli_main_writes_outputs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     assert Harvester.load_fixtures(fixtures_out)[0].match_id == "SS-2"
     printed = capsys.readouterr().out
     assert "matches=1" in printed and "Sestri Levante x1" in printed
+
+
+# ============================================================================ review findings
+def test_module_level_persistence_helpers_match_main_py_import(tmp_path: Path) -> None:
+    """``main.py`` does ``from src.ingestion.harvester import load_fixtures, load_processed``."""
+    from src.ingestion.harvester import load_fixtures, load_processed, save_fixtures, save_processed  # noqa: PLC0415
+    import src.ingestion as package  # noqa: PLC0415
+
+    assert load_processed is Harvester.load_processed and load_fixtures is Harvester.load_fixtures
+    assert save_processed is Harvester.save_processed and save_fixtures is Harvester.save_fixtures
+    for name in ("load_processed", "load_fixtures", "save_processed", "save_fixtures"):
+        assert hasattr(hv, name) and name in hv.__all__ and name in package.__all__
+        assert getattr(package, name) is getattr(hv, name)
+    df = hv.matches_to_frame([MatchRecord("SS-1", date(2025, 8, 23), 1, Girone.A, "Pro Vercelli", "Vicenza", 0, 2)])
+    fixtures = [Fixture("SS-2", date(2025, 9, 6), 3, Girone.A, "AlbinoLeffe", "Lumezzane")]
+    pd.testing.assert_frame_equal(load_processed(save_processed(df, tmp_path / "m.csv")), df)
+    assert load_fixtures(save_fixtures(fixtures, tmp_path / "f.csv")) == fixtures
+
+
+@pytest.mark.asyncio
+async def test_harvest_failure_cancels_sibling_round_fetches(http_cfg: HttpConfig, matcher: TeamMatcher) -> None:
+    """A round that keeps failing must not leave orphan requests running after harvest() raised."""
+    cfg = dataclasses.replace(http_cfg, max_retries=1, max_concurrency=4)
+    state = {"blocked": 0, "cancelled": 0}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        found = re.search(r"/events/round/(\d+)$", request.url.path)
+        if found is None:
+            return sofascore_router(request)
+        if found.group(1) == "1":
+            return json_response({"error": "down"}, status=503)
+        state["blocked"] += 1
+        try:
+            await asyncio.Event().wait()  # never resolves: only a cancellation can end it
+        except asyncio.CancelledError:
+            state["cancelled"] += 1
+            raise
+        return json_response({"events": []})  # pragma: no cover - unreachable
+
+    client, transport, _ = make_client(handler, cfg)
+    provider = SofaScoreProvider(client, load_endpoints().sofascore, matcher)
+    async with client:
+        with pytest.raises(HarvestError) as info:
+            await asyncio.wait_for(provider.harvest(Girone.A, season_id=SEASON_ID, rounds=range(1, 5)), timeout=5)
+        leftovers = [t for t in asyncio.all_tasks() if t is not asyncio.current_task() and not t.done()]
+    assert type(info.value) is HarvestError and info.value.status == 503 and info.value.attempts == 2  # not an ExceptionGroup
+    assert state["blocked"] == 3 and state["cancelled"] == 3  # every in-flight sibling was cancelled
+    assert leftovers == []
+    assert transport.calls == 2 + 3  # two attempts for round 1, one (cancelled) attempt per sibling
+
+
+@pytest.mark.asyncio
+async def test_run_concurrently_contract() -> None:
+    async def value(x: int) -> int:
+        return x * 2
+
+    async def boom() -> int:
+        raise NotFoundError("gone", url="https://x/404", status=404)
+
+    assert await hv.run_concurrently([value(1), value(2), value(3)]) == [2, 4, 6]
+    assert await hv.run_concurrently([]) == []
+    with pytest.raises(NotFoundError) as info:
+        await hv.run_concurrently([value(1), boom()])
+    assert info.value.status == 404 and isinstance(info.value.__cause__, BaseExceptionGroup)
+
+    async def bug() -> int:
+        raise RuntimeError("programming error")
+
+    with pytest.raises(RuntimeError):
+        await hv.run_concurrently([bug(), value(1)])
+
+
+@pytest.mark.asyncio
+async def test_cache_write_failure_keeps_payload_and_match(
+    http_cfg: HttpConfig, tmp_path: Path, matcher: TeamMatcher, caplog: pytest.LogCaptureFixture
+) -> None:
+    cache_dir = tmp_path / "raw"
+    cache = RawCache(cache_dir)
+    shutil.rmtree(cache_dir)
+    cache_dir.write_text("not a directory", encoding="utf-8")  # every write now fails with FileExistsError
+    client, transport, _ = make_client(sofascore_router, http_cfg, cache=cache)
+    provider = SofaScoreProvider(client, load_endpoints().sofascore, matcher)
+    with caplog.at_level(logging.WARNING, logger="src.ingestion.harvester"):
+        async with client:
+            matches, fixtures = await provider.harvest(Girone.A, season_id=SEASON_ID, rounds=[1], with_stats=True)
+    assert [m.match_id for m in matches] == ["SS-13579101", "SS-13579102", "SS-13579103"]
+    assert matches[0].home_xg == 0.87 and fixtures == []
+    assert transport.calls == 1 + 2 + (http_cfg.max_retries + 1)  # events, two good stats payloads, the broken one
+    failed = [r for r in caplog.records if r.getMessage() == "cache write failed, payload kept"]
+    assert len(failed) == 1 + 2 and all("File exists" in r.error for r in failed)  # events + the two good stats payloads
+    assert client.stats.errors == 1  # only the genuine 500 counts as a request error
+
+
+@pytest.mark.asyncio
+async def test_cache_read_failure_falls_back_to_network(
+    http_cfg: HttpConfig, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    cache = RawCache(tmp_path)
+
+    def unreadable(url: str, params: Any = None) -> Any:
+        raise PermissionError(13, "Permission denied", str(tmp_path))
+
+    monkeypatch.setattr(cache, "get", unreadable)
+    client, transport, _ = make_client(lambda request: json_response({"n": 1}), http_cfg, cache=cache)
+    with caplog.at_level(logging.WARNING, logger="src.ingestion.harvester"):
+        async with client:
+            assert await client.get_json("/x") == {"n": 1}
+    assert transport.calls == 1 and client.stats.cache_hits == 0
+    assert any(r.getMessage() == "cache read failed, fetching" for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_sofascore_harvest_treats_no_rounds_as_failure(http_cfg: HttpConfig, matcher: TeamMatcher, registry: TeamRegistry, tmp_path: Path) -> None:
+    def router(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/rounds"):
+            return json_response({"rounds": []})  # payload drift: no rounds, no currentRound
+        return sofascore_router(request)
+
+    client, transport, _ = make_client(router, http_cfg)
+    provider = SofaScoreProvider(client, load_endpoints().sofascore, matcher)
+    async with client:
+        with pytest.raises(HarvestError, match="no rounds") as info:
+            await provider.harvest(Girone.A, season_id=SEASON_ID)
+    assert info.value.url.endswith(f"/season/{SEASON_ID}/rounds") and transport.calls == 1
+    harvester = Harvester(endpoints=load_endpoints(), registry=registry, cache_dir=tmp_path, transport=CountingTransport(router), sleeper=RecordingSleeper())
+    with pytest.raises(HarvestError, match="no rounds"):
+        await harvester.harvest_all([Girone.A])
+
+
+def _fake_harvest_all(matches: pd.DataFrame, failures: dict[str, str]) -> Callable[..., Any]:
+    async def fake(self: Harvester, gironi, *, season_id=None, with_stats=True) -> HarvestResult:
+        return HarvestResult(
+            matches=matches,
+            fixtures=[Fixture("SS-9", date(2025, 9, 6), 3, Girone.A, "AlbinoLeffe", "Lumezzane")],
+            unmapped_teams={},
+            stats={"requests": 1, "retries": 0, "cache_hits": 0, "errors": 0},
+            provider="sofascore",
+            failures=failures,
+        )
+
+    return fake
+
+
+def _write_existing_outputs(out: Path, fixtures_out: Path) -> pd.DataFrame:
+    existing = hv.matches_to_frame(
+        [
+            MatchRecord("SS-1", date(2025, 8, 23), 1, Girone.A, "Pro Vercelli", "Vicenza", 0, 2),
+            MatchRecord("SS-2", date(2025, 8, 24), 1, Girone.B, "Arezzo", "Ternana", 1, 1),
+        ]
+    )
+    Harvester.save_processed(existing, out)
+    Harvester.save_fixtures([Fixture("SS-8", date(2025, 9, 6), 3, Girone.B, "Rimini", "Pontedera")], fixtures_out)
+    return existing
+
+
+def test_cli_partial_harvest_exits_nonzero_and_keeps_existing_outputs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    out, fixtures_out = tmp_path / "matches.csv", tmp_path / "fixtures.csv"
+    existing = _write_existing_outputs(out, fixtures_out)
+    partial = hv.matches_to_frame([MatchRecord("SS-3", date(2025, 9, 1), 2, Girone.A, "Lecco", "Novara", 2, 0)])
+    monkeypatch.setattr(Harvester, "harvest_all", _fake_harvest_all(partial, {"B:sofascore": "HTTP 503", "C:sofascore": "HTTP 503"}))
+    args = ["--gironi", "A", "B", "C", "--out", str(out), "--fixtures-out", str(fixtures_out), "--cache-dir", str(tmp_path / "raw")]
+
+    assert hv.main(args) == 1
+    pd.testing.assert_frame_equal(Harvester.load_processed(out), existing)  # untouched
+    assert [f.match_id for f in Harvester.load_fixtures(fixtures_out)] == ["SS-8"]
+    captured = capsys.readouterr()
+    assert "partial harvest" in captured.err and "--allow-partial" in captured.err and "failure B:sofascore" in captured.err
+    assert "matches ->" not in captured.out
+
+    assert hv.main([*args, "--allow-partial"]) == 1  # written on request, exit code still signals the failures
+    assert Harvester.load_processed(out)["match_id"].tolist() == ["SS-3"]
+    assert [f.match_id for f in Harvester.load_fixtures(fixtures_out)] == ["SS-9"]
+    assert "matches ->" in capsys.readouterr().out
+
+
+def test_cli_empty_harvest_never_overwrites_good_data(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    out, fixtures_out = tmp_path / "matches.csv", tmp_path / "fixtures.csv"
+    existing = _write_existing_outputs(out, fixtures_out)
+    monkeypatch.setattr(Harvester, "harvest_all", _fake_harvest_all(hv.empty_matches_frame(), {}))
+    args = ["--out", str(out), "--fixtures-out", str(fixtures_out), "--cache-dir", str(tmp_path / "raw")]
+
+    assert hv.main(args) == 1
+    pd.testing.assert_frame_equal(Harvester.load_processed(out), existing)
+    assert "refusing to overwrite" in capsys.readouterr().err
+    assert hv.main([*args, "--allow-partial"]) == 1  # --allow-partial never licenses destroying data with an empty frame
+    assert len(Harvester.load_processed(out)) == 2
+
+    fresh_out, fresh_fixtures = tmp_path / "fresh" / "matches.csv", tmp_path / "fresh" / "fixtures.csv"
+    assert hv.main(["--out", str(fresh_out), "--fixtures-out", str(fresh_fixtures), "--cache-dir", str(tmp_path / "raw")]) == 1
+    assert fresh_out.exists() and Harvester.load_processed(fresh_out).empty  # harmless header-only file where nothing existed
+    assert hv._csv_has_rows(fresh_out) is False and hv._csv_has_rows(out) is True and hv._csv_has_rows(tmp_path / "missing.csv") is False
+
+
+def test_cli_parser_allow_partial_flag() -> None:
+    assert hv._build_parser().parse_args([]).allow_partial is False
+    assert hv._build_parser().parse_args(["--allow-partial"]).allow_partial is True
+
+
+def _write_endpoints_toml(path: Path, stat_keys_block: str) -> Path:
+    base = (Path(__file__).resolve().parents[1] / "config" / "endpoints.toml").read_text(encoding="utf-8")
+    head, _, _ = base.partition("[sofascore.stat_keys]")
+    _, _, tail = base.partition("[fotmob]")
+    path.write_text(head + "[sofascore.stat_keys]\n" + stat_keys_block + "\n[fotmob]" + tail, encoding="utf-8")
+    return path
+
+
+@pytest.mark.parametrize(
+    "block",
+    [
+        'shots = "totalShotsOnGoal"\nxg = ["expectedGoals"]',  # scalar string: would iterate characters
+        'shots = []\nxg = ["expectedGoals"]',  # empty list
+        'shots = [""]\nxg = ["expectedGoals"]',  # blank key
+        'shots = [1, 2]\nxg = ["expectedGoals"]',  # non-string keys
+        "shots = 12",
+    ],
+)
+def test_load_endpoints_rejects_malformed_stat_keys(tmp_path: Path, block: str) -> None:
+    with pytest.raises(ValueError, match="stat_keys"):
+        load_endpoints(_write_endpoints_toml(tmp_path / "endpoints.toml", block))
+
+
+def test_load_endpoints_accepts_lists_and_warns_on_unknown_metric(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    toml = _write_endpoints_toml(tmp_path / "endpoints.toml", 'shots = ["totalShotsOnGoal", " Total shots "]\nxG = ["expectedGoals"]')
+    with caplog.at_level(logging.WARNING, logger="src.ingestion.harvester"):
+        cfg = load_endpoints(toml)
+    assert cfg.sofascore.stat_keys == {"shots": ("totalShotsOnGoal", "Total shots"), "xG": ("expectedGoals",)}
+    assert any(r.getMessage() == "unknown stat_keys metric is never used" and r.metric == "xG" for r in caplog.records)
+    assert SofaScoreProvider.parse_statistics(load_fixture("statistics_13579101.json"), cfg.sofascore.stat_keys)["home_shots"] == 9.0
+    no_keys = _write_endpoints_toml(tmp_path / "none.toml", "")
+    assert load_endpoints(no_keys).sofascore.stat_keys == {}
+
+
+@pytest.mark.asyncio
+async def test_harvest_warns_when_a_metric_is_never_located(http_cfg: HttpConfig, matcher: TeamMatcher, caplog: pytest.LogCaptureFixture) -> None:
+    base = load_endpoints().sofascore
+    drifted = dataclasses.replace(base, stat_keys={**base.stat_keys, "xg": ("xgTotalRenamedUpstream",)})
+    client, _, _ = make_client(sofascore_router, http_cfg)
+    with caplog.at_level(logging.WARNING, logger="src.ingestion.harvester"):
+        async with client:
+            matches, _ = await SofaScoreProvider(client, drifted, matcher).harvest(Girone.A, season_id=SEASON_ID, rounds=[1])
+    assert all(m.home_xg is None for m in matches) and matches[0].home_shots == 9.0
+    warnings = [r for r in caplog.records if r.getMessage() == "statistics metrics never located"]
+    assert len(warnings) == 1 and warnings[0].metrics == ["xg"] and warnings[0].payloads == 2 and warnings[0].source == "sofascore"
+    assert warnings[0].keys == {"xg": ["xgTotalRenamedUpstream"]}
+
+    caplog.clear()
+    client, _, _ = make_client(sofascore_router, http_cfg)
+    with caplog.at_level(logging.WARNING, logger="src.ingestion.harvester"):
+        async with client:
+            await SofaScoreProvider(client, base, matcher).harvest(Girone.A, season_id=SEASON_ID, rounds=[1])
+    assert not [r for r in caplog.records if r.getMessage() == "statistics metrics never located"]  # xG present in one payload
+    assert hv._warn_missing_metrics([], base.stat_keys, "sofascore") == []  # no payload fetched: nothing to judge
