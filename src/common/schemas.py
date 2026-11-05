@@ -14,6 +14,7 @@ from datetime import date, datetime
 from enum import Enum
 from typing import Any, Final, Iterable, Mapping, Sequence
 
+import numpy as np
 import pandas as pd
 
 __all__ = [
@@ -25,6 +26,7 @@ __all__ = [
     "MatchRecord",
     "Fixture",
     "OddsQuote",
+    "MatchPrediction",
     "Market",
     "SELECTIONS",
     "matches_to_frame",
@@ -234,6 +236,40 @@ class OddsQuote:
         for sel, o in self.odds.items():
             if not (o > 1.0):
                 raise ValueError(f"decimal odds must be > 1.0 ({sel}={o})")
+
+
+@dataclass(frozen=True, slots=True)
+class MatchPrediction:
+    """Model output for one fixture: the interface between the engine
+    (``src/engine/model.py``), the value module (``src/engine/value.py``) and the
+    dashboard. ``probabilities``/``fair_odds`` are keyed exactly like
+    :data:`SELECTIONS`; ``matrix[i, j]`` is ``P(home goals = i, away goals = j)``."""
+
+    fixture: Fixture
+    home_rate: float  # lambda
+    away_rate: float  # mu
+    rho: float
+    matrix: np.ndarray
+    probabilities: dict[Market, dict[str, float]]
+    fair_odds: dict[Market, dict[str, float]]
+
+    def __post_init__(self) -> None:
+        if self.matrix.ndim != 2 or self.matrix.shape[0] != self.matrix.shape[1]:
+            raise ValueError("matrix must be square")
+        if not np.isclose(self.matrix.sum(), 1.0, atol=1e-6):
+            raise ValueError("matrix must sum to 1")
+
+    @property
+    def match_id(self) -> str:
+        return self.fixture.match_id
+
+    @property
+    def expected_goals(self) -> float:
+        return self.home_rate + self.away_rate
+
+    def most_likely_score(self) -> tuple[int, int, float]:
+        i, j = np.unravel_index(int(np.argmax(self.matrix)), self.matrix.shape)
+        return int(i), int(j), float(self.matrix[i, j])
 
 
 def empty_matches_frame() -> pd.DataFrame:
