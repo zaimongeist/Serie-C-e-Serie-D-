@@ -1,0 +1,103 @@
+# Raccolta dati post-giornata: scarica le ultime 3 stagioni di Serie C (Gironi A/B/C),
+# aggiorna data/processed/*.csv e committa solo se qualcosa è cambiato.
+#
+# Dove gira:
+#   - per default sui runner GitHub (ubuntu-latest). ATTENZIONE: SofaScore risponde spesso
+#     HTTP 403 agli IP dei datacenter; in quel caso il job fallisce e il riepilogo lo spiega.
+#   - per girare dal tuo PC (IP residenziale, la via affidabile): registra un self-hosted runner
+#     (Settings → Actions → Runners → New self-hosted runner) e imposta la variabile di repository
+#     HARVEST_RUNNER = self-hosted (Settings → Secrets and variables → Actions → Variables).
+#     Il job partirà sul PC quando è acceso e il runner è in esecuzione.
+name: Aggiorna dati Serie C
+
+on:
+  schedule:
+    # Lunedì e giovedì alle 06:30 UTC (dopo i turni del weekend e infrasettimanali).
+    - cron: "30 6 * * 1,4"
+  workflow_dispatch:
+    inputs:
+      seasons:
+        description: "Numero di stagioni da raccogliere (le più recenti)"
+        default: "3"
+        required: false
+      with_stats:
+        description: "Scaricare anche tiri/angoli/xG (true/false)"
+        default: "true"
+        required: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: aggiorna-dati
+  cancel-in-progress: false
+
+jobs:
+  harvest:
+    runs-on: ${{ vars.HARVEST_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 120
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+
+      - name: Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Dipendenze
+        run: python -m pip install --disable-pip-version-check -r requirements.txt
+
+      - name: Cache risposte grezze (stagioni concluse)
+        uses: actions/cache@v4
+        with:
+          path: data/raw
+          key: sofascore-raw-${{ github.ref_name }}-${{ github.run_id }}
+          restore-keys: |
+            sofascore-raw-${{ github.ref_name }}-
+
+      - name: Raccolta dati
+        id: harvest
+        env:
+          SERIEC_LOG_LEVEL: INFO
+        run: |
+          set -o pipefail
+          SEASONS="${{ github.event.inputs.seasons || '3' }}"
+          STATS_FLAG=""
+          if [ "${{ github.event.inputs.with_stats || 'true' }}" = "false" ]; then STATS_FLAG="--no-stats"; fi
+          python -m src.ingestion.harvester --gironi A B C --seasons "$SEASONS" $STATS_FLAG 2>&1 | tee harvest.log
+
+      - name: Riepilogo in caso di errore
+        if: failure()
+        run: |
+          {
+            echo "## Raccolta dati non riuscita"
+            if grep -qE "status=403|HTTP 403|Forbidden" harvest.log; then
+              echo "SofaScore ha risposto **403 Forbidden**: l'IP del runner è bloccato."
+              echo "Soluzione: esegui il job da un self-hosted runner sul tuo PC (variabile HARVEST_RUNNER=self-hosted) oppure lancia \`avvia.command\` / \`avvia.bat\` in locale."
+            else
+              echo "Vedi il log del passo *Raccolta dati*."
+            fi
+            echo; echo '```'; tail -n 40 harvest.log; echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Commit dei CSV aggiornati
+        if: success()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/processed/matches.csv data/processed/fixtures.csv
+          if git diff --cached --quiet; then
+            echo "Nessuna variazione nei dati: niente da committare." | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          N=$(python - <<'PY'
+          import pandas as pd; print(len(pd.read_csv("data/processed/matches.csv")))
+          PY
+          )
+          git commit -m "Aggiorna dati Serie C ($(date -u +%Y-%m-%d), $N partite)"
+          git push
+          echo "Dati aggiornati: $N partite in data/processed/matches.csv" >> "$GITHUB_STEP_SUMMARY"

@@ -55,6 +55,35 @@ Serie-C-e-Serie-D-/
 └── tests/                         # Unit test, validazione numerica, test dashboard (AppTest)
 ```
 
+## 🖱️ Avvio con un doppio clic (senza terminale)
+
+1. Installa Python 3.12 o superiore da <https://www.python.org/downloads/> (su Windows spunta "Add python.exe to PATH").
+2. Scarica il progetto: su GitHub pulsante **Code → Download ZIP**, poi estrai la cartella.
+3. Fai doppio clic su `avvia.bat` (Windows) o `avvia.command` (macOS; la prima volta: tasto destro → Apri).
+
+Lo script crea l'ambiente Python, installa le dipendenze, raccoglie i dati reali delle ultime tre stagioni
+(la prima volta serve qualche decina di minuti, poi è veloce grazie alla cache) e apre la dashboard nel browser.
+Per aprire solo la dashboard senza aggiornare i dati: `avvia.bat --solo-dashboard`.
+Le quote dei bookmaker vanno in `data/odds/*.csv` (formato più sotto).
+Per pubblicare i CSV raccolti sul repository (così li vede anche la dashboard in cloud):
+`pubblica_dati.bat` / `pubblica_dati.command` (serve git e una copia clonata, non lo ZIP).
+
+## ⏱️ Aggiornamento automatico dopo ogni giornata (GitHub Actions)
+
+Il workflow `.github/workflows/aggiorna-dati.yml` gira lunedì e giovedì alle 06:30 UTC (o a mano da
+*Actions → Aggiorna dati Serie C → Run workflow*), raccoglie le ultime tre stagioni e committa
+`data/processed/matches.csv` e `fixtures.csv` solo se sono cambiati.
+
+- **Sui runner GitHub** (default) SofaScore risponde spesso `403 Forbidden` agli IP dei datacenter: in quel
+  caso il job fallisce e il riepilogo lo spiega. Vale la pena tenerlo attivo (a volte passa), ma non contarci.
+- **Dal tuo PC, in automatico**: registra un *self-hosted runner* (Settings → Actions → Runners → New self-hosted
+  runner, segui i comandi mostrati) e imposta la variabile di repository `HARVEST_RUNNER = self-hosted`
+  (Settings → Secrets and variables → Actions → Variables). Lo stesso job partirà sul tuo PC, con il tuo IP,
+  quando è acceso e il runner è in esecuzione. È la via affidabile.
+- **A mano**: `avvia.bat` / `avvia.command` raccolgono i dati, poi `pubblica_dati.*` li carica sul repository.
+
+I CSV in `data/processed/` e `data/odds/` sono versionati; la cache grezza `data/raw/` no.
+
 ## 🚀 Quick Start
 
 ```bash

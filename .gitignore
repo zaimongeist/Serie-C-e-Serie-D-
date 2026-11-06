@@ -13,9 +13,12 @@ venv/
 # raw cache and generated data (keep the folders)
 data/raw/*
 !data/raw/.gitkeep
+# processed CSVs and odds snapshots are versioned (the dashboard in cloud reads them from the repo)
 data/processed/*
 !data/processed/.gitkeep
+!data/processed/*.csv
 data/odds/*
 !data/odds/.gitkeep
+!data/odds/*.csv
 reports/
 *.log
