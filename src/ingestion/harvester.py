@@ -66,12 +66,13 @@ import httpx
 import pandas as pd
 
 from src.common.logging_config import configure_logging, get_logger
-from src.common.paths import CONFIG_DIR, PROCESSED_DIR, RAW_DIR
+from src.common.paths import CONFIG_DIR, ODDS_DIR, PROCESSED_DIR, RAW_DIR
 from src.common.schemas import (
     MATCH_COLUMNS,
     Fixture,
     Girone,
     MatchRecord,
+    OddsQuote,
     empty_matches_frame,
     matches_to_frame,
     season_of,
@@ -84,10 +85,13 @@ __all__ = [
     "DEFAULT_USER_AGENTS",
     "FIXTURE_COLUMNS",
     "FOTMOB_STAT_KEYS",
+    "ODDS_COLUMNS",
+    "PROVIDER_NAMES",
     "STAT_FIELDS",
     "AsyncHarvesterClient",
     "ClientStats",
     "EndpointsConfig",
+    "FootyStatsEndpoints",
     "FotMobEndpoints",
     "FotMobProvider",
     "HarvestError",
@@ -101,6 +105,7 @@ __all__ = [
     "SeasonInfo",
     "SofaScoreEndpoints",
     "SofaScoreProvider",
+    "default_providers",
     "load_endpoints",
     "load_fixtures",
     "load_processed",
@@ -109,6 +114,7 @@ __all__ = [
     "parse_stat_value",
     "run_concurrently",
     "save_fixtures",
+    "save_odds",
     "save_processed",
     "season_label_from_year",
     "site_origin",
@@ -164,6 +170,10 @@ FOTMOB_STAT_KEYS: Final[dict[str, tuple[str, ...]]] = {
 
 #: Columns of the fixtures CSV written by :meth:`Harvester.save_fixtures`.
 FIXTURE_COLUMNS: Final[tuple[str, ...]] = ("match_id", "date", "round", "girone", "home_team", "away_team")
+
+#: Columns of the odds CSV written by :func:`save_odds` (one row per quoted selection),
+#: the format ``main.load_odds_dir`` and the dashboard read from ``data/odds/*.csv``.
+ODDS_COLUMNS: Final[tuple[str, ...]] = ("match_id", "bookmaker", "market", "selection", "odds")
 
 _NUMBER_RE = re.compile(r"-?\d+(?:[.,]\d+)?")
 _SCORE_RE = re.compile(r"(\d+)\s*[-:–]\s*(\d+)")
@@ -321,12 +331,54 @@ class FotMobEndpoints:
 
 
 @dataclass(frozen=True)
+class FootyStatsEndpoints:
+    """``[footystats]`` section: the official FootyStats API (``api.football-data-api.com``).
+
+    The API key never lives in the configuration: ``key_env`` names the environment
+    variable (also looked up in a ``.env`` file in the repository root) that holds
+    it. ``league_names`` maps a competition code (``'A'``, ``'B'``, ``'C'``, ``'SB'``)
+    to the ``name`` field of ``/league-list`` and is the fallback when the shared
+    competitions module is not available; ``season_ids`` (code -> season label ->
+    FootyStats ``season_id``) is used only when ``/league-list`` cannot be reached.
+    The defaults are the public API as documented in November 2026, so a
+    configuration file without the section still works.
+    """
+
+    base_url: str = "https://api.football-data-api.com"
+    league_list: str = "/league-list"
+    league_matches: str = "/league-matches"
+    league_teams: str = "/league-teams"
+    key_env: str = "FOOTYSTATS_API_KEY"
+    max_requests_per_hour: int = 1800
+    league_names: Mapping[str, str] = field(default_factory=dict)
+    season_ids: Mapping[str, Mapping[str, int]] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if int(self.max_requests_per_hour) < 1:
+            raise ValueError("max_requests_per_hour must be >= 1")
+
+    def url_league_list(self) -> str:
+        return _join_url(self.base_url, self.league_list)
+
+    def url_league_matches(self) -> str:
+        return _join_url(self.base_url, self.league_matches)
+
+    def url_league_teams(self) -> str:
+        return _join_url(self.base_url, self.league_teams)
+
+    def known_season_ids(self, code: str) -> dict[str, int]:
+        """Configured fallback season ids of ``code`` (label ``'2026/27'`` -> id), ``{}`` when none."""
+        return {str(label): int(season_id) for label, season_id in (self.season_ids.get(str(code).upper()) or {}).items()}
+
+
+@dataclass(frozen=True)
 class EndpointsConfig:
     """Whole ``endpoints.toml``."""
 
     sofascore: SofaScoreEndpoints
     fotmob: FotMobEndpoints
     http: HttpConfig
+    footystats: FootyStatsEndpoints = field(default_factory=FootyStatsEndpoints)
 
 
 def _require(section: Mapping[str, Any], key: str, section_name: str, path: Path) -> Any:
@@ -412,8 +464,39 @@ def load_endpoints(path: Path = CONFIG_DIR / "endpoints.toml") -> EndpointsConfi
         cache_ttl_hours=float(http_raw.get("cache_ttl_hours", defaults.cache_ttl_hours)),
         history_cache_ttl_hours=float(http_raw.get("history_cache_ttl_hours", defaults.history_cache_ttl_hours)),
     )
+    footystats = _parse_footystats_section(raw.get("footystats"), path)
     log.debug("endpoints loaded", extra={"path": str(path)})
-    return EndpointsConfig(sofascore=sofascore, fotmob=fotmob, http=http)
+    return EndpointsConfig(sofascore=sofascore, fotmob=fotmob, http=http, footystats=footystats)
+
+
+def _parse_footystats_section(raw: Any, path: Path) -> FootyStatsEndpoints:
+    """``[footystats]`` -> :class:`FootyStatsEndpoints`; a missing section yields the defaults."""
+    if raw is None:
+        return FootyStatsEndpoints()
+    if not isinstance(raw, Mapping):
+        raise ValueError(f"{path}: [footystats] must be a table, got {type(raw).__name__}")
+    defaults = FootyStatsEndpoints()
+    names_raw = raw.get("league_names") or {}
+    if not isinstance(names_raw, Mapping) or not all(isinstance(v, str) and v.strip() for v in names_raw.values()):
+        raise ValueError(f"{path}: [footystats.league_names] must map competition codes to non-empty strings")
+    ids_raw = raw.get("season_ids") or {}
+    if not isinstance(ids_raw, Mapping):
+        raise ValueError(f"{path}: [footystats.season_ids] must be a table of code -> {{season label = id}}")
+    season_ids: dict[str, dict[str, int]] = {}
+    for code, labels in ids_raw.items():
+        if not isinstance(labels, Mapping):
+            raise ValueError(f"{path}: [footystats.season_ids] {code!r} must be a table of season label -> id")
+        season_ids[str(code).upper()] = {str(label): int(season_id) for label, season_id in labels.items()}
+    return FootyStatsEndpoints(
+        base_url=str(raw.get("base_url", defaults.base_url)).rstrip("/"),
+        league_list=str(raw.get("league_list", defaults.league_list)),
+        league_matches=str(raw.get("league_matches", defaults.league_matches)),
+        league_teams=str(raw.get("league_teams", defaults.league_teams)),
+        key_env=str(raw.get("key_env", defaults.key_env)),
+        max_requests_per_hour=int(raw.get("max_requests_per_hour", defaults.max_requests_per_hour)),
+        league_names={str(code).upper(): str(name).strip() for code, name in names_raw.items()},
+        season_ids=season_ids,
+    )
 
 
 # =============================================================================
@@ -1730,7 +1813,11 @@ class HarvestResult:
     canonical names resolved through the aliases of older dictionaries that are
     not part of the perimeter (relegated / promoted / excluded clubs);
     ``unmapped_teams`` are raw spellings no dictionary knows, with their counts
-    (the two sets are disjoint).
+    (the two sets are disjoint). ``odds`` holds the pre-match quotes of the
+    ``fixtures`` when the provider supplies them (FootyStats; SofaScore does
+    not), ready for :func:`save_odds`. ``provider`` names the provider(s) that
+    delivered data (``'footystats'``, ``'sofascore'`` or ``'footystats+sofascore'``
+    when the fallback kicked in for some girone).
     """
 
     matches: pd.DataFrame
@@ -1743,6 +1830,7 @@ class HarvestResult:
     n_matches_by_season: dict[str, int] = field(default_factory=dict)
     historical_teams: tuple[str, ...] = ()
     registry_season: str = ""
+    odds: list[OddsQuote] = field(default_factory=list)
 
     @property
     def perimeter_season(self) -> str | None:
@@ -1771,13 +1859,35 @@ class HarvestResult:
             f"provider={self.provider} gironi={gironi} matches={len(self.matches)} fixtures={len(self.fixtures)} "
             f"season={self.registry_season or '-'} seasons={','.join(self.seasons) or '-'} "
             f"historical_matches={self.n_historical_matches} historical_teams={len(self.historical_teams)} "
-            f"unmapped_teams={len(self.unmapped_teams)} requests={self.stats.get('requests', 0)} "
+            f"unmapped_teams={len(self.unmapped_teams)} odds={len(self.odds)} requests={self.stats.get('requests', 0)} "
             f"retries={self.stats.get('retries', 0)} cache_hits={self.stats.get('cache_hits', 0)} "
             f"errors={self.stats.get('errors', 0)} failures={len(self.failures)}"
         )
 
 
-PROVIDER_NAMES: Final[tuple[str, ...]] = (SofaScoreProvider.name, FotMobProvider.name)
+#: Name of the FootyStats provider (:class:`src.ingestion.footystats.FootyStatsProvider`);
+#: that module imports this one, so the name is spelled here to avoid a circular import.
+FOOTYSTATS_PROVIDER: Final[str] = "footystats"
+
+#: Every provider the facade can drive, in the default fallback order.
+PROVIDER_NAMES: Final[tuple[str, ...]] = (FOOTYSTATS_PROVIDER, SofaScoreProvider.name, FotMobProvider.name)
+
+
+def default_providers(api_key: str | None = None) -> tuple[str, ...]:
+    """Provider order used when none is given: FootyStats first when a key is available.
+
+    ``('footystats', 'sofascore')`` when ``api_key`` is given or
+    :func:`src.ingestion.footystats.find_api_key` finds one (environment
+    variable or ``.env`` file), ``('sofascore',)`` otherwise, so an installation
+    without a FootyStats account keeps the historical behaviour unchanged.
+    """
+    if api_key is None:
+        from src.ingestion import footystats as _footystats  # local import: footystats imports this module
+
+        api_key = _footystats.find_api_key()
+    if api_key:
+        return (FOOTYSTATS_PROVIDER, SofaScoreProvider.name)
+    return (SofaScoreProvider.name,)
 
 
 class Harvester:
@@ -1806,6 +1916,15 @@ class Harvester:
     payloads are immutable, so a multi-season run repeated later re-downloads
     the current season only. ``None`` for either means "take the endpoints
     configuration".
+
+    ``providers`` defaults to :func:`default_providers`: FootyStats (the
+    official API, reachable from datacenters, with pre-match odds) followed by
+    SofaScore when an API key is available (``api_key``, the environment
+    variable ``FOOTYSTATS_API_KEY`` or a ``.env`` file), SofaScore alone
+    otherwise. FootyStats harvests every requested competition in one pass;
+    the facade then falls back to the next provider for the gironi it could not
+    deliver. ``mapping_path`` is the persisted FootyStats team-id mapping
+    (``config/footystats_teams.json`` by default).
     """
 
     def __init__(
@@ -1815,7 +1934,7 @@ class Harvester:
         registry: TeamRegistry | None = None,
         cache_dir: Path = RAW_DIR,
         cache_ttl: timedelta | None = None,
-        providers: Sequence[str] = ("sofascore",),
+        providers: Sequence[str] | None = None,
         transport: httpx.AsyncBaseTransport | None = None,
         extra_headers: Mapping[str, str] | None = None,
         matcher: TeamMatcher | None = None,
@@ -1825,12 +1944,18 @@ class Harvester:
         historical_aliases: bool = True,
         config_dir: Path = CONFIG_DIR,
         history_cache_ttl: timedelta | None = None,
+        api_key: str | None = None,
+        mapping_path: Path | None = None,
     ) -> None:
+        self.api_key = api_key
+        if providers is None:
+            providers = default_providers(api_key)
         names = tuple(str(p).lower() for p in providers)
         unknown = [p for p in names if p not in PROVIDER_NAMES]
         if unknown or not names:
             raise ValueError(f"providers must be a non-empty subset of {PROVIDER_NAMES}, got {providers!r}")
         self.endpoints = endpoints if endpoints is not None else load_endpoints()
+        self.mapping_path = Path(mapping_path) if mapping_path is not None else Path(config_dir) / "footystats_teams.json"
         self.config_dir = Path(config_dir)
         if registry is not None:
             self.registry = registry
@@ -1867,8 +1992,39 @@ class Harvester:
             return SofaScoreProvider(client, self.endpoints.sofascore, self.matcher)
         return FotMobProvider(client, self.endpoints.fotmob, self.matcher)
 
+    def _make_footystats(self) -> Any:
+        """:class:`src.ingestion.footystats.FootyStatsProvider` on this facade's cache, matcher and transport.
+
+        Raises :class:`src.ingestion.footystats.MissingApiKeyError` (a
+        :class:`HarvestError`) when no key can be resolved, so the facade records
+        it as a provider failure and moves on to the next provider.
+        """
+        from src.ingestion import footystats as _footystats  # local import: footystats imports this module
+
+        client = _footystats.FootyStatsClient(
+            api_key=_footystats.resolve_api_key(self.api_key, key_env=self.endpoints.footystats.key_env),
+            endpoints=self.endpoints.footystats,
+            http=self.endpoints.http,
+            cache=self.cache,
+            transport=self._transport,
+            sleeper=self._sleeper,
+            rng=self._rng,
+        )
+        mapper = _footystats.FootyStatsTeamMapper(self.registry, self.matcher, mapping_path=self.mapping_path)
+        return _footystats.FootyStatsProvider(client, mapper, self.endpoints.footystats)
+
     def _base_url(self, name: str) -> str:
         return self.endpoints.sofascore.base_url if name == SofaScoreProvider.name else self.endpoints.fotmob.base_url
+
+    def _supports(self, name: str, girone: Girone) -> str | None:
+        """Why provider ``name`` cannot serve ``girone`` at all (``None`` when it can).
+
+        SofaScore needs a configured tournament id; FotMob resolves ids at runtime
+        and FootyStats resolves seasons by competition name, so both always qualify.
+        """
+        if name == SofaScoreProvider.name and girone not in self.endpoints.sofascore.tournament_ids:
+            return f"no SofaScore tournament id configured for girone {girone.value}"
+        return None
 
     @staticmethod
     def registry_with_history(registry: TeamRegistry, config_dir: Path = CONFIG_DIR) -> TeamRegistry:

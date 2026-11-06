@@ -62,3 +62,35 @@ cache_ttl_hours = 6
 # repeated after cache_ttl_hours re-downloads only the current season; set it to 0
 # (or pass --history-cache-ttl-hours 0) to force the history to be downloaded again.
 history_cache_ttl_hours = 8760
+
+[footystats]
+# Official, documented API (https://footystats.org/api/). Unlike SofaScore it answers
+# from datacenter IPs, so it is the provider the GitHub Actions job uses. The API key
+# (your account at footystats.org -> API) is NEVER written here: it is read from the
+# environment variable named in `key_env`, from a `.env` file in the repository root
+# (FOOTYSTATS_API_KEY=...) or from `--key`. On footystats.org add the competitions you
+# want to harvest to your account ("Choose leagues"): the harvester only sees the
+# chosen ones (`league_list` with chosen_leagues_only=true). Needed for this project:
+#   Italy Serie C Group A, Italy Serie C Group B, Italy Serie C Group C, Italy Serie B
+base_url = "https://api.football-data-api.com"
+league_list = "/league-list"
+league_matches = "/league-matches"
+league_teams = "/league-teams"
+key_env = "FOOTYSTATS_API_KEY"
+# Standard plans allow about 1800 requests per hour (HTTP 429 beyond that, retried with
+# backoff). A full run of 4 competitions x 3 seasons costs ~25 requests.
+max_requests_per_hour = 1800
+# Competition code -> `name` field of /league-list. Used when the shared competitions
+# module (src/common/competitions.py) is not available.
+[footystats.league_names]
+A = "Italy Serie C Group A"
+B = "Italy Serie C Group B"
+C = "Italy Serie C Group C"
+SB = "Italy Serie B"
+# Known season ids (verified 2026-11-06), used only as a fallback when /league-list
+# cannot be reached; the live listing always wins.
+[footystats.season_ids]
+A = { "2024/25" = 12659, "2025/26" = 15535, "2026/27" = 17487 }
+B = { "2024/25" = 12647, "2025/26" = 15532, "2026/27" = 17492 }
+C = { "2024/25" = 12670, "2025/26" = 15519, "2026/27" = 17473 }
+SB = { "2024/25" = 12621, "2025/26" = 15632, "2026/27" = 17404 }
