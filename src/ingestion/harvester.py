@@ -1873,18 +1873,20 @@ FOOTYSTATS_PROVIDER: Final[str] = "footystats"
 PROVIDER_NAMES: Final[tuple[str, ...]] = (FOOTYSTATS_PROVIDER, SofaScoreProvider.name, FotMobProvider.name)
 
 
-def default_providers(api_key: str | None = None) -> tuple[str, ...]:
+def default_providers(api_key: str | None = None, *, key_env: str = "FOOTYSTATS_API_KEY") -> tuple[str, ...]:
     """Provider order used when none is given: FootyStats first when a key is available.
 
     ``('footystats', 'sofascore')`` when ``api_key`` is given or
-    :func:`src.ingestion.footystats.find_api_key` finds one (environment
-    variable or ``.env`` file), ``('sofascore',)`` otherwise, so an installation
-    without a FootyStats account keeps the historical behaviour unchanged.
+    :func:`src.ingestion.footystats.find_api_key` finds one in the environment
+    variable ``key_env`` or in the ``.env`` file (``key_env`` is ``[footystats]
+    key_env`` of ``endpoints.toml``; the facade passes its configured value, so a
+    renamed variable is honoured), ``('sofascore',)`` otherwise, so an
+    installation without a FootyStats account keeps the historical behaviour.
     """
     if api_key is None:
         from src.ingestion import footystats as _footystats  # local import: footystats imports this module
 
-        api_key = _footystats.find_api_key()
+        api_key = _footystats.find_api_key(key_env=key_env)
     if api_key:
         return (FOOTYSTATS_PROVIDER, SofaScoreProvider.name)
     return (SofaScoreProvider.name,)
@@ -1948,13 +1950,13 @@ class Harvester:
         mapping_path: Path | None = None,
     ) -> None:
         self.api_key = api_key
-        if providers is None:
-            providers = default_providers(api_key)
+        self.endpoints = endpoints if endpoints is not None else load_endpoints()
+        if providers is None:  # the key lookup must use the variable name the configuration declares
+            providers = default_providers(api_key, key_env=self.endpoints.footystats.key_env)
         names = tuple(str(p).lower() for p in providers)
         unknown = [p for p in names if p not in PROVIDER_NAMES]
         if unknown or not names:
             raise ValueError(f"providers must be a non-empty subset of {PROVIDER_NAMES}, got {providers!r}")
-        self.endpoints = endpoints if endpoints is not None else load_endpoints()
         self.mapping_path = Path(mapping_path) if mapping_path is not None else Path(config_dir) / "footystats_teams.json"
         self.config_dir = Path(config_dir)
         if registry is not None:
@@ -2002,7 +2004,9 @@ class Harvester:
         from src.ingestion import footystats as _footystats  # local import: footystats imports this module
 
         client = _footystats.FootyStatsClient(
-            api_key=_footystats.resolve_api_key(self.api_key, key_env=self.endpoints.footystats.key_env),
+            api_key=_footystats.resolve_api_key(
+                self.api_key, key_env=self.endpoints.footystats.key_env, endpoints=self.endpoints.footystats
+            ),
             endpoints=self.endpoints.footystats,
             http=self.endpoints.http,
             cache=self.cache,
@@ -2025,6 +2029,17 @@ class Harvester:
         if name == SofaScoreProvider.name and girone not in self.endpoints.sofascore.tournament_ids:
             return f"no SofaScore tournament id configured for girone {girone.value}"
         return None
+
+    def supported_gironi(self) -> tuple[Girone, ...]:
+        """The competitions at least one configured provider can serve, in configuration order.
+
+        This is the default of :meth:`harvest_all`: a SofaScore-only installation
+        (no FootyStats key) harvests the gironi that have a SofaScore tournament
+        id (the three Serie C gironi) and never records Serie B as a failure,
+        while with the FootyStats provider every competition qualifies. A girone
+        requested explicitly is always attempted and reported.
+        """
+        return tuple(girone for girone in Girone if any(self._supports(name, girone) is None for name in self.providers))
 
     @staticmethod
     def registry_with_history(registry: TeamRegistry, config_dir: Path = CONFIG_DIR) -> TeamRegistry:
@@ -2065,65 +2080,128 @@ class Harvester:
         return dict(sorted(unmapped.items())), tuple(sorted(historical))
 
     # ---------------------------------------------------------------- public
+    async def _footystats_once(
+        self, targets: Sequence[Girone], *, seasons: int, with_odds: bool
+    ) -> tuple[Any | None, HarvestError | None, ClientStats]:
+        """Run the FootyStats provider once for every target (it harvests all competitions in one pass)."""
+        try:
+            provider = self._make_footystats()
+        except HarvestError as exc:
+            log.error("footystats unavailable", extra={"error": str(exc)})
+            return None, exc, ClientStats()
+        try:
+            result = await provider.harvest([g.value for g in targets], seasons=seasons, with_odds=with_odds)
+        except HarvestError as exc:
+            log.error("footystats harvest failed", extra={"status": exc.status, "url": exc.url})
+            return None, exc, provider.client.client_stats()
+        finally:
+            await provider.client.close()
+        return result, None, provider.client.client_stats()
+
     async def harvest_all(
         self,
-        gironi: Iterable[Girone] = tuple(Girone),
+        gironi: Iterable[Girone] | None = None,
         *,
         season_id: int | None = None,
         seasons: int = 3,
         with_stats: bool = True,
+        with_odds: bool = True,
     ) -> HarvestResult:
         """Harvest ``gironi`` and return a validated canonical frame plus fixtures.
 
-        On SofaScore the newest ``seasons`` seasons of every girone are harvested
-        (current season plus history; ``season_id`` pins a single season instead);
-        fixtures come from the current season only. A past season that fails is
-        recorded in ``HarvestResult.failures`` under ``"<girone>:<provider>:<season>"``
-        and the rest is kept. Raises :class:`HarvestError` only when every girone
-        failed on every provider; partial failures are reported in
-        ``HarvestResult.failures``.
+        ``gironi`` defaults to :meth:`supported_gironi`, the competitions the
+        configured providers can serve (every one with FootyStats, the Serie C
+        gironi with SofaScore alone), so a default call on a keyless installation
+        does not record Serie B as a failure.
+        Providers are tried in order for every girone and the first that succeeds
+        wins. FootyStats harvests the newest ``seasons`` seasons of every requested
+        competition in one pass (``with_odds`` adds the pre-match quotes of the
+        fixtures); a competition it could not deliver falls through to the next
+        provider. On SofaScore the newest ``seasons`` seasons of every girone are
+        harvested (current season plus history; ``season_id`` pins a single season
+        instead); fixtures come from the current season only. A past season that
+        fails is recorded in ``HarvestResult.failures`` under
+        ``"<girone>:<provider>:<season>"`` and the rest is kept. Raises
+        :class:`HarvestError` only when every girone failed on every provider;
+        partial failures are reported in ``HarvestResult.failures``.
         """
         if int(seasons) < 1:
             raise ValueError("seasons must be >= 1")
-        targets = [Girone.parse(g) for g in gironi]
+        targets = [Girone.parse(g) for g in (self.supported_gironi() if gironi is None else gironi)]
         clients: dict[str, AsyncHarvesterClient] = {}
         providers: dict[str, SofaScoreProvider | FotMobProvider] = {}
         all_matches: list[MatchRecord] = []
         all_fixtures: list[Fixture] = []
+        all_odds: list[OddsQuote] = []
         season_labels: list[str] = []
         used: list[str] = []
         failures: dict[str, str] = {}
         last_error: HarvestError | None = None
+        footystats_result: Any | None = None
+        footystats_error: HarvestError | None = None
+        footystats_stats = ClientStats()
+        footystats_done = False
         try:
             for girone in targets:
                 success = False
                 for name in self.providers:
-                    if name not in clients:
-                        clients[name] = self._make_client(self._base_url(name))
-                        providers[name] = self._make_provider(name, clients[name])
-                    provider = providers[name]
-                    try:
-                        if isinstance(provider, SofaScoreProvider):
-                            harvested = await provider.harvest_seasons(
-                                girone, season_id=season_id, seasons=seasons, with_stats=with_stats
-                            )
-                            matches = [m for item in harvested for m in item.matches]
-                            fixtures = [f for item in harvested for f in item.fixtures]
-                            for item in harvested:
-                                if item.label not in season_labels:
-                                    season_labels.append(item.label)
-                                if item.error:
-                                    failures[f"{girone.value}:{name}:{item.label}"] = item.error
-                        else:
-                            matches, fixtures = await provider.harvest(girone, with_stats=with_stats)
-                    except HarvestError as exc:
-                        last_error = exc
-                        failures[f"{girone.value}:{name}"] = str(exc)
-                        log.error(
-                            "provider failed for girone",
-                            extra={"provider": name, "girone": girone.value, "status": exc.status, "url": exc.url},
-                        )
+                    unsupported = self._supports(name, girone)
+                    if unsupported is not None:
+                        failures[f"{girone.value}:{name}"] = unsupported
+                        log.warning("provider cannot serve girone", extra={"provider": name, "girone": girone.value, "reason": unsupported})
                         continue
+                    if name == FOOTYSTATS_PROVIDER:
+                        if not footystats_done:
+                            footystats_done = True
+                            footystats_result, footystats_error, footystats_stats = await self._footystats_once(
+                                targets, seasons=seasons, with_odds=with_odds
+                            )
+                        if footystats_result is None:
+                            last_error = footystats_error
+                            failures[f"{girone.value}:{name}"] = str(footystats_error)
+                            continue
+                        problem = footystats_result.problem_for(girone.value)
+                        if problem is not None:
+                            failures[f"{girone.value}:{name}"] = problem
+                            log.error("footystats could not deliver girone", extra={"girone": girone.value, "reason": problem})
+                            continue
+                        matches = [m for m in footystats_result.records if m.girone == girone]
+                        fixtures = [f for f in footystats_result.fixtures if f.girone == girone]
+                        fixture_ids = {f.match_id for f in fixtures}
+                        all_odds.extend(q for q in footystats_result.odds if q.match_id in fixture_ids)
+                        for label in footystats_result.seasons.get(girone.value, ()):
+                            if label not in season_labels:
+                                season_labels.append(label)
+                        for key, message in footystats_result.failures.items():
+                            if key.split(":", 1)[0] == girone.value:
+                                failures[f"{girone.value}:{name}:{key.split(':', 1)[1]}"] = message
+                    else:
+                        if name not in clients:
+                            clients[name] = self._make_client(self._base_url(name))
+                            providers[name] = self._make_provider(name, clients[name])
+                        provider = providers[name]
+                        try:
+                            if isinstance(provider, SofaScoreProvider):
+                                harvested = await provider.harvest_seasons(
+                                    girone, season_id=season_id, seasons=seasons, with_stats=with_stats
+                                )
+                                matches = [m for item in harvested for m in item.matches]
+                                fixtures = [f for item in harvested for f in item.fixtures]
+                                for item in harvested:
+                                    if item.label not in season_labels:
+                                        season_labels.append(item.label)
+                                    if item.error:
+                                        failures[f"{girone.value}:{name}:{item.label}"] = item.error
+                            else:
+                                matches, fixtures = await provider.harvest(girone, with_stats=with_stats)
+                        except HarvestError as exc:
+                            last_error = exc
+                            failures[f"{girone.value}:{name}"] = str(exc)
+                            log.error(
+                                "provider failed for girone",
+                                extra={"provider": name, "girone": girone.value, "status": exc.status, "url": exc.url},
+                            )
+                            continue
                     all_matches.extend(matches)
                     all_fixtures.extend(fixtures)
                     if name not in used:
@@ -2140,6 +2218,7 @@ class Harvester:
             raise last_error
 
         totals = ClientStats()
+        totals.add(footystats_stats)
         for client in clients.values():
             totals.add(client.stats)
         seen: set[str] = set()
@@ -2159,6 +2238,7 @@ class Harvester:
             n_matches_by_season={label: int(counts.get(label, 0)) for label in labels},
             historical_teams=historical,
             registry_season=season_label_from_year(str(self.registry.season)) or str(self.registry.season),
+            odds=all_odds,
         )
         log.info("harvest_all complete", extra={"summary": result.summary()})
         return result
@@ -2256,12 +2336,47 @@ class Harvester:
         return out
 
 
+    @staticmethod
+    def save_odds(odds: Iterable[OddsQuote], path: Path = ODDS_DIR / "footystats.csv") -> Path:
+        """Write quotes to CSV with :data:`ODDS_COLUMNS` (one row per selection); returns ``path``.
+
+        The format is the one ``main.load_odds_dir`` and
+        :func:`src.dashboard.state.load_odds_quotes` read from ``data/odds/*.csv``:
+        ``market`` is the :class:`~src.common.schemas.Market` value, ``selection``
+        a key of :data:`~src.common.schemas.SELECTIONS`. Rows follow the input
+        order, selections the canonical order of their market. Odds are written
+        with Python's shortest round-trip representation (``2.1``, ``101.25``,
+        ``10.125``), never rounded to a number of significant digits, so the
+        value engine reads exactly the price the provider quoted. An empty
+        iterable writes the header only, so a stale file never survives a run
+        that found no fixtures.
+        """
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        rows = [
+            {
+                "match_id": quote.match_id,
+                "bookmaker": quote.bookmaker,
+                "market": quote.market.value,
+                "selection": selection,
+                "odds": float(quote.odds[selection]),
+            }
+            for quote in odds
+            for selection in quote.odds
+        ]
+        frame = pd.DataFrame(rows, columns=list(ODDS_COLUMNS))
+        frame.to_csv(path, index=False)
+        log.info("odds saved", extra={"path": str(path), "rows": len(rows)})
+        return path
+
+
 #: Module-level aliases of the persistence helpers: ``main.py`` and other
 #: integrators import ``from src.ingestion.harvester import load_processed, load_fixtures``.
 save_processed = Harvester.save_processed
 load_processed = Harvester.load_processed
 save_fixtures = Harvester.save_fixtures
 load_fixtures = Harvester.load_fixtures
+save_odds = Harvester.save_odds
 
 
 # =============================================================================
@@ -2299,7 +2414,13 @@ def _build_parser() -> argparse.ArgumentParser:
         prog="python -m src.ingestion.harvester",
         description="Harvest Serie C matches and fixtures from SofaScore / FotMob into the canonical CSVs.",
     )
-    parser.add_argument("--gironi", nargs="+", default=["A", "B", "C"], choices=["A", "B", "C"], help="gironi to harvest")
+    parser.add_argument(
+        "--gironi",
+        nargs="+",
+        default=["A", "B", "C"],
+        choices=[g.value for g in Girone],
+        help="competitions to harvest (Serie C gironi by default; SB = Serie B is served by the footystats provider only)",
+    )
     parser.add_argument(
         "--seasons",
         type=int,
@@ -2314,6 +2435,13 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--season-id", type=int, default=None, help="SofaScore season id: harvest only that season (default: the newest --seasons)")
     parser.add_argument("--out", type=Path, default=PROCESSED_DIR / "matches.csv", help="matches CSV output")
     parser.add_argument("--fixtures-out", type=Path, default=PROCESSED_DIR / "fixtures.csv", help="fixtures CSV output")
+    parser.add_argument(
+        "--odds-out",
+        type=Path,
+        default=ODDS_DIR / "footystats.csv",
+        help="pre-match odds CSV (match_id,bookmaker,market,selection,odds), written when the provider supplies odds (FootyStats)",
+    )
+    parser.add_argument("--no-odds", action="store_true", help="do not collect pre-match odds (FootyStats)")
     parser.add_argument("--no-stats", action="store_true", help="skip per-match statistics calls")
     parser.add_argument(
         "--allow-partial",
@@ -2321,7 +2449,13 @@ def _build_parser() -> argparse.ArgumentParser:
         help="write the CSVs even when some girone/provider failed (exit code stays non-zero)",
     )
     parser.add_argument("--log-json", action="store_true", help="emit JSON-lines logs")
-    parser.add_argument("--providers", nargs="+", default=["sofascore"], choices=list(PROVIDER_NAMES), help="ordered provider fallbacks")
+    parser.add_argument(
+        "--providers",
+        nargs="+",
+        default=None,
+        choices=list(PROVIDER_NAMES),
+        help="ordered provider fallbacks (default: footystats sofascore when a FootyStats key is available, else sofascore)",
+    )
     parser.add_argument("--cache-dir", type=Path, default=RAW_DIR, help="raw JSON cache directory")
     parser.add_argument(
         "--cache-ttl-hours",
@@ -2381,7 +2515,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             cache_dir=args.cache_dir,
             cache_ttl=timedelta(hours=args.cache_ttl_hours) if args.cache_ttl_hours is not None else None,
             history_cache_ttl=timedelta(hours=args.history_cache_ttl_hours) if args.history_cache_ttl_hours is not None else None,
-            providers=tuple(args.providers),
+            providers=tuple(args.providers) if args.providers else None,
             extra_headers=extra_headers,
             season=args.season,
         )
@@ -2392,7 +2526,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     gironi = [Girone.parse(g) for g in args.gironi]
     try:
         result = asyncio.run(
-            harvester.harvest_all(gironi, season_id=args.season_id, seasons=args.seasons, with_stats=not args.no_stats)
+            harvester.harvest_all(
+                gironi, season_id=args.season_id, seasons=args.seasons, with_stats=not args.no_stats, with_odds=not args.no_odds
+            )
         )
     except HarvestError as exc:
         log.error("harvest failed", extra={"url": exc.url, "status": exc.status, "attempts": exc.attempts})
@@ -2409,6 +2545,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         save_fixtures(result.fixtures, args.fixtures_out)
         print(f"matches -> {args.out}")
         print(f"fixtures -> {args.fixtures_out}")
+        if result.odds:
+            save_odds(result.odds, args.odds_out)
+            print(f"odds -> {args.odds_out}")
     else:
         log.error("harvest output not written", extra={"reason": reason, "out": str(args.out)})
         print(reason, file=sys.stderr)

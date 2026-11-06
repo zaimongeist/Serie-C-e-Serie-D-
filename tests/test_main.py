@@ -22,7 +22,7 @@ def test_mini_mode_runs_end_to_end(tmp_path: Path, capsys: pytest.CaptureFixture
     assert len(out.current_matches) == 20 and len(out.history_matches) == 108
     assert len(out.matches) == 128 == out.params.n_matches
     assert list(out.matches.columns) == list(MATCH_COLUMNS)
-    assert out.season_label == "2026/27" and "Perimetro: Serie C 2026/27 (14 squadre)" in captured
+    assert out.season_label == "2026/27" and "Perimetro: Serie C 2026/27 Gironi A/B/C (14 squadre)" in captured  # the mini demo has no Serie B
     assert out.params.converged
     assert len(out.predictions) == len(out.fixtures) > 0
     # every quote selection was evaluated
@@ -58,8 +58,10 @@ def test_full_mode_reports_parameter_recovery(capsys: pytest.CaptureFixture[str]
     # --rounds fixes 30 played rounds whatever today's date (the default follows the calendar as of today)
     out = pipeline.main(["--mode", "full", "--no-export", "--log-level", "ERROR", "--seed", "3", "--rounds", "30"])
     console = capsys.readouterr().out
-    assert out.recovery is not None and len(out.recovery) == 3
-    assert len(out.current_matches) == 900 and "30 giornate giocate (--rounds)" in console
+    assert out.recovery is not None and len(out.recovery) == 4  # three Serie C gironi + Serie B
+    assert out.recovery["competizione"].tolist() == ["Girone A", "Girone B", "Girone C", "Serie B"]
+    assert len(out.current_matches) == 1200 and "30 giornate giocate (--rounds)" in console
+    assert "Perimetro: Serie C 2026/27 Gironi A/B/C + Serie B (80 squadre)" in console
     assert (out.recovery["corr_alpha"] > 0.8).all()
     assert (out.recovery["corr_beta"] > 0.7).all()
     assert ((out.recovery["gamma_hat"] - out.recovery["gamma_true"]).abs() < 0.15).all()
@@ -144,7 +146,7 @@ def test_auto_prior_is_based_on_matches_per_team_not_total_matches(tmp_path: Pat
     prior off and the pure MLE pinned rho/gamma on their bounds (home multiplier x3). The rule now
     looks at the matches per team of the least-covered girone."""
     league = simulate_league(seed=7, n_rounds=4)
-    assert len(league.matches) == 120
+    assert len(league.matches) == 160  # 4 rounds x (30 Serie C + 10 Serie B) matches
     assert pipeline.matches_per_team(league.matches) == pytest.approx(4.0)
     assert pipeline.prior_recommended(league.matches)
     # a full half season (15 per team) is where the MLE takes over; a single thin girone keeps the prior on
@@ -170,7 +172,7 @@ def test_auto_prior_is_based_on_matches_per_team_not_total_matches(tmp_path: Pat
     full = pipeline.main(["--mode", "full", "--no-export", "--log-level", "ERROR", "--seed", "3", "--rounds", "30"])
     assert full.params.penalty == 0.0 and not pipeline.prior_recommended(full.matches)
     today = pipeline.main(["--mode", "full", "--no-export", "--log-level", "ERROR", "--seed", "3", "--as-of", "2026-11-06"])
-    assert len(today.current_matches) == 330 and today.params.penalty > 0.0
+    assert len(today.current_matches) == 440 and today.params.penalty > 0.0
     assert pipeline.prior_recommended(today.matches, registry=today.registry, season=today.season_label)
 
 
@@ -181,8 +183,9 @@ def test_parameters_on_optimiser_bounds_are_reported(tmp_path: Path, capsys: pyt
     out = pipeline.main(["--processed", str(processed), "--fixtures", str(fixtures), "--prior", "off", "--no-export", "--log-level", "ERROR"])
     captured = capsys.readouterr().out
     hits = pipeline.parameters_at_bounds(out.params, out.engine.config)
-    assert "rho" in hits and len(hits) >= 2
-    assert "ATTENZIONE" in captured and "parametri sui limiti dell'ottimizzatore" in captured and "rho" in captured
+    assert len(hits) >= 2, hits  # which parameters hit a bound depends on the draw (beta/gamma/rho); the report must name them
+    assert "ATTENZIONE" in captured and "parametri sui limiti dell'ottimizzatore" in captured
+    assert all(hit in captured for hit in hits[:6]) and f"{len(hits)} parametri" in captured
     assert any("limiti dell'ottimizzatore" in n for n in out.notes)
     # the helper itself
     from dataclasses import replace as dc_replace
@@ -201,7 +204,7 @@ def test_fixture_with_unknown_team_is_skipped_not_fatal(tmp_path: Path, capsys: 
 
     league = simulate_league(seed=9, n_rounds=12)
     first = league.fixtures[0]
-    league.fixtures.append(Fixture("HAND-1", first.date, first.round, Girone.A, "Sampdoria", first.away_team))
+    league.fixtures.append(Fixture("HAND-1", first.date, first.round, Girone.A, "Nowhere FC", first.away_team))  # not in any registry
     girone_c_free = league.matches[league.matches["girone"] != "C"].reset_index(drop=True)
     league.matches = girone_c_free  # girone C never harvested, but its fixtures are still listed
     processed, fixtures, odds_dir = _save_league(tmp_path, league, odds=True)
@@ -213,7 +216,7 @@ def test_fixture_with_unknown_team_is_skipped_not_fatal(tmp_path: Path, capsys: 
     assert len(out.fixtures) == len(league.fixtures)
     assert len(out.predictions) == len(league.fixtures) - n_c - 1
     assert all(p.fixture.match_id != "HAND-1" and p.fixture.girone != Girone.C for p in out.predictions)
-    assert "Sampdoria - " in captured and "partita saltata, squadra non presente nello storico (Sampdoria)" in captured
+    assert "Nowhere FC - " in captured and "partita saltata, squadra non presente nello storico (Nowhere FC)" in captured
     assert "girone C" in captured
     assert any(n.startswith(f"{n_c + 1} partite in programma saltate") for n in out.notes)
     assert err.count("WARNING main: fixture not predictable") == n_c + 1 and "match_id=HAND-1" in err

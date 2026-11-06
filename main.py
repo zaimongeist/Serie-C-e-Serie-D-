@@ -14,7 +14,10 @@ console:
 Perimeter and history
 ---------------------
 The *perimeter* is the registry of ``--season`` (``config/teams_2026_27.json``
-by default): only its teams are ranked, predicted and priced. The model may be
+by default: the three Serie C gironi and Serie B, every competition of
+``config/competitions.toml`` the file holds, 80 teams): only its teams are
+ranked, predicted and priced. The banner spells it out from the configuration
+(``Perimetro: Serie C 2026/27 Gironi A/B/C + Serie B (80 squadre) ...``). The model may be
 fitted on up to three seasons: the rows of the registry season are the current
 matches, older rows are history that sharpens the strength estimates (time
 decay down-weights them). Teams that appear only in history are fitted as
@@ -195,17 +198,22 @@ def load_real_data(
 
 
 # ------------------------------------------------------------------ diagnostics
-#: ``--prior auto`` keeps the Gaussian prior on while the least-covered girone averages
+#: ``--prior auto`` keeps the Gaussian prior on while the least-covered competition averages
 #: fewer than this many played matches per team (``2 * matches / teams``). A threshold on
-#: the *total* number of matches ignores the 60-team league: 100 matches are < 2 per team
-#: and the pure MLE then drives gamma and rho onto their bounds. In a parameter-recovery
+#: the *total* number of matches ignores the size of the 80-team perimeter (three Serie C
+#: gironi plus Serie B): 100 matches are barely more than 2 per team and the pure MLE then
+#: drives gamma and rho onto their bounds. In a parameter-recovery
 #: study on ``simulate_league`` (10 seeds per season length) the MLE still ended on a bound
 #: in 3/10 fits at 8 matches per team, 2/10 at 10 and 1/10 at 12; from 15 matches per team
 #: no fit hit a bound and the largest home-advantage error fell below 0.45.
 # ``--prior auto`` rule: shared with the dashboard so console and UI agree. Coverage is
-# counted on the current-season matches of the current teams: history never counts.
+# counted on the current-season matches of the current teams: history never counts, and a
+# registry competition that was never harvested (no match in any season) is ignored by the
+# rule instead of pinning it to zero coverage (``CoverageReport.ignored`` names it).
 from src.dashboard.state import (  # noqa: E402
     PRIOR_MIN_MATCHES_PER_TEAM,
+    CoverageReport,
+    coverage_report,
     history_label,
     matches_per_team,
     other_season_reason,
@@ -268,8 +276,12 @@ def season_summary(matches: pd.DataFrame, registry: TeamRegistry | None = None) 
 
 
 def perimeter_banner(registry: TeamRegistry, current: pd.DataFrame, history: pd.DataFrame) -> str:
-    """``'Perimetro: Serie C 2026/27 (60 squadre) · storico: 2280 partite 2024/25-2025/26'``."""
-    text = f"Perimetro: Serie C {registry.season_label} ({registry.n_teams} squadre) · stagione corrente: {len(current)} partite"
+    """``'Perimetro: Serie C 2026/27 Gironi A/B/C + Serie B (80 squadre) · stagione corrente: 440 partite · storico: 3040 partite 2024/25-2025/26'``.
+
+    The competitions come from the registry (:attr:`TeamRegistry.perimeter_label`,
+    built on ``config/competitions.toml``), never from a hard-coded string.
+    """
+    text = f"Perimetro: {registry.perimeter_label} · stagione corrente: {len(current)} partite"
     if len(history):
         text += f" · storico: {len(history)} partite {history_label(history)}"
     else:
@@ -381,9 +393,15 @@ def run_pipeline(
         group = params.teams_by_girone.get(g, ())
         alphas = [params.alpha[t] for t in group]
         say(
-            f"girone {g.value}: gamma (fattore campo) = {gamma:+.4f}  -> moltiplicatore casa x{np.exp(gamma):.3f} | "
+            f"{g.short} [{g.value}]: gamma (fattore campo) = {gamma:+.4f}  -> moltiplicatore casa x{np.exp(gamma):.3f} | "
             f"somma alpha (gruppo di vincolo) = {sum(alphas):+.2e} | squadre = {len(current_by_girone.get(g, ()))} attuali + {len(group) - len(current_by_girone.get(g, ()))} storiche"
         )
+    for g in params.teams_by_girone:
+        if g not in params.gamma:
+            say(
+                f"{g.short} [{g.value}]: nessuna partita nei dati, fattore campo non stimato; le sue {len(current_by_girone.get(g, ()))} squadre "
+                "del perimetro sono vincolate con la competizione in cui hanno giocato (raccogli la competizione per prevederne le partite)"
+            )
     at_bounds = parameters_at_bounds(params, config)
     if at_bounds:
         shown = ", ".join(at_bounds[:6]) + (" ..." if len(at_bounds) > 6 else "")
@@ -397,17 +415,17 @@ def run_pipeline(
 
     # 3. ranking ---------------------------------------------------------------
     if verbose:
-        _banner(f"3) RANKING FORZA PER GIRONE {label} (alpha = attacco, beta = solidità difensiva, gamma = fattore campo; solo squadre del perimetro)")
+        _banner(f"3) RANKING FORZA PER COMPETIZIONE {label} (alpha = attacco, beta = solidità difensiva, gamma = fattore campo; solo squadre del perimetro)")
     for g in current_by_girone:
         rk = engine.ranking(g)
-        say(f"\n--- Girone {g.value} ({len(rk)} squadre) ---")
+        say(f"\n--- {g.short} ({len(rk)} squadre) ---")
         say(rk[["team", "alpha", "beta", "gamma", "attack_index", "defence_index"]].to_string(index=False))
     if params.historical_teams:
         say(f"\n{len(params.historical_teams)} squadre storiche escluse dal ranking (stimate solo come avversarie): {', '.join(params.historical_teams)}")
 
     # 4. predictions -----------------------------------------------------------
     if verbose:
-        _banner(f"4) PREVISIONI PROSSIMO TURNO (solo partite tra squadre della Serie C {label})")
+        _banner(f"4) PREVISIONI PROSSIMO TURNO (solo partite tra squadre del perimetro {label})")
     predictions: list[MatchPrediction] = []
     skipped: list[str] = []
     skipped_outside: list[str] = []
@@ -532,7 +550,12 @@ def run_pipeline(
 
 
 def recovery_report(league: SimulatedLeague, params: FittedParams) -> pd.DataFrame:
-    """Compare the fitted parameters of the *current* teams with the generator's ground truth."""
+    """Compare the fitted parameters of the *current* teams with the generator's ground truth.
+
+    One row per competition of the perimeter (``girone`` = code, ``competizione``
+    = short label); ``gamma_hat`` is ``NaN`` for a competition without matches in
+    the fit (no home advantage estimated).
+    """
     rows = []
     for g, teams in params.current_teams_by_girone().items():
         a_true = np.array([league.true_params.alpha[t] for t in teams])
@@ -542,11 +565,12 @@ def recovery_report(league: SimulatedLeague, params: FittedParams) -> pd.DataFra
         rows.append(
             {
                 "girone": g.value,
+                "competizione": g.short,
                 "n_teams": len(teams),
                 "corr_alpha": float(np.corrcoef(a_true, a_hat)[0, 1]) if len(teams) > 2 else np.nan,
                 "corr_beta": float(np.corrcoef(b_true, b_hat)[0, 1]) if len(teams) > 2 else np.nan,
-                "gamma_true": league.true_params.gamma[g],
-                "gamma_hat": params.gamma[g],
+                "gamma_true": league.true_params.gamma.get(g, np.nan),
+                "gamma_hat": params.gamma.get(g, np.nan),
                 "rho_true": league.true_params.rho,
                 "rho_hat": params.rho,
             }
@@ -692,17 +716,22 @@ def main(argv: Sequence[str] | None = None) -> PipelineOutput:
     season_label = registry.season_label
     current, history = split_by_season(validate_matches_df(matches), season_label)
 
+    coverage: CoverageReport = coverage_report(matches, registry=registry, season=season_label)
     use_prior = prior_recommended(matches, registry=registry, season=season_label) if args.prior == "auto" else (args.prior == "on")
     if use_prior:
         # Thin sample (few current-season matches per current team, not few matches in total:
-        # 100 matches over 60 teams are < 2 each, and three seasons of history do not make the
-        # current season any longer): a Gaussian prior (alpha/beta sd 0.30, home advantage
-        # 0.25 +- 0.15, rho sd 0.10) keeps gamma and rho off their bounds. With a full season
-        # the data dominate and the MAP estimate is practically the MLE.
+        # 100 matches over the 80-team perimeter are barely 2 each, and three seasons of history
+        # do not make the current season any longer): a Gaussian prior (alpha/beta sd 0.30, home
+        # advantage 0.25 +- 0.15, rho sd 0.10) keeps gamma and rho off their bounds. With a full
+        # season the data dominate and the MAP estimate is practically the MLE. Competitions of
+        # the registry without any match (never harvested) do not count as thin: the banner
+        # names them as ignored.
         config = DixonColesConfig.with_gaussian_prior(xi=xi, method=args.method)
         source += (
-            f" | stima MAP con prior gaussiana ({matches_per_team(matches, registry=registry, season=season_label):.1f} partite per squadra nel girone "
-            f"meno coperto della stagione {season_label}, soglia {PRIOR_MIN_MATCHES_PER_TEAM:g})"
+            f" | stima MAP con prior gaussiana ({coverage.thinnest:.1f} partite per squadra nel girone "
+            f"meno coperto della stagione {season_label}, soglia {PRIOR_MIN_MATCHES_PER_TEAM:g}"
+            + (f"; {coverage.describe_ignored()}" if coverage.ignored else "")
+            + ")"
         )
     else:
         config = DixonColesConfig(xi=xi, method=args.method)

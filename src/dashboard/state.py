@@ -18,7 +18,10 @@ Bookmaker odds are read from ``odds_dir/*.csv`` in the same format
 Perimeter and history
 ---------------------
 The dashboard ranks, predicts and prices only the teams of the registry of the
-selected ``season`` (``config/teams_2026_27.json`` by default, 60 teams). The
+selected ``season`` (``config/teams_2026_27.json`` by default: 80 teams, the
+three Serie C gironi and Serie B, i.e. every competition of
+``config/competitions.toml`` the registry holds; the perimeter banner is
+``registry.perimeter_label``, never a hard-coded string). The
 match frame may hold up to three seasons: the rows of the registry season are
 the *current* matches (coverage, traps and the auto-prior rule are judged on
 them), the older rows are *history* that only sharpens the strength estimates
@@ -35,7 +38,7 @@ from __future__ import annotations
 
 import math
 import time
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -87,6 +90,8 @@ __all__ = [
     "ODDS_COLUMNS",
     "PRIOR_THRESHOLD_MATCHES",
     "PRIOR_MIN_MATCHES_PER_TEAM",
+    "CoverageReport",
+    "coverage_report",
     "matches_per_team",
     "perimeter_matches",
     "prior_recommended",
@@ -96,6 +101,7 @@ __all__ = [
     "PipelineState",
     "Source",
     "build_state",
+    "competition_label",
     "export_csv_bytes",
     "fixtures_for",
     "heatmap_figure",
@@ -137,10 +143,11 @@ MAX_HISTORY_SEASONS: Final[int] = len(HISTORY_SEASONS)
 #: Required columns of a bookmaker odds CSV (one row per quoted selection).
 ODDS_COLUMNS: Final[tuple[str, ...]] = ("match_id", "bookmaker", "market", "selection", "odds")
 
-#: Italian labels of :func:`ranking_table`, in order.
+#: Italian labels of :func:`ranking_table`, in order. ``Competizione`` holds the competition's
+#: short label (``'Girone A'``, ``'Serie B'``, see :func:`competition_label`), not the code.
 RANKING_COLUMNS: Final[tuple[str, ...]] = (
     "Squadra",
-    "Girone",
+    "Competizione",
     "Forza Offensiva (α)",
     "Solidità Difensiva (β)",
     "Vantaggio Casa (γ)",
@@ -149,7 +156,7 @@ RANKING_COLUMNS: Final[tuple[str, ...]] = (
 )
 _RANKING_RENAME: Final[dict[str, str]] = {
     "team": "Squadra",
-    "girone": "Girone",
+    "girone": "Competizione",
     "alpha": "Forza Offensiva (α)",
     "beta": "Solidità Difensiva (β)",
     "gamma": "Vantaggio Casa (γ)",
@@ -170,7 +177,7 @@ MARKETS_COLUMNS: Final[tuple[str, ...]] = (
 #: Italian labels of :func:`value_table`, in order.
 VALUE_COLUMNS: Final[tuple[str, ...]] = (
     "Data",
-    "Girone",
+    "Competizione",
     "Partita",
     "Mercato",
     "Esito",
@@ -184,7 +191,7 @@ VALUE_COLUMNS: Final[tuple[str, ...]] = (
 )
 
 #: Italian labels of :func:`traps_table`, in order.
-TRAPS_COLUMNS: Final[tuple[str, ...]] = ("Squadra", "Girone", "Gol Subiti", "xGA", "Severità", "Ultima Gara")
+TRAPS_COLUMNS: Final[tuple[str, ...]] = ("Squadra", "Competizione", "Gol Subiti", "xGA", "Severità", "Ultima Gara")
 
 #: Human-readable market names for the UI.
 MARKET_LABELS: Final[dict[Market, str]] = {
@@ -221,7 +228,10 @@ class PipelineState:
     loaded (filtered or not), while ``predictions``, ``opportunities`` and
     ``traps`` only ever concern current teams and the current season;
     ``skipped_fixtures`` names the fixtures left out (dated in another season,
-    historical or unknown teams).
+    historical or unknown teams). ``coverage`` is the per-competition
+    current-season coverage the ``use_prior=None`` rule looked at
+    (:class:`CoverageReport`, with the registry competitions it ignored because
+    they have no match in the data).
     """
 
     matches: pd.DataFrame
@@ -240,6 +250,7 @@ class PipelineState:
     current_matches: pd.DataFrame = field(default_factory=empty_matches_frame)
     history_matches: pd.DataFrame = field(default_factory=empty_matches_frame)
     skipped_fixtures: list[str] = field(default_factory=list)
+    coverage: "CoverageReport | None" = None
 
     @property
     def n_matches(self) -> int:
@@ -277,12 +288,22 @@ class PipelineState:
         return history_label(self.history_matches)
 
     @property
+    def perimeter_label(self) -> str:
+        """The perimeter as the configuration describes it, ``'Serie C 2026/27 Gironi A/B/C + Serie B (80 squadre)'``.
+
+        Derived from the registry (:attr:`TeamRegistry.perimeter_label`); without
+        a registry, ``'Stagione <season> (<n> squadre)'`` with the fitted current teams.
+        """
+        if self.registry is not None:
+            return self.registry.perimeter_label
+        return f"Stagione {self.season_label} ({self.n_current_teams} squadre)"
+
+    @property
     def perimeter_text(self) -> str:
         """Italian one-liner for badges and subtitles:
-        ``'Stagione 2026/27 · 60 squadre · 330 partite stagione corrente · 2280 partite storiche (2024/25-2025/26)'``."""
-        n_teams = self.registry.n_teams if self.registry is not None else self.n_current_teams
+        ``'Perimetro: Serie C 2026/27 Gironi A/B/C + Serie B (80 squadre) · 440 partite stagione corrente · 3040 partite storiche (2024/25-2025/26)'``."""
         text = (
-            f"Stagione {self.season_label} · {n_teams} squadre · {self.n_current_matches} partite stagione corrente · "
+            f"Perimetro: {self.perimeter_label} · {self.n_current_matches} partite stagione corrente · "
             f"{self.n_history_matches} partite storiche"
         )
         if self.n_history_matches:
@@ -291,7 +312,7 @@ class PipelineState:
 
     @property
     def gironi(self) -> tuple[Girone, ...]:
-        """Gironi present in the fitted parameters, in A/B/C order."""
+        """Competitions present in the fitted parameters, in configuration order (``config/competitions.toml``)."""
         return tuple(g for g in Girone if g in self.params.teams_by_girone)
 
     @property
@@ -431,35 +452,112 @@ def _pick_trap_team(matches: pd.DataFrame, fixtures: Sequence[Fixture], girone: 
     return None
 
 
+@dataclass(frozen=True)
+class CoverageReport:
+    """Current-season coverage of the perimeter, competition by competition.
+
+    ``per_competition`` maps every competition that has **at least one match in
+    the frame, in any season**, to the average played current-season matches
+    per team of its current teams (``2 * matches / teams``). ``ignored`` lists
+    the registry competitions that have no match at all in the frame: they were
+    never harvested (Serie B for a SofaScore-only installation, whose provider
+    cannot serve it) so they cannot be *covered* and must not drag the minimum
+    to zero for ever; the engine likewise estimates no home advantage for them.
+    A competition whose matches exist but whose current season has not started
+    stays in ``per_competition`` with ``0.0``: that is genuinely thin data.
+    Without a registry the competitions are those of the frame and nothing is
+    ignored.
+    """
+
+    per_competition: Mapping[Girone, float]
+    ignored: tuple[Girone, ...] = ()
+    season: str | None = None
+
+    @property
+    def thinnest(self) -> float:
+        """Matches per team of the least-covered competition (``0.0`` when nothing is covered)."""
+        return float(min(self.per_competition.values())) if self.per_competition else 0.0
+
+    @property
+    def thinnest_competition(self) -> Girone | None:
+        """The least-covered competition (first in configuration order on ties), ``None`` when none is covered."""
+        best: Girone | None = None
+        for g, value in self.per_competition.items():
+            if best is None or value < self.per_competition[best]:
+                best = g
+        return best
+
+    def describe_ignored(self) -> str:
+        """Italian fragment naming the ignored competitions, ``''`` when none.
+
+        ``'Serie B senza partite nei dati (ignorata nel calcolo della copertura)'``;
+        with several competitions the names are joined with ``' e '`` and the
+        participle becomes plural.
+        """
+        if not self.ignored:
+            return ""
+        names = " e ".join(g.short for g in self.ignored)
+        participle = "ignorata" if len(self.ignored) == 1 else "ignorate"
+        return f"{names} senza partite nei dati ({participle} nel calcolo della copertura)"
+
+
+def coverage_report(
+    matches: pd.DataFrame,
+    *,
+    registry: TeamRegistry | None = None,
+    season: str | None = None,
+) -> CoverageReport:
+    """Per-competition coverage behind :func:`matches_per_team` and :func:`prior_recommended`.
+
+    ``registry``/``season`` restrict the count to the perimeter (see
+    :func:`perimeter_matches`): with three seasons in the frame the history is
+    large, but the question is how much of the *current* season the current
+    teams have played. With a registry every competition the registry holds is
+    considered (the Serie C gironi and Serie B alike), except those without a
+    single match in ``matches`` in any season, which are reported as
+    :attr:`CoverageReport.ignored` instead of counting as zero coverage.
+    """
+    present = set(matches["girone"].astype(str)) if len(matches) else set()
+    frame = perimeter_matches(matches, registry=registry, season=season)
+    per_competition: dict[Girone, float] = {}
+    ignored: list[Girone] = []
+    if registry is not None:
+        for g, teams in registry.teams_by_girone.items():
+            if not teams:
+                continue
+            if g.value not in present:
+                ignored.append(g)
+                continue
+            members = set(teams)
+            n = int((frame["home_team"].isin(members) | frame["away_team"].isin(members)).sum()) if len(frame) else 0
+            per_competition[g] = 2.0 * n / len(members)
+    elif len(frame):
+        for code, group in frame.groupby("girone", observed=True):
+            teams = set(group["home_team"]) | set(group["away_team"])
+            per_competition[Girone(str(code))] = 2.0 * len(group) / len(teams)
+    if ignored:
+        log.debug(
+            "registry competitions without matches ignored by the coverage rule",
+            extra={"ignored": [g.value for g in ignored], "season": season},
+        )
+    return CoverageReport(per_competition=per_competition, ignored=tuple(ignored), season=season)
+
+
 def matches_per_team(
     matches: pd.DataFrame,
     *,
     registry: TeamRegistry | None = None,
     season: str | None = None,
 ) -> float:
-    """Average played matches per team in the least-covered girone (``2 * n / teams``), 0.0 when empty.
+    """Average played matches per team in the least-covered competition (``2 * n / teams``), 0.0 when empty.
 
-    ``registry``/``season`` restrict the count to the perimeter (see
-    :func:`perimeter_matches`): with three seasons in the frame the history is
-    large, but the question is how much of the *current* season the current
-    teams have played. With a registry, gironi are the registry gironi and a
-    girone without any current-season match counts as zero coverage.
+    Shorthand for ``coverage_report(...).thinnest``: with a registry, coverage is
+    counted for every competition the registry holds that has matches in the
+    frame (a competition never harvested is ignored, see
+    :class:`CoverageReport`), and a competition with history but no
+    current-season match counts as zero coverage.
     """
-    frame = perimeter_matches(matches, registry=registry, season=season)
-    if frame.empty:
-        return 0.0
-    coverage = []
-    if registry is not None:
-        gironi = {g: set(teams) for g, teams in registry.teams_by_girone.items() if teams}
-        for g, members in gironi.items():
-            played = frame["home_team"].isin(members) | frame["away_team"].isin(members)
-            n = int(played.sum())
-            coverage.append(2.0 * n / len(members))
-    else:
-        for _, group in frame.groupby("girone", observed=True):
-            teams = set(group["home_team"]) | set(group["away_team"])
-            coverage.append(2.0 * len(group) / len(teams))
-    return float(min(coverage)) if coverage else 0.0
+    return coverage_report(matches, registry=registry, season=season).thinnest
 
 
 def prior_recommended(
@@ -469,13 +567,15 @@ def prior_recommended(
     registry: TeamRegistry | None = None,
     season: str | None = None,
 ) -> bool:
-    """Auto rule: MAP estimate while some girone has fewer than ``min_matches_per_team`` matches per team.
+    """Auto rule: MAP estimate while some competition has fewer than ``min_matches_per_team`` matches per team.
 
-    A total-match threshold is misleading for a 60-team league (100 matches are
-    fewer than 2 per team), so coverage is measured per team in the thinnest
-    girone. Coverage is counted on the **current-season matches of current
-    teams** when ``registry``/``season`` are given: history never counts, however
-    long it is.
+    A total-match threshold is misleading for an 80-team perimeter (100 matches
+    are barely 2 per team), so coverage is measured per team in the thinnest
+    competition (each Serie C girone and Serie B on its own). Coverage is counted
+    on the **current-season matches of current teams** when ``registry``/``season``
+    are given: history never counts, however long it is, and a registry
+    competition with no match at all in the frame is left out of the rule
+    (:attr:`CoverageReport.ignored`) instead of forcing the prior for ever.
     """
     return matches_per_team(matches, registry=registry, season=season) < min_matches_per_team
 
@@ -634,19 +734,21 @@ def _simulated_inputs(
         swapped = sorted(set(past.teams) - set(reg.canonical_names))
         notes.append(
             f"Storico simulato: {len(history)} partite delle stagioni {', '.join(past.seasons)} con {len(swapped)} squadre "
-            f"non più in Serie C {reg.season_label} ({', '.join(swapped[:6])}{', ...' if len(swapped) > 6 else ''}): "
+            f"non più nel perimetro {reg.season_label} ({', '.join(swapped[:6])}{', ...' if len(swapped) > 6 else ''}): "
             "usate solo per stimare meglio le forze, escluse da classifica, previsioni e valore."
         )
-    trap_team = _pick_trap_team(matches, league.fixtures, Girone.A)
+    # the showcase trap goes to the first competition of the registry (Girone A with the default one)
+    trap_girone = reg.gironi[0] if reg.gironi else next(iter(Girone))
+    trap_team = _pick_trap_team(matches, league.fixtures, trap_girone)
     if trap_team is not None:
         matches = inject_regression_trap(matches, trap_team)
         notes.append(
-            f"Trappola di regressione iniettata su {trap_team} (Girone A): ultime 3 gare riscritte con "
+            f"Trappola di regressione iniettata su {trap_team} ({trap_girone.short}): ultime 3 gare riscritte con "
             f"1 gol subito contro 4.20 xGA, così il filtro REGRESSION_TRAP compare nel pannello valore."
         )
-        log.info("regression trap injected", extra={"team": trap_team})
+        log.info("regression trap injected", extra={"team": trap_team, "girone": trap_girone.value})
     else:
-        notes.append("Nessuna squadra del Girone A con 3 gare giocate e una partita in programma: trappola non iniettata.")
+        notes.append(f"Nessuna squadra di {trap_girone.short} con 3 gare giocate e una partita in programma: trappola non iniettata.")
     return matches, history, league.fixtures, league.odds
 
 
@@ -675,10 +777,11 @@ def build_state(
     Perimeter
         ``season`` selects the registry (``config/teams_<season>.json``, 2026/27
         by default; ``registry`` overrides it, e.g. for a simulated composition).
-        Its teams are the only ones ranked, predicted and priced: the fit sees
-        every match of the frame, but teams outside the registry are fitted as
-        *historical* opponents only. The rows of the registry season are the
-        current matches; older rows are history.
+        Its teams -- in every competition it holds, the three Serie C gironi and
+        Serie B with the shipped files -- are the only ones ranked, predicted and
+        priced: the fit sees every match of the frame, but teams outside the
+        registry are fitted as *historical* opponents only. The rows of the
+        registry season are the current matches; older rows are history.
     Data source
         ``processed_dir/matches.csv`` is used when it exists and ``simulate`` is
         not ``True`` (``fixtures.csv`` alongside it when present, odds from
@@ -745,12 +848,13 @@ def build_state(
     if matches.empty:
         raise ValueError(f"no played matches available for the {season_label} perimeter")
 
+    coverage = coverage_report(current, registry=reg, season=season_label)
     config, prior_on = _model_config(current, xi=xi, use_prior=use_prior, registry=reg, season=season_label)
     engine = DixonColesEngine(config)
     params = engine.fit(matches, registry=reg)
     hist_label = history_label(history)
     notes.append(
-        f"Perimetro: Serie C {season_label}, {reg.n_teams} squadre nel dizionario, {len(params.current_teams)} con partite; "
+        f"Perimetro: {reg.perimeter_label}, {len(params.current_teams)} squadre con partite nei dati; "
         f"{len(current)} partite della stagione corrente"
         + (f" e {len(history)} partite storiche ({hist_label})" if len(history) else " e nessuna partita storica")
         + f"; {len(params.historical_teams)} squadre storiche stimate solo come avversarie"
@@ -768,8 +872,9 @@ def build_state(
         f"({params.message}), log-likelihood {params.log_likelihood:.2f}, {params.n_iter} iterazioni in "
         f"{params.fit_seconds:.2f} s, xi={params.xi}, prior gaussiana {'attiva' if prior_on else 'disattivata'}"
         + (f" (penalità {params.penalty:.3f})" if prior_on else "")
-        + f" (copertura {matches_per_team(current, registry=reg, season=season_label):.1f} partite per squadra nel girone meno coperto)"
-        + f", rho={params.rho:+.4f}."
+        + f" (copertura {coverage.thinnest:.1f} partite per squadra nel girone meno coperto"
+        + (f"; {coverage.describe_ignored()}" if coverage.ignored else "")
+        + f"), rho={params.rho:+.4f}."
     )
     log.info(
         "dashboard fit",
@@ -868,6 +973,7 @@ def build_state(
         current_matches=current,
         history_matches=history,
         skipped_fixtures=skipped_season + skipped_historical + skipped_unknown,
+        coverage=coverage,
     )
 
 
@@ -878,21 +984,29 @@ def _as_girone(girone: Girone | str | None) -> Girone | None:
     return None if girone is None else Girone.parse(girone)
 
 
+def competition_label(girone: Girone | str) -> str:
+    """Short label shown in the tables for a competition code: ``'A'`` -> ``'Girone A'``, ``'SB'`` -> ``'Serie B'``."""
+    return Girone.parse(girone).short
+
+
 def ranking_table(state: PipelineState, girone: Girone | None) -> pd.DataFrame:
     """Strength ranking (alpha desc) with Italian labels, rounded to 3 decimals.
 
-    Only the current teams of the perimeter are listed and ``Girone`` is their
-    registry girone (historical opponents never appear). ``girone=None`` returns
-    every current team; a girone with no fitted teams yields an empty frame with
-    the same columns instead of raising.
+    Only the current teams of the perimeter are listed and ``Competizione`` is
+    the short label of their registry competition (historical opponents never
+    appear). ``girone=None`` returns every current team; a competition with no
+    fitted teams yields an empty frame with the same columns instead of raising.
     """
     g = _as_girone(girone)
     if g is not None and g not in state.params.teams_by_girone:
-        return pd.DataFrame({c: pd.Series(dtype="string" if c in ("Squadra", "Girone") else "float64") for c in RANKING_COLUMNS})
+        return pd.DataFrame({c: pd.Series(dtype="string" if c in ("Squadra", "Competizione") else "float64") for c in RANKING_COLUMNS})
     frame = state.engine.ranking(g)[list(_RANKING_RENAME)].rename(columns=_RANKING_RENAME)
-    numeric = [c for c in RANKING_COLUMNS if c not in ("Squadra", "Girone")]
+    numeric = [c for c in RANKING_COLUMNS if c not in ("Squadra", "Competizione")]
     frame = frame.assign(**{c: frame[c].astype("float64").round(3) for c in numeric})
-    frame = frame.assign(Squadra=frame["Squadra"].astype("string"), Girone=frame["Girone"].astype("string"))
+    frame = frame.assign(
+        Squadra=frame["Squadra"].astype("string"),
+        Competizione=frame["Competizione"].astype(str).map(competition_label).astype("string"),
+    )
     return frame[list(RANKING_COLUMNS)].reset_index(drop=True)
 
 
@@ -1025,7 +1139,7 @@ def heatmap_figure(prediction: MatchPrediction, max_goals_shown: int | None = No
         subtitle += f" · {n - 1}+ = {n - 1} o più gol"
     fig.update_layout(
         template="plotly",
-        title={"text": f"{fx.label} · Girone {fx.girone.value} · {fx.date.isoformat()}<br><sup>{subtitle}</sup>"},
+        title={"text": f"{fx.label} · {fx.girone.short} · {fx.date.isoformat()}<br><sup>{subtitle}</sup>"},
         xaxis={
             "title": {"text": f"Gol {fx.away_team}"},
             "tickmode": "array",
@@ -1140,12 +1254,12 @@ def markets_table(prediction: MatchPrediction, quotes: list[OddsQuote]) -> pd.Da
 
 
 def value_table(state: PipelineState, min_ev: float, girone: Girone | None = None) -> pd.DataFrame:
-    """Selections with ``ev >= min_ev`` (optionally one girone), EV descending, Italian labels."""
+    """Selections with ``ev >= min_ev`` (optionally one competition), EV descending, Italian labels."""
     g = _as_girone(girone)
     rows = [
         {
             "Data": pd.Timestamp(o.date),
-            "Girone": o.girone.value,
+            "Competizione": o.girone.short,
             "Partita": f"{o.home_team} - {o.away_team}",
             "Mercato": MARKET_LABELS[o.market],
             "Esito": o.selection,
@@ -1162,7 +1276,7 @@ def value_table(state: PipelineState, min_ev: float, girone: Girone | None = Non
     ]
     frame = pd.DataFrame(rows, columns=list(VALUE_COLUMNS))
     frame = frame.assign(Data=pd.to_datetime(frame["Data"]).astype("datetime64[ns]"))
-    for c in ("Girone", "Partita", "Mercato", "Esito", "Bookmaker", "Flag"):
+    for c in ("Competizione", "Partita", "Mercato", "Esito", "Bookmaker", "Flag"):
         frame[c] = frame[c].astype("string")
     for c in ("Quota Book", "Quota Fair", "P. Modello (%)", "EV (%)", "Stake (unità)"):
         frame[c] = frame[c].astype("float64")
@@ -1175,7 +1289,7 @@ def traps_table(state: PipelineState) -> pd.DataFrame:
     rows = [
         {
             "Squadra": t.team,
-            "Girone": t.girone.value,
+            "Competizione": t.girone.short,
             "Gol Subiti": int(t.goals_against),
             "xGA": round(t.xg_against, 2),
             "Severità": round(t.severity, 2),
@@ -1186,7 +1300,7 @@ def traps_table(state: PipelineState) -> pd.DataFrame:
     frame = pd.DataFrame(rows, columns=list(TRAPS_COLUMNS))
     frame = frame.assign(
         Squadra=frame["Squadra"].astype("string"),
-        Girone=frame["Girone"].astype("string"),
+        Competizione=frame["Competizione"].astype("string"),
         **{"Gol Subiti": frame["Gol Subiti"].astype("int64"), "Ultima Gara": pd.to_datetime(frame["Ultima Gara"]).astype("datetime64[ns]")},
     )
     for c in ("xGA", "Severità"):

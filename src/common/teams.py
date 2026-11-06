@@ -1,19 +1,29 @@
-"""Canonical team dictionary (per season, per girone) + alias lookup.
+"""Canonical team dictionary (per season, per competition) + alias lookup.
 
-The dictionary lives in ``config/teams_<season>.json``. Code never hard-codes a
-team name: it asks :class:`TeamRegistry` for the canonical spelling.
+The dictionary lives in ``config/teams_<season>.json``: under ``"gironi"`` one
+object per competition code of ``config/competitions.toml`` (``A``, ``B``, ``C``
+for the Serie C gironi, ``SB`` for Serie B, more as leagues are added), each
+mapping a canonical team name to its aliases. Code never hard-codes a team
+name: it asks :class:`TeamRegistry` for the canonical spelling. The registry
+works with any number of competitions: it iterates the dynamic
+:class:`src.common.schemas.Girone` enum and never assumes A/B/C.
 
 Seasons and perimeter
 ---------------------
-The registry of :data:`DEFAULT_SEASON` (``config/teams_2026_27.json``, the
-official Lega Pro composition of the three gironi) is the *perimeter*: its 60
-teams are the only ones that are ranked, predicted and priced. Older season
-files (``teams_2025_26.json``, ...) are kept as **historical alias sources**:
+The registry of :data:`DEFAULT_SEASON` (``config/teams_2026_27.json``: the
+official Lega Pro composition of the three Serie C gironi plus the Serie B
+organico) is the *perimeter*: its 80 teams are the only ones that are ranked,
+predicted and priced (:attr:`TeamRegistry.perimeter_label` spells it out:
+``'Serie C 2026/27 Gironi A/B/C + Serie B (80 squadre)'``). Older season files
+(``teams_2025_26.json``, ...) are kept as **historical alias sources**:
 :meth:`TeamRegistry.with_historical_aliases` merges their spellings into the
 current registry so that harvested history keeps consistent names, while
 :meth:`TeamRegistry.is_current_team` tells the current teams apart from the
 historical ones (relegated, promoted, excluded clubs) that only appear in past
-seasons. :func:`list_seasons` enumerates the season files available.
+seasons. A club keeps **one canonical name across divisions**: Pescara is
+``'Pescara'`` whether it plays Serie B (2025/26) or Serie C girone B (2026/27),
+and the registry of the current season decides its competition.
+:func:`list_seasons` enumerates the season files available.
 """
 from __future__ import annotations
 
@@ -24,6 +34,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, Mapping
 
+from .competitions import describe_competitions
 from .paths import CONFIG_DIR
 from .schemas import Girone
 
@@ -65,12 +76,15 @@ def season_file_stem(season: str) -> str:
 
 @dataclass(frozen=True)
 class TeamRegistry:
-    """Canonical teams of one season, grouped by girone, plus an alias table.
+    """Canonical teams of one season, grouped by competition, plus an alias table.
 
-    ``aliases`` maps a *normalised* spelling to a canonical name. The canonical
-    names of ``teams_by_girone`` are the **current** teams; ``historical_names``
-    lists further canonical names reachable through the alias table that are
-    *not* current (teams of previous seasons merged in with
+    ``teams_by_girone`` maps a :class:`Girone` (competition) to its canonical
+    names; a registry may hold any subset of the configured competitions (the
+    mini demo has three, the default perimeter four). ``aliases`` maps a
+    *normalised* spelling to a canonical name. The canonical names of
+    ``teams_by_girone`` are the **current** teams; ``historical_names`` lists
+    further canonical names reachable through the alias table that are *not*
+    current (teams of previous seasons merged in with
     :meth:`with_historical_aliases`). An alias of a historical team resolves to
     the historical canonical spelling, never to a current team, so history keeps
     consistent names and :meth:`is_current_team` stays unambiguous.
@@ -83,8 +97,13 @@ class TeamRegistry:
 
     # ----------------------------------------------------------------- views
     @property
+    def gironi(self) -> tuple[Girone, ...]:
+        """Competitions that have at least one team, in configuration order."""
+        return tuple(g for g in Girone if self.teams_by_girone.get(g))
+
+    @property
     def canonical_names(self) -> tuple[str, ...]:
-        """Current teams in girone order (A, B, C), file order within a girone."""
+        """Current teams in competition order (``config/competitions.toml``), file order within a competition."""
         return tuple(t for g in Girone for t in self.teams_by_girone.get(g, ()))
 
     @property
@@ -97,6 +116,18 @@ class TeamRegistry:
         """Season as a public label, ``'2026/27'`` (whatever the file spelled)."""
         return str(self.season).strip().replace("_", "/").replace("-", "/")
 
+    @property
+    def perimeter_label(self) -> str:
+        """Italian description of the perimeter derived from the configuration, never hard-coded.
+
+        ``'Serie C 2026/27 Gironi A/B/C + Serie B (80 squadre)'`` for the default
+        registry, ``'Serie C 2026/27 Gironi A/B/C (14 squadre)'`` for the mini
+        demo; only the competitions that have teams are named (see
+        :func:`src.common.competitions.describe_competitions`).
+        """
+        text = describe_competitions((g.competition for g in self.gironi), season=self.season_label)
+        return f"{text} ({self.n_teams} squadre)"
+
     def girone_of(self, canonical: str) -> Girone:
         for g, teams in self.teams_by_girone.items():
             if canonical in teams:
@@ -104,6 +135,7 @@ class TeamRegistry:
         raise KeyError(canonical)
 
     def teams(self, girone: "Girone | str") -> tuple[str, ...]:
+        """Canonical teams of one competition (``KeyError`` when the registry has none for it)."""
         return self.teams_by_girone[Girone.parse(girone)]
 
     def alias_table(self) -> dict[str, str]:
@@ -128,15 +160,43 @@ class TeamRegistry:
     # -------------------------------------------------------------- builders
     @classmethod
     def from_mapping(cls, season: str, gironi: Mapping[str, Mapping[str, Iterable[str]]]) -> "TeamRegistry":
+        """Build from ``{competition code: {canonical: [aliases]}}`` (the JSON layout).
+
+        Keys are parsed with :meth:`Girone.parse`, so ``'SB'`` and ``'Serie B'``
+        both work. ``ValueError`` when a canonical name is listed under two
+        competitions (a club has one canonical name and plays one league per
+        season) or when a *normalised* spelling would resolve to two different
+        clubs, whatever competitions they play in: with 80 teams in four
+        competitions ``'Verona'`` as an alias of both ``'Virtus Verona'`` (girone
+        A) and ``'Hellas Verona'`` (Serie B) would otherwise silently keep only
+        the club listed last. Repeating a spelling for the *same* club is fine.
+        """
         teams_by_girone: dict[Girone, tuple[str, ...]] = {}
         aliases: dict[str, str] = {}
+        owner: dict[str, Girone] = {}
+
+        def register(spelling: str, canonical: str, g: Girone) -> None:
+            norm = normalize_name(spelling)
+            other = aliases.get(norm)
+            if other is not None and other != canonical:
+                raise ValueError(
+                    f"season {season}: spelling {spelling!r} (normalised {norm!r}) of {canonical!r} [{g.value}] "
+                    f"collides with {other!r} [{owner[other].value}]: one spelling must resolve to one club"
+                )
+            aliases[norm] = canonical
+
         for g_key, teams in gironi.items():
             g = Girone.parse(g_key)
+            if g in teams_by_girone:
+                raise ValueError(f"season {season}: competition {g.value} listed twice")
             teams_by_girone[g] = tuple(teams.keys())
             for canonical, alias_list in teams.items():
-                aliases[normalize_name(canonical)] = canonical
+                if canonical in owner:
+                    raise ValueError(f"season {season}: {canonical!r} is listed in both {owner[canonical].value} and {g.value}")
+                owner[canonical] = g
+                register(canonical, canonical, g)
                 for alias in alias_list:
-                    aliases[normalize_name(alias)] = canonical
+                    register(alias, canonical, g)
         return cls(season=season, teams_by_girone=teams_by_girone, aliases=aliases)
 
     @classmethod
@@ -156,10 +216,13 @@ class TeamRegistry:
 
         * if it still exists (its canonical spelling, or one of its aliases,
           resolves to a current team) its aliases are added for that current team,
-          so ``'Juventus U23'`` from an old file still maps to ``'Juventus Next Gen'``;
+          so ``'Juventus U23'`` from an old file still maps to ``'Juventus Next Gen'``
+          and ``'Delfino Pescara'`` (Serie B 2025/26) to ``'Pescara'`` (girone B
+          2026/27), whatever competition the club plays now;
         * otherwise the team is **historical**: its old canonical name and its
           aliases map to the *old canonical spelling itself* (``'Ternana Calcio'``
-          -> ``'Ternana'``), which is also recorded in ``historical_names``.
+          -> ``'Ternana'``, ``'Frosinone Calcio'`` -> ``'Frosinone'``), which is
+          also recorded in ``historical_names``.
 
         Spellings already known to the current registry are never overridden, and
         among several older registries the first argument wins, so pass them from

@@ -8,9 +8,11 @@ so the engine can be validated against it.
 Seasons
 -------
 The simulated *current* season is the season of the registry, by default the
-real 2026/27 Serie C: the composition of :func:`src.common.teams.load_registry`
-(60 teams, three gironi) on a calendar anchored to the real kick-off
-(:data:`SEASON_2026_27_START`, Sunday 23 August 2026, one round per week). A
+real 2026/27 perimeter: the composition of :func:`src.common.teams.load_registry`
+(80 teams: the three Serie C gironi and Serie B, one double round robin per
+competition, every competition the registry holds and nothing hard-coded) on a
+calendar anchored to the real kick-off (:data:`SEASON_2026_27_START`, Sunday
+23 August 2026, one round per week). A
 registry of another season (``load_registry("2025_26")``) is simulated on *its*
 calendar (:func:`season_start_date`), so the dated matches always belong to the
 registry season. :func:`simulate_league` accepts ``as_of`` so that the number
@@ -19,13 +21,17 @@ the first round on/after it is the fixture list), or ``n_rounds`` for explicit
 control. :func:`simulate_history` produces the two seasons *before* the registry
 season (:func:`previous_seasons`: 2024/25 and 2025/26 for 2026/27) with a
 partly different composition -- some current teams replaced by real former
-Serie C clubs (:data:`HISTORICAL_TEAMS`, padded with the registry's own
-historical names and, as a last resort, synthetic ``Storica N`` clubs so the
-pool can never run dry) and a few current teams in the girone they really
-played in back then (:data:`HISTORICAL_MOVES`) -- so the engine's
-current/historical logic and the registry-based girone assignment are exercised
-offline. One :class:`TrueParams` drives every season; the strengths of the
-historical clubs are drawn from the same distribution as the current ones.
+Serie C and Serie B clubs (:data:`HISTORICAL_TEAMS`, padded with the
+registry's own historical names and, as a last resort, synthetic ``Storica N``
+clubs so the pool can never run dry) and a few current teams in the
+competition they really played in back then (:data:`HISTORICAL_MOVES`: girone
+moves such as Inter U23 A -> C, and division moves such as Pescara, Serie B
+2025/26 -> girone B 2026/27, or Vicenza, girone A 2025/26 -> Serie B 2026/27)
+-- so the engine's current/historical logic, the registry-based competition
+assignment and the cross-division identification through the movers are
+exercised offline. One :class:`TrueParams` drives every season, with a home
+advantage per competition (:data:`DEFAULT_HOME_ADVANTAGE`); the strengths of
+the historical clubs are drawn from the same distribution as the current ones.
 """
 from __future__ import annotations
 
@@ -53,6 +59,8 @@ from src.common.schemas import (
 from src.common.teams import DEFAULT_SEASON, TeamRegistry, load_registry
 
 __all__ = [
+    "DEFAULT_HOME_ADVANTAGE",
+    "FALLBACK_HOME_ADVANTAGE",
     "HISTORICAL_ABSENCES",
     "HISTORICAL_MOVES",
     "HISTORICAL_TEAMS",
@@ -62,6 +70,7 @@ __all__ = [
     "SYNTHETIC_HISTORICAL_PREFIX",
     "SimulatedLeague",
     "TrueParams",
+    "default_home_advantage",
     "dixon_coles_matrix",
     "history_seasons_for",
     "inject_regression_trap",
@@ -86,9 +95,18 @@ SEASON_2026_27_START: Final[date] = date(2026, 8, 23)
 #: first; for another registry the same number of seasons *before* its season is used (:func:`previous_seasons`).
 HISTORY_SEASONS: Final[tuple[str, ...]] = ("2024/25", "2025/26")
 #: Name prefix of the synthetic clubs that fill a historical composition when every real name is used up
-#: (``'Storica 1'``, ``'Storica 2'``, ...): they are never current teams, so they are historical by construction.
+#: (``'Storica 01'``, ``'Storica 02'``, ...): they are never current teams, so they are historical by construction.
+#: The number is zero-padded because :func:`src.common.teams.normalize_name` drops single-character tokens:
+#: ``'Storica 1'`` and ``'Storica 2'`` would both normalise to ``'storica'`` and the registry rejects spellings
+#: shared by two clubs.
 SYNTHETIC_HISTORICAL_PREFIX: Final[str] = "Storica"
-#: Real former Serie C clubs (relegated, promoted or excluded) used as historical opponents.
+#: True home advantage per competition code used by :func:`sample_true_params` (Serie B lower than Serie C).
+DEFAULT_HOME_ADVANTAGE: Final[dict[str, float]] = {"A": 0.30, "B": 0.22, "C": 0.38, "SB": 0.25}
+#: Home advantage of a competition that :data:`DEFAULT_HOME_ADVANTAGE` does not list (a league added later).
+FALLBACK_HOME_ADVANTAGE: Final[float] = 0.28
+#: Real former Serie C and Serie B clubs (relegated, promoted or excluded) used as historical opponents.
+#: Names that are current teams of the simulated registry are skipped (Arezzo, Ascoli, Benevento and
+#: Vicenza play Serie B 2026/27; 12 of them play Serie C 2025/26).
 HISTORICAL_TEAMS: Final[tuple[str, ...]] = (
     "Ternana",
     "Rimini",
@@ -110,29 +128,80 @@ HISTORICAL_TEAMS: Final[tuple[str, ...]] = (
     "Taranto",
     "Turris",
     "Clodiense",
+    "Frosinone",
+    "Monza",
+    "Venezia",
 )
-#: Current teams that played in a *different* girone in a past season (real Lega Pro compositions),
-#: so a registry-based fit must put them back in their 2026/27 girone.
+
+
+def _moves(spec: Mapping[str, str]) -> dict[str, Girone]:
+    """``{team: code}`` -> ``{team: Girone}``, silently dropping codes the configuration does not define."""
+    return {team: Girone(code) for team, code in spec.items() if code in Girone.__members__}
+
+
+#: Current teams that played in a *different* competition in a past season (real compositions): girone moves
+#: inside Serie C (Inter U23, Atalanta U23, Juventus Next Gen, Latina, Carpi) and division moves between
+#: Serie B (``SB``) and Serie C (Pescara, Spezia, Reggiana and Bari relegated in 2026; Arezzo, Ascoli,
+#: Benevento and Vicenza promoted in 2026; Padova, Avellino, Virtus Entella promoted in 2025; Cittadella,
+#: Cosenza and Salernitana relegated in 2025). A registry-based fit must put every mover back in its
+#: current competition; a code the configuration lacks (a registry without Serie B) is ignored.
 HISTORICAL_MOVES: Final[dict[str, dict[str, Girone]]] = {
-    "2025/26": {
-        "Inter U23": Girone.A,
-        "Atalanta U23": Girone.C,
-        "Juventus Next Gen": Girone.B,
-        "Latina": Girone.C,
-        "Carpi": Girone.B,
-    },
-    "2024/25": {
-        "Atalanta U23": Girone.A,
-        "Juventus Next Gen": Girone.C,
-        "Latina": Girone.C,
-        "Carpi": Girone.B,
-    },
+    "2025/26": _moves(
+        {
+            "Inter U23": "A",
+            "Atalanta U23": "C",
+            "Juventus Next Gen": "B",
+            "Latina": "C",
+            "Carpi": "B",
+            "Pescara": "SB",
+            "Spezia": "SB",
+            "Reggiana": "SB",
+            "Bari": "SB",
+            "Arezzo": "B",
+            "Ascoli": "B",
+            "Benevento": "C",
+            "Vicenza": "A",
+        }
+    ),
+    "2024/25": _moves(
+        {
+            "Atalanta U23": "A",
+            "Juventus Next Gen": "C",
+            "Latina": "C",
+            "Carpi": "B",
+            "Bari": "SB",
+            "Cittadella": "SB",
+            "Cosenza": "SB",
+            "Salernitana": "SB",
+            "Reggiana": "SB",
+            "Spezia": "SB",
+            "Arezzo": "B",
+            "Ascoli": "B",
+            "Avellino": "C",
+            "Benevento": "C",
+            "Padova": "A",
+            "Vicenza": "A",
+            "Virtus Entella": "B",
+        }
+    ),
 }
-#: Current teams that did not play Serie C in a past season (Inter U23 was founded in 2025).
+#: Current teams that did not play in the perimeter in a past season: Inter U23 was founded in 2025;
+#: Cremonese, Pisa and Hellas Verona played Serie A in 2025/26, Empoli and Hellas Verona in 2024/25.
 HISTORICAL_ABSENCES: Final[dict[str, frozenset[str]]] = {
-    "2024/25": frozenset({"Inter U23"}),
-    "2023/24": frozenset({"Inter U23"}),
+    "2025/26": frozenset({"Cremonese", "Pisa", "Hellas Verona"}),
+    "2024/25": frozenset({"Inter U23", "Empoli", "Hellas Verona"}),
+    "2023/24": frozenset({"Inter U23", "Empoli", "Hellas Verona"}),
 }
+
+
+def default_home_advantage(gironi: Sequence[Girone] | None = None) -> dict[Girone, float]:
+    """True home advantage per competition: :data:`DEFAULT_HOME_ADVANTAGE` by code, :data:`FALLBACK_HOME_ADVANTAGE` otherwise.
+
+    Every configured competition by default (so :class:`TrueParams.gamma` always
+    covers the whole :class:`Girone` enum), or only ``gironi``.
+    """
+    targets = tuple(Girone) if gironi is None else tuple(Girone.parse(g) for g in gironi)
+    return {g: float(DEFAULT_HOME_ADVANTAGE.get(g.value, FALLBACK_HOME_ADVANTAGE)) for g in targets}
 
 
 # --------------------------------------------------------------------------- math
@@ -275,7 +344,7 @@ def sample_true_params(
             alpha[t] = float(ai)
             beta[t] = float(bi)
     if gamma is None:
-        gamma = {Girone.A: 0.30, Girone.B: 0.22, Girone.C: 0.38}
+        gamma = default_home_advantage()
     return TrueParams(alpha=alpha, beta=beta, gamma=dict(gamma), rho=rho)
 
 
@@ -471,20 +540,22 @@ def _season_composition(
 ) -> dict[Girone, tuple[str, ...]]:
     """Composition of one past season: the current registry with moves, absences and swaps applied.
 
-    Every girone keeps its current size. Teams in :data:`HISTORICAL_MOVES` (when
-    present in ``registry``) sit in the girone they played in that season and
-    are never swapped out; teams in :data:`HISTORICAL_ABSENCES` are removed;
-    then ``swap_per_girone`` of the remaining current teams of each girone are
-    replaced by names from :data:`HISTORICAL_TEAMS` (a fresh permutation of the
-    pool per season, so a club can appear in several seasons). When moves leave
-    a girone over its size, extra current teams are dropped; under its size,
-    extra historical teams fill it.
+    Every competition keeps its current size. Teams in :data:`HISTORICAL_MOVES`
+    (when present in ``registry`` *and* when their destination competition is
+    one the registry has: a Serie B move is skipped for a Serie-C-only registry)
+    sit in the competition they played in that season and are never swapped out;
+    teams in :data:`HISTORICAL_ABSENCES` are removed; then ``swap_per_girone`` of
+    the remaining current teams of each competition are replaced by names from
+    :data:`HISTORICAL_TEAMS` (a fresh permutation of the pool per season, so a
+    club can appear in several seasons). When moves leave a competition over its
+    size, extra current teams are dropped; under its size, extra historical
+    teams fill it.
 
     The pool is size-safe: names of :data:`HISTORICAL_TEAMS` that are current
     teams of ``registry`` are left out (12 of them play Serie C 2025/26), then
     the registry's own ``historical_names`` (older season files merged with
     :meth:`TeamRegistry.with_historical_aliases`) are appended, and when even
-    those run out synthetic clubs ``'Storica 1'``, ``'Storica 2'``, ... fill the
+    those run out synthetic clubs ``'Storica 01'``, ``'Storica 02'``, ... fill the
     gaps with a warning instead of raising, so every registry can be simulated.
     """
     comp: dict[Girone, list[str]] = {g: list(teams) for g, teams in registry.teams_by_girone.items()}
@@ -518,7 +589,7 @@ def _season_composition(
         need = sizes[g] - len(teams)
         if need > len(pool):
             missing = need - len(pool)
-            pool.extend(f"{SYNTHETIC_HISTORICAL_PREFIX} {n_synthetic + i + 1}" for i in range(missing))
+            pool.extend(f"{SYNTHETIC_HISTORICAL_PREFIX} {n_synthetic + i + 1:02d}" for i in range(missing))
             n_synthetic += missing
             log.warning(
                 "historical pool exhausted, synthetic clubs added to the composition",
@@ -563,11 +634,13 @@ def simulate_history(
     season whatever registry is used. Each season is a full double round robin
     on its real calendar (:func:`season_start_date`: 25 Aug 2024, 24 Aug 2025)
     whose composition is the current registry with ``swap_per_girone`` current
-    teams per girone replaced by real former Serie C clubs
+    teams per competition replaced by real former Serie C / Serie B clubs
     (:data:`HISTORICAL_TEAMS`, padded as described in the module docstring when
-    the pool runs short), plus the girone moves of :data:`HISTORICAL_MOVES`
-    (Inter U23 in A, Atalanta U23 in C, Juventus Next Gen in B, ... for
-    2025/26) and the absences of :data:`HISTORICAL_ABSENCES`. The same
+    the pool runs short), plus the moves of :data:`HISTORICAL_MOVES` (Inter U23
+    in A, Atalanta U23 in C, Juventus Next Gen in B, Pescara / Spezia /
+    Reggiana / Bari in Serie B, Arezzo / Ascoli / Benevento / Vicenza in their
+    Serie C gironi, ... for 2025/26) and the absences of
+    :data:`HISTORICAL_ABSENCES`. The same
     :class:`TrueParams` drive every season: ``true_params`` when given,
     otherwise the ones ``simulate_league(seed=seed, registry=registry)`` samples
     for the current season, extended with strengths for the whole historical

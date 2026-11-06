@@ -1,8 +1,8 @@
 {
   "season": "2026/27",
-  "competition": "Serie C Sky Wifi",
-  "source": "Lega Pro, Comunicato Ufficiale n. 33/L del 29 luglio 2026 (composizione dei gironi)",
-  "note": "Canonical team names per girone for the CURRENT season. Aliases are the spellings used by SofaScore, FotMob and bookmakers. Only these 60 teams are ranked, predicted and priced; previous seasons are used as history only.",
+  "competition": "Serie C Sky Wifi (Gironi A/B/C) + Serie B",
+  "source": "Lega Pro, Comunicato Ufficiale n. 33/L del 29 luglio 2026 (composizione dei gironi di Serie C); Lega B, organico 2026/27 dopo i playoff/playout 2026",
+  "note": "Canonical team names per competition for the CURRENT season (keys = competition codes of config/competitions.toml: A/B/C = Serie C gironi, SB = Serie B). Aliases are the spellings used by FootyStats, SofaScore, FotMob and bookmakers. Only these 80 teams are ranked, predicted and priced; previous seasons are used as history only. A club keeps ONE canonical name across divisions (Pescara relegated from Serie B is 'Pescara' in girone B, Vicenza promoted is 'Vicenza' in SB). The SB composition (20 clubs after the 2026 playoffs/playouts) is from our research and is to be confirmed with the FootyStats league-teams endpoint (python -m src.ingestion.footystats --init-registry, built by the other chain).",
   "gironi": {
     "A": {
       "AlbinoLeffe": ["Albinoleffe", "U.C. AlbinoLeffe"],
@@ -69,6 +69,28 @@
       "Savoia": ["US Savoia", "Savoia 1908", "US Savoia 1908"],
       "Scafatese": ["Scafatese Calcio", "Scafatese 1922"],
       "Sorrento": ["Sorrento Calcio", "Sorrento 1945"]
+    },
+    "SB": {
+      "Arezzo": ["SS Arezzo", "ACF Arezzo", "Arezzo Calcio"],
+      "Ascoli": ["Ascoli Calcio", "Ascoli Calcio 1898"],
+      "Avellino": ["US Avellino", "Avellino 1912", "US Avellino 1912"],
+      "Benevento": ["Benevento Calcio"],
+      "Carrarese": ["Carrarese Calcio", "Carrarese Calcio 1908"],
+      "Catanzaro": ["US Catanzaro", "US Catanzaro 1929", "Catanzaro 1929"],
+      "Cesena": ["Cesena FC", "AC Cesena"],
+      "Cremonese": ["US Cremonese", "Cremonese 1903"],
+      "Empoli": ["Empoli FC"],
+      "Hellas Verona": ["Hellas Verona FC", "Hellas", "Hellas Verona 1903"],
+      "Juve Stabia": ["SS Juve Stabia", "Juve Stabia 1907"],
+      "Mantova": ["Mantova 1911", "AC Mantova"],
+      "Modena": ["Modena FC", "Modena FC 2018"],
+      "Padova": ["Padova Calcio", "Calcio Padova", "Padova 1910"],
+      "Palermo": ["Palermo FC", "US Palermo", "Palermo 1900"],
+      "Pisa": ["Pisa SC", "Pisa Sporting Club", "AC Pisa", "AC Pisa 1909"],
+      "Sampdoria": ["UC Sampdoria", "Sampdoria 1946"],
+      "Südtirol": ["FC Südtirol", "Sudtirol", "Alto Adige", "FC Sudtirol"],
+      "Vicenza": ["LR Vicenza", "L.R. Vicenza", "Lane Rossi Vicenza", "Vicenza Calcio"],
+      "Virtus Entella": ["Entella", "Virtus Entella Chiavari"]
     }
   }
 }

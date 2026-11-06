@@ -4,7 +4,12 @@ The matching-logic tests run on the 2025/26 dictionary (``LEGACY_SEASON``): its
 spellings (``Vicenza``, ``Virtus Verona``, ...) are the ones the assertions were
 written for, and pinning the season keeps them independent of
 :data:`src.common.teams.DEFAULT_SEASON`. The historical-team tests use the
-current 2026/27 perimeter extended with the 2025/26 aliases.
+current 2026/27 perimeter (80 teams: the three Serie C gironi plus Serie B)
+extended with the 2025/26 aliases. Both season files hold Serie B, so clubs such
+as Virtus Entella, Vicenza or Arezzo are *current* teams: the "unknown club"
+examples use ``UNKNOWN_CLUB`` (Serie D, in neither file) and the "left the
+perimeter" examples use clubs that are only in the 2025/26 file (Ternana,
+Frosinone, ...).
 """
 from __future__ import annotations
 
@@ -18,6 +23,11 @@ from src.ingestion.team_matcher import MatchResult, TeamMatcher
 
 LEGACY_SEASON = "2025_26"
 CURRENT_SEASON = "2026_27"
+#: Teams of the 2026/27 perimeter: three Serie C gironi + Serie B, 20 each.
+PERIMETER_SIZE = 80
+#: A real club (Serie D) that is in neither registry; close enough to "Virtus Verona" to be its
+#: top fuzzy candidate (score 74) without reaching the default threshold (86).
+UNKNOWN_CLUB = "Virtus Bergamo"
 
 
 @pytest.fixture(scope="module")
@@ -73,7 +83,7 @@ def test_fuzzy_lookup(matcher: TeamMatcher) -> None:
 
 
 def test_team_not_in_serie_c_is_none(matcher: TeamMatcher) -> None:
-    result = matcher.match("Virtus Entella")
+    result = matcher.match(UNKNOWN_CLUB)
     assert result.canonical is None
     assert result.method == "none"
     assert not result.matched
@@ -100,7 +110,7 @@ def test_threshold_respected(registry: TeamRegistry) -> None:
     assert strict.match("Juve Next Gen").canonical is None
     assert strict.match("Juventus U23").canonical == "Juventus Next Gen"  # alias path unaffected
     lenient = TeamMatcher(registry, threshold=70)
-    assert lenient.match("Virtus Entella").canonical == "Virtus Verona"
+    assert lenient.match(UNKNOWN_CLUB).canonical == "Virtus Verona"
 
 
 def test_ambiguity_returns_none_with_candidates() -> None:
@@ -146,16 +156,16 @@ def test_memoisation(matcher: TeamMatcher) -> None:
 
 # ----------------------------------------------------------------- bulk helpers
 def test_map_names(matcher: TeamMatcher) -> None:
-    out = matcher.map_names(["L.R. Vicenza", "Juve Next Gen", "Virtus Entella", "L.R. Vicenza"])
-    assert out == {"L.R. Vicenza": "Vicenza", "Juve Next Gen": "Juventus Next Gen", "Virtus Entella": None}
+    out = matcher.map_names(["L.R. Vicenza", "Juve Next Gen", UNKNOWN_CLUB, "L.R. Vicenza"])
+    assert out == {"L.R. Vicenza": "Vicenza", "Juve Next Gen": "Juventus Next Gen", UNKNOWN_CLUB: None}
     assert matcher.map_names(["Vicenza"], girone=Girone.B) == {"Vicenza": None}
 
 
 def test_map_frame_reports_unmapped_counts(matcher: TeamMatcher) -> None:
     df = pd.DataFrame(
         {
-            "home_team": ["L.R. Vicenza", "Virtus Entella", "Juventus U23", None],
-            "away_team": ["Pro Vercelli", "Virtus Entella", "Sestri Levante", "Novara"],
+            "home_team": ["L.R. Vicenza", UNKNOWN_CLUB, "Juventus U23", None],
+            "away_team": ["Pro Vercelli", UNKNOWN_CLUB, "Sestri Levante", "Novara"],
             "girone": ["A", "A", "B", "A"],
             "home_goals": [1, 2, 0, 3],
         }
@@ -163,10 +173,10 @@ def test_map_frame_reports_unmapped_counts(matcher: TeamMatcher) -> None:
     snapshot = df.copy()
     out, unmapped = matcher.map_frame(df)
     pd.testing.assert_frame_equal(df, snapshot)  # input untouched
-    assert out["home_team"].tolist()[:3] == ["Vicenza", "Virtus Entella", "Juventus Next Gen"]
+    assert out["home_team"].tolist()[:3] == ["Vicenza", UNKNOWN_CLUB, "Juventus Next Gen"]
     assert pd.isna(out["home_team"].iloc[3])
-    assert out["away_team"].tolist() == ["Pro Vercelli", "Virtus Entella", "Sestri Levante", "Novara"]
-    assert unmapped == {"Virtus Entella": 2, "Sestri Levante": 1}
+    assert out["away_team"].tolist() == ["Pro Vercelli", UNKNOWN_CLUB, "Sestri Levante", "Novara"]
+    assert unmapped == {UNKNOWN_CLUB: 2, "Sestri Levante": 1}
     assert str(out["home_team"].dtype) == "string"
     assert out["home_goals"].tolist() == [1, 2, 0, 3]
 
@@ -202,7 +212,7 @@ def test_difflib_fallback_path(monkeypatch: pytest.MonkeyPatch, registry: TeamRe
     assert calls == ["juve next gen"]
     assert result.canonical == "Juventus Next Gen"
     assert result.method == "fuzzy"
-    assert fallback.match("Virtus Entella").canonical is None
+    assert fallback.match(UNKNOWN_CLUB).canonical is None
     assert fallback.match("Juventus U23").method == "alias"  # non-fuzzy steps unaffected
     assert len(calls) == 2
 
@@ -271,14 +281,21 @@ def test_token_subset_guard_on_difflib_fallback(monkeypatch: pytest.MonkeyPatch,
 def test_default_season_is_the_current_perimeter() -> None:
     assert DEFAULT_SEASON == CURRENT_SEASON
     plain = TeamMatcher(load_registry())
-    assert len(plain.current_names) == 60 and plain.historical_names == frozenset()
-    assert plain.match("Vicenza").canonical is None  # relegated: unknown without history
+    assert len(plain.current_names) == PERIMETER_SIZE and plain.historical_names == frozenset()
+    assert plain.match("Ternana").canonical is None  # left Serie C after 2025/26: unknown without history
+    assert plain.match("Frosinone").canonical is None  # Serie B 2025/26, promoted: unknown without history
     assert plain.match("Juventus U23").canonical == "Juventus Next Gen"  # alias kept in the 2026/27 file
+    # Serie B is part of the perimeter: its clubs are current teams, not unknown ones (regression:
+    # the registry gained "SB" and these tests used Serie B clubs as the unknown examples)
+    assert plain.match("Virtus Entella").canonical == "Virtus Entella" and plain.match("Vicenza").canonical == "Vicenza"
+    assert plain.match("Arezzo").canonical == "Arezzo" and plain.match(UNKNOWN_CLUB).canonical is None
 
 
 def test_historical_names_are_derived_from_the_registry(history_matcher: TeamMatcher) -> None:
-    assert len(history_matcher.current_names) == 60
-    assert {"Ternana", "Vicenza", "Pro Patria", "Triestina", "Rimini", "Virtus Verona", "Benevento"} <= history_matcher.historical_names
+    assert len(history_matcher.current_names) == PERIMETER_SIZE
+    assert {"Ternana", "Frosinone", "Monza", "Pro Patria", "Triestina", "Rimini", "Virtus Verona", "Venezia"} <= history_matcher.historical_names
+    # promoted (Vicenza, Benevento, Arezzo) or relegated (Pescara) between Serie B and Serie C: still current
+    assert {"Vicenza", "Benevento", "Arezzo", "Pescara"} <= history_matcher.current_names
     assert history_matcher.historical_names.isdisjoint(history_matcher.current_names)
     assert history_matcher.is_historical("Ternana") and not history_matcher.is_current("Ternana")
     assert history_matcher.is_current("Perugia") and not history_matcher.is_historical("Perugia")

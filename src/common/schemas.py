@@ -19,10 +19,13 @@ from typing import Any, Final, Iterable, Mapping, Sequence
 import numpy as np
 import pandas as pd
 
+from src.common.competitions import COMPETITIONS, Competition, find_competition
 from src.common.logging_config import get_logger
 
 __all__ = [
+    "CompetitionBase",
     "Girone",
+    "build_girone_enum",
     "MATCH_COLUMNS",
     "MATCH_DTYPES",
     "REQUIRED_MATCH_COLUMNS",
@@ -99,27 +102,123 @@ def season_bounds(label: str) -> tuple[date, date]:
     return first, last
 
 
-class Girone(str, Enum):
-    """The three Serie C groups. The value is the public letter."""
+class CompetitionBase(str, Enum):
+    """Behaviour of the dynamic :data:`Girone` enum; the base itself has no members.
 
-    A = "A"
-    B = "B"
-    C = "C"
+    :func:`build_girone_enum` derives a concrete enum from a tuple of
+    :class:`~src.common.competitions.Competition` records: one member per
+    competition, named and valued by its code (``Girone.A.value == 'A'``,
+    ``Girone.SB.value == 'SB'``) in configuration order. Members are plain
+    strings too (``Girone.A == 'A'``), so frames, JSON payloads and CSV columns
+    keep storing the code. The records the enum was built from are reachable
+    through :meth:`competitions` and, per member, :attr:`competition`,
+    :attr:`label`, :attr:`short`, :attr:`family`, :attr:`tier`.
+    """
 
     @classmethod
-    def parse(cls, value: "str | Girone") -> "Girone":
-        if isinstance(value, Girone):
+    def competitions(cls) -> tuple[Competition, ...]:
+        """The competition records this enum was built from (empty on the base class)."""
+        return tuple(getattr(cls, "_competitions", ()))
+
+    @classmethod
+    def parse(cls, value: "str | CompetitionBase") -> "CompetitionBase":
+        """Member for any accepted spelling of a competition.
+
+        The code (``'A'``, ``'SB'``), the labels (``'Girone A'``, ``'Serie B'``,
+        ``'serie_b'``), the FootyStats name (``'Italy Serie B'``) and a code
+        wrapped in filler words (``'Serie C Girone A'``, ``'GIRONE_A'``) are all
+        accepted, case-insensitively; ``'B'`` is always the competition coded
+        ``B`` (Serie C Girone B). A member of another enum built by
+        :func:`build_girone_enum` is matched by its value. ``ValueError`` for an
+        unknown spelling.
+        """
+        if isinstance(value, cls):
             return value
-        text = str(value).strip().upper()
-        # accept 'A', 'Girone A', 'GIRONE_A', 'serie c girone a'
-        text = text.replace("GIRONE", "").replace("SERIE C", "").replace("_", "").strip()
+        if isinstance(value, CompetitionBase):
+            value = value.value
         try:
-            return cls(text)
-        except ValueError as exc:  # pragma: no cover - defensive
-            raise ValueError(f"Unknown girone: {value!r}") from exc
+            comp = find_competition(value, cls.competitions())
+        except ValueError as exc:
+            raise ValueError(f"Unknown girone: {value!r} (known: {[m.value for m in cls]})") from exc
+        return cls(comp.code)
+
+    @property
+    def competition(self) -> Competition:
+        """The :class:`~src.common.competitions.Competition` record of this member."""
+        by_code: Mapping[str, Competition] | None = getattr(type(self), "_by_code", None)
+        if by_code is None or self.value not in by_code:  # pragma: no cover - only a hand-built enum lacks the table
+            raise LookupError(f"no competition record for {self!r}; build the enum with build_girone_enum")
+        return by_code[self.value]
+
+    @property
+    def label(self) -> str:
+        """Full public name, ``'Serie C Girone A'`` / ``'Serie B'``."""
+        return self.competition.label
+
+    @property
+    def short(self) -> str:
+        """Compact name for tables and selectors, ``'Girone A'`` / ``'Serie B'``."""
+        return self.competition.short
+
+    @property
+    def family(self) -> str:
+        """League the competition belongs to (``'Serie C'`` for the three gironi)."""
+        return self.competition.family
+
+    @property
+    def tier(self) -> int:
+        """Level in the national pyramid (2 = Serie B, 3 = Serie C)."""
+        return self.competition.tier
+
+    @property
+    def country(self) -> str:
+        return self.competition.country
+
+    @property
+    def footystats_name(self) -> str:
+        """``name`` of the competition in the FootyStats ``/league-list`` endpoint."""
+        return self.competition.footystats_name
 
     def __str__(self) -> str:  # pragma: no cover - trivial
         return self.value
+
+
+def build_girone_enum(
+    competitions: Iterable[Competition],
+    *,
+    name: str = "Girone",
+    module: str = __name__,
+    qualname: str | None = None,
+) -> type[CompetitionBase]:
+    """Create a :class:`CompetitionBase` enum with one member per competition, in the given order.
+
+    Member names and values are the competition codes. ``module``/``qualname``
+    make the class picklable (they default to this module and ``name``). The
+    global :data:`Girone` is ``build_girone_enum(COMPETITIONS)``; tests build
+    further enums from custom tuples without touching it. ``ValueError`` for an
+    empty iterable or duplicate codes.
+    """
+    comps = tuple(competitions)
+    if not comps:
+        raise ValueError("build_girone_enum needs at least one competition")
+    codes = [c.code for c in comps]
+    if len(set(codes)) != len(codes):
+        raise ValueError(f"duplicate competition codes: {codes}")
+    enum_cls = CompetitionBase(name, {c.code: c.code for c in comps}, module=module, qualname=qualname or name)
+    # Attached after creation on purpose: inside an Enum class body every non-descriptor
+    # name (underscore-prefixed included) would become a member.
+    enum_cls._competitions = comps  # type: ignore[attr-defined]
+    enum_cls._by_code = {c.code: c for c in comps}  # type: ignore[attr-defined]
+    enum_cls.__doc__ = (
+        f"Competitions of the perimeter, from config/competitions.toml: {', '.join(codes)}. "
+        "The value of a member is its code; see CompetitionBase for the helpers."
+    )
+    return enum_cls
+
+
+#: The competitions of this installation (``config/competitions.toml``): ``Girone.A``, ``Girone.B``,
+#: ``Girone.C`` (Serie C) and ``Girone.SB`` (Serie B) by default. The value is the competition code.
+Girone = build_girone_enum(COMPETITIONS)
 
 
 #: Column order of the canonical match frame (identical to the spec).
@@ -484,7 +583,9 @@ def validate_matches_df(df: pd.DataFrame, *, strict: bool = False) -> pd.DataFra
     - Rows with a required value missing or unparseable (an empty goal cell, a
       ``'pp'`` sentinel, a ``'TBD'`` date) are dropped with a logged warning that
       names the columns and the ``match_id`` values (or raise when ``strict``).
-    - An unknown ``girone`` raises ``ValueError`` naming the rows.
+    - An unknown ``girone`` (not a competition code or label of
+      ``config/competitions.toml``) raises ``ValueError`` naming the rows; the
+      column is stored as the code (``'Serie B'`` -> ``'SB'``).
     - Duplicate ``match_id`` keeps the last occurrence (logged).
 
     The drop counts are attached as ``frame.attrs["validation"]``; use
@@ -546,7 +647,7 @@ def validate_matches_report(df: pd.DataFrame, *, strict: bool = False) -> tuple[
         values = sorted(set(out.loc[unknown, "girone"].astype(str)))
         raise ValueError(
             f"{int(unknown.sum())} rows have an unknown girone {values[:_MAX_IDS_IN_MESSAGE]} "
-            f"(expected A, B or C; match_id: {_preview(ids)})"
+            f"(expected one of {[g.value for g in Girone]}; match_id: {_preview(ids)})"
         )
     out["girone"] = girone
     out["round"] = out["round"].astype("int64")

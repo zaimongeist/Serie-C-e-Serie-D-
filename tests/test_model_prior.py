@@ -90,18 +90,32 @@ def test_map_prior_keeps_small_sample_fit_regular(mini) -> None:
 
 
 def test_prior_is_negligible_on_a_full_season() -> None:
-    league = simulate_league(seed=4, n_rounds=20)
+    """On a (nearly) complete double round robin the alpha/beta ridge cannot move gamma: every pair of teams meets
+    home and away, so the sums of exp(alpha - beta) over home and over away pairings coincide and the score
+    equations pin exp(gamma) to the ratio of home to away goals whatever the shrinkage. The MAP gammas therefore stay
+    within a few hundredths of the MLE in every competition (Serie B included), rho moves little and the alphas are
+    practically unchanged. On half a season the schedule is unbalanced and the ridge shifts individual gammas by up
+    to ~0.15 in either direction, but on average the gammas are pulled towards the prior mean."""
+    league = simulate_league(seed=4)  # 37 of 38 rounds: 1480 matches over the four competitions
     mle = DixonColesEngine(DixonColesConfig(xi=0.0)).fit(league.matches)
     prior = DixonColesEngine(DixonColesConfig.with_gaussian_prior(xi=0.0)).fit(league.matches)
+    assert set(mle.gamma) == set(prior.gamma) and len(mle.gamma) == 4
     for g in mle.gamma:
-        # shrinkage: the MAP gamma lies between the MLE and the prior mean, and moves little
-        lo, hi = sorted((mle.gamma[g], 0.25))
-        assert lo - 0.02 <= prior.gamma[g] <= hi + 0.02
-        assert abs(prior.gamma[g] - mle.gamma[g]) < 0.2
+        assert abs(prior.gamma[g] - mle.gamma[g]) < 0.05, (g, mle.gamma[g], prior.gamma[g])
     assert prior.rho == pytest.approx(mle.rho, abs=0.03)
     teams = list(mle.alpha)
     corr = np.corrcoef([mle.alpha[t] for t in teams], [prior.alpha[t] for t in teams])[0, 1]
     assert corr > 0.99
+
+    half = simulate_league(seed=4, n_rounds=20)
+    mle_half = DixonColesEngine(DixonColesConfig(xi=0.0)).fit(half.matches)
+    prior_half = DixonColesEngine(DixonColesConfig.with_gaussian_prior(xi=0.0)).fit(half.matches)
+    for g in mle_half.gamma:
+        assert abs(prior_half.gamma[g] - mle_half.gamma[g]) < 0.2, g
+    assert np.mean([abs(prior_half.gamma[g] - 0.25) for g in mle_half.gamma]) < np.mean([abs(mle_half.gamma[g] - 0.25) for g in mle_half.gamma])
+    assert prior_half.rho == pytest.approx(mle_half.rho, abs=0.03)
+    teams = list(mle_half.alpha)
+    assert np.corrcoef([mle_half.alpha[t] for t in teams], [prior_half.alpha[t] for t in teams])[0, 1] > 0.98
 
 
 def test_config_validation_of_prior_fields() -> None:

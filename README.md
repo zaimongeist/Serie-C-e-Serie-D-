@@ -25,24 +25,29 @@ Il progetto supera l'analisi euristica e le fallacie di regressione empiriche im
 ```
 Serie-C-e-Serie-D-/
 ├── main.py                        # Pipeline end-to-end dimostrativa (console)
+├── .env.example                   # Modello del file .env con la chiave FootyStats (il .env vero non si committa)
 ├── requirements.txt               # Dipendenze pinnate
 ├── pyproject.toml / pytest.ini    # Configurazione ruff e pytest (il progetto si esegue dalla root, non si installa)
 ├── config/
-│   ├── teams_2026_27.json         # Dizionario canonico squadre + alias (per girone) della stagione corrente = PERIMETRO (default)
-│   ├── teams_2025_26.json         # Stagione precedente: solo fonte di alias storici (squadre uscite dalla Serie C)
-│   └── endpoints.toml             # Endpoint SofaScore/FotMob, retry, cache, rate-limit
+│   ├── competitions.toml          # Le competizioni del perimetro (Serie C A/B/C + Serie B), in ordine di visualizzazione
+│   ├── teams_2026_27.json         # Dizionario canonico squadre + alias per competizione (A/B/C/SB) della stagione corrente = PERIMETRO (default)
+│   ├── teams_2025_26.json         # Stagione precedente: solo fonte di alias storici (squadre uscite dal perimetro, movimenti B<->C)
+│   ├── footystats_teams.json      # Mappa id squadra FootyStats -> nome canonico (generata e aggiornata dall'harvester)
+│   └── endpoints.toml             # Endpoint FootyStats (API ufficiale) e SofaScore/FotMob, retry, cache, rate-limit
 ├── data/
 │   ├── raw/                       # Cache JSON grezzi (chiave = sha1 URL, TTL)
 │   ├── processed/                 # matches.csv / fixtures.csv normalizzati
 │   └── odds/                      # Snapshot quote bookmaker (CSV)
 ├── src/
 │   ├── common/                    # Contratti condivisi
-│   │   ├── schemas.py             # MatchRecord, Fixture, OddsQuote, MatchPrediction, Market
-│   │   ├── teams.py               # TeamRegistry + normalizzazione nomi
+│   │   ├── competitions.py        # Competition + load_competitions(): legge config/competitions.toml (fallback integrato)
+│   │   ├── schemas.py             # Girone (enum DINAMICO dalle competizioni), MatchRecord, Fixture, OddsQuote, MatchPrediction, Market
+│   │   ├── teams.py               # TeamRegistry (qualsiasi numero di competizioni) + normalizzazione nomi
 │   │   ├── logging_config.py      # Logging strutturato (JSON lines)
 │   │   └── paths.py
 │   ├── ingestion/                 # MODULO 1
-│   │   ├── harvester.py           # Client httpx asincrono, UA rotation, backoff, cache, provider
+│   │   ├── footystats.py          # Provider FootyStats (API ufficiale): storico 3 stagioni, fixture, quote pre-match, CLI
+│   │   ├── harvester.py           # Client httpx asincrono, cache, backoff, provider SofaScore/FotMob, facade con fallback
 │   │   └── team_matcher.py        # Fuzzy matching nomi squadre -> canonico
 │   ├── engine/                    # MODULI 2-3
 │   │   ├── model.py               # DixonColesEngine (MLE SLSQP/L-BFGS-B, time-decay, rho, gamma per girone)
@@ -62,7 +67,10 @@ Serie-C-e-Serie-D-/
 3. Fai doppio clic su `avvia.bat` (Windows) o `avvia.command` (macOS; la prima volta: tasto destro → Apri).
 
 Lo script crea l'ambiente Python, installa le dipendenze, raccoglie i dati reali delle ultime tre stagioni
-(la prima volta serve qualche decina di minuti, poi è veloce grazie alla cache) e apre la dashboard nel browser.
+e apre la dashboard nel browser. Se trova la chiave FootyStats (variabile `FOOTYSTATS_API_KEY` oppure un file
+`.env` accanto allo script, copia di `.env.example`) usa l'API ufficiale FootyStats (Serie C A/B/C + Serie B,
+quote pre-match incluse: pochi secondi); altrimenti SofaScore (solo da connessione residenziale, la prima volta
+serve qualche decina di minuti, poi è veloce grazie alla cache).
 Per aprire solo la dashboard senza aggiornare i dati: `avvia.bat --solo-dashboard`.
 Le quote dei bookmaker vanno in `data/odds/*.csv` (formato più sotto).
 Per pubblicare i CSV raccolti sul repository (così li vede anche la dashboard in cloud):
@@ -71,11 +79,17 @@ Per pubblicare i CSV raccolti sul repository (così li vede anche la dashboard i
 ## ⏱️ Aggiornamento automatico dopo ogni giornata (GitHub Actions)
 
 Il workflow `.github/workflows/aggiorna-dati.yml` gira lunedì e giovedì alle 06:30 UTC (o a mano da
-*Actions → Aggiorna dati Serie C → Run workflow*), raccoglie le ultime tre stagioni e committa
-`data/processed/matches.csv` e `fixtures.csv` solo se sono cambiati.
+*Actions → Aggiorna dati Serie C e Serie B → Run workflow*), raccoglie le ultime tre stagioni e committa
+`data/processed/matches.csv`, `fixtures.csv`, `data/odds/footystats.csv` e `config/footystats_teams.json`
+solo se sono cambiati. Il riepilogo del job mostra le partite per competizione e stagione.
 
-- **Sui runner GitHub** (default) SofaScore risponde spesso `403 Forbidden` agli IP dei datacenter: in quel
-  caso il job fallisce e il riepilogo lo spiega. Vale la pena tenerlo attivo (a volte passa), ma non contarci.
+- **Con FootyStats (consigliato, funziona sui runner GitHub)**: salva la chiave API come *segreto* di repository
+  `FOOTYSTATS_API_KEY` (Settings → Secrets and variables → Actions → New repository secret). Il job esegue
+  `python -m src.ingestion.footystats --competitions A B C SB --seasons 3 --odds-out data/odds/footystats.csv`;
+  la chiave non compare mai nei log né nei file. Vedi la sezione *Dati reali con FootyStats*.
+- **Senza segreto** il job usa SofaScore. **Sui runner GitHub** SofaScore risponde spesso `403 Forbidden` agli IP
+  dei datacenter: in quel caso il job fallisce e il riepilogo lo spiega. Vale la pena tenerlo attivo (a volte
+  passa), ma non contarci.
 - **Dal tuo PC, in automatico**: registra un *self-hosted runner* (Settings → Actions → Runners → New self-hosted
   runner, segui i comandi mostrati) e imposta la variabile di repository `HARVEST_RUNNER = self-hosted`
   (Settings → Secrets and variables → Actions → Variables). Lo stesso job partirà sul tuo PC, con il tuo IP,
@@ -100,7 +114,10 @@ python main.py --mode full
 #    opzioni comuni: --season 2026_27 (perimetro = config/teams_<stagione>.json), --history 0|1|2 (stagioni sintetiche
 #    precedenti quella del dizionario: 2024/25-2025/26 per il 2026/27); il mini è un'istantanea fissa di inizio stagione
 
-# 3) raccolta dati reali (SofaScore, ultime 3 stagioni, da eseguire dal proprio PC: vedi "Ingestion") -> data/processed/
+# 3) raccolta dati reali: FootyStats (API ufficiale, chiave in .env o FOOTYSTATS_API_KEY; Serie C A/B/C + Serie B,
+#    ultime 3 stagioni, quote pre-match in data/odds/footystats.csv) -> data/processed/
+python -m src.ingestion.footystats --competitions A B C SB --seasons 3
+#    oppure SofaScore (senza chiave, solo dal proprio PC: vedi "Ingestion") -> data/processed/
 python -m src.ingestion.harvester --gironi A B C --seasons 3 --out data/processed/matches.csv
 
 # 4) pipeline sui dati reali con quote bookmaker in data/odds/*.csv
@@ -115,14 +132,115 @@ streamlit run src/dashboard/app.py
 python -m pytest -q
 ```
 
-Formato CSV quote (`data/odds/*.csv`): `match_id,bookmaker,market,selection,odds`, una riga per esito,
+Formato CSV quote (`data/odds/*.csv`, è anche quello che FootyStats scrive in `data/odds/footystats.csv`): `match_id,bookmaker,market,selection,odds`, una riga per esito,
 con `market` in `1X2 | OU1.5 | OU2.5 | OU3.5 | GG/NG` e `selection` in `1,X,2 | Over 2.5,Under 2.5 | GG,NG` ecc.
 
-## 📥 Ingestion: raccolta dati reali (SofaScore)
+## 🏆 Competizioni (`config/competitions.toml`)
 
-Il **perimetro** è il dizionario della stagione corrente (`config/teams_2026_27.json`, le 60 squadre dei tre
-gironi ufficiali Lega Pro): solo queste squadre vengono classificate, previste e prezzate. Le stagioni
-precedenti servono **unicamente come base storica** per stimare meglio la forza delle squadre correnti.
+Le competizioni del perimetro **non sono cablate nel codice**: `config/competitions.toml` è un array di tabelle
+`[[competition]]`, una per competizione, nell'ordine in cui compaiono nelle tabelle e nei selettori:
+
+```toml
+[[competition]]
+code = "SB"                          # identificatore stabile: chiave di teams_<stagione>.json, colonna girone del CSV, valore dell'enum
+label = "Serie B"                    # nome pubblico completo
+short = "Serie B"                    # etichetta compatta (tabelle, selettore della dashboard)
+country = "Italy"
+footystats_name = "Italy Serie B"    # campo `name` di /league-list su FootyStats
+sofascore_tournament_id = 53         # id SofaScore (legacy); 0 se sconosciuto
+tier = 2                             # livello della piramide (2 = Serie B, 3 = Serie C)
+family = "Serie B"                   # lega di appartenenza: i tre gironi condividono "Serie C"
+```
+
+Da questo file nasce, **all'import**, l'enum `src.common.schemas.Girone` (`Girone.A`, `Girone.B`, `Girone.C`,
+`Girone.SB`; `Girone.parse()` accetta `'A'`, `'Girone A'`, `'SB'`, `'Serie B'`, `'serie_b'`, `'Italy Serie B'`,
+senza distinzione di maiuscole; `'B'` è sempre il girone B di Serie C) con le proprietà `.label`, `.short`,
+`.family`, `.tier`, `.competition`. Se il file manca il codice usa le definizioni integrate (A/B/C/SB), così gli
+import non falliscono mai. Il **perimetro** è il dizionario della stagione corrente (`config/teams_2026_27.json`,
+chiavi = codici delle competizioni): `Serie C 2026/27 Gironi A/B/C + Serie B (80 squadre)` — la frase è derivata
+dalla configurazione (`TeamRegistry.perimeter_label`) e compare identica nel banner della console e della
+dashboard. Il modello stima un fattore campo e un vincolo Σα = 0 per competizione; simulatore, console e
+dashboard iterano l'enum, mai una lista A/B/C.
+
+**Per aggiungere un campionato** (es. Serie D girone A, o un'altra nazione):
+
+1. aggiungi una tabella `[[competition]]` a `config/competitions.toml` con un `code` nuovo (maiuscole/cifre, es. `DA`);
+2. aggiungi le squadre di quella competizione, con gli alias, sotto la stessa chiave in `config/teams_<stagione>.json`
+   (una squadra ha **un solo nome canonico** anche se cambia divisione: `Pescara` in Serie B 2025/26 e nel girone B
+   2026/27; il dizionario della stagione corrente decide la sua competizione, le stagioni passate restano storico);
+3. inserisci il `footystats_name` esatto restituito da `/league-list` e aggiungi la lega al tuo account su
+   footystats.org (l'API mostra solo le leghe scelte), poi raccogli i dati con l'harvester FootyStats.
+
+Nient'altro va toccato: enum, dizionario, motore, selettori e banner seguono il file. Per controllare una
+composizione (es. la Serie B 2026/27) usa `python -m src.ingestion.footystats --init-registry`: **aggiunge** al
+dizionario le squadre e gli alias mancanti secondo `/league-teams` di FootyStats e stampa il diff, comprese le squadre
+del file che FootyStats **non elenca più** (*no longer listed by FootyStats*). Il comando non cancella mai squadre o
+alias: un club di troppo (retrocesso, escluso, inserito nel girone sbagliato) va rimosso a mano dal file.
+
+## 🔑 Dati reali con FootyStats (API ufficiale, consigliata)
+
+FootyStats (<https://footystats.org/api/>) è un'API documentata e autenticata con chiave: risponde anche dai
+datacenter (GitHub Actions, cloud), copre i tre gironi di Serie C e la Serie B con risultati, tiri, tiri nello
+specchio, angoli, xG (dove disponibile) e **quote pre-match** (1X2, Over/Under 1.5-2.5-3.5, Gol/NoGol) che
+alimentano il motore di valore. È la sorgente di default appena la chiave è disponibile; SofaScore resta il
+fallback (sezione successiva).
+
+1. **Chiave**: dal tuo account su footystats.org → *API*. Non committarla mai: va in una variabile d'ambiente
+   `FOOTYSTATS_API_KEY` oppure in un file `.env` nella root del repository (copia `.env.example`;
+   `.env` è in `.gitignore`), oppure passata con `--key`. Il codice la maschera ovunque (`***`): non finisce
+   in log, cache (`data/raw/`), messaggi d'errore né nei file prodotti.
+2. **Leghe dell'account**: su footystats.org aggiungi al tuo account (*Choose leagues*) **Italy Serie C Group A**,
+   **Italy Serie C Group B**, **Italy Serie C Group C** e **Italy Serie B**. L'API elenca solo le leghe scelte
+   (`/league-list?chosen_leagues_only=true`): se una manca l'harvester si ferma elencando i nomi da aggiungere.
+   Verifica con `python -m src.ingestion.footystats --list-leagues`.
+3. **Raccolta**:
+
+```bash
+# ultime 3 stagioni di Serie C (A/B/C) e Serie B in UN solo matches.csv + fixture della stagione corrente + quote
+python -m src.ingestion.footystats --competitions A B C SB --seasons 3 --odds-out data/odds/footystats.csv
+# solo Serie B, 2 stagioni, senza quote
+python -m src.ingestion.footystats --competitions SB --seasons 2 --no-odds
+# leghe e season id del tuo account
+python -m src.ingestion.footystats --list-leagues
+# crea/aggiorna config/teams_2027_28.json dalle squadre FootyStats: aggiunge squadre/alias mancanti e stampa il diff
+# (squadre e alias esistenti non vengono mai rimossi; quelle non più elencate da FootyStats sono segnalate, da togliere a mano)
+python -m src.ingestion.footystats --init-registry --season 2027_28 --competitions A B C SB
+# poi la pipeline / la dashboard leggono data/processed e data/odds
+python main.py --processed data/processed/matches.csv --fixtures data/processed/fixtures.csv --odds data/odds
+```
+
+- Le competizioni sono i codici di `config/competitions.toml` (`A`, `B`, `C`, `SB`); il nome FootyStats di
+  ciascuna (`footystats_name`, es. `Italy Serie B`) è lì, con un fallback in `[footystats.league_names]` di
+  `config/endpoints.toml`. Per aggiungere un campionato: una tabella `[[competition]]`, le squadre nel
+  dizionario di stagione (`--init-registry` le aggiunge con gli alias FootyStats), la lega nell'account FootyStats
+  (le istruzioni stampate quando manca la chiave elencano i `footystats_name` di tutte le competizioni configurate).
+- Storico: per ogni competizione vengono scaricate le ultime `--seasons` stagioni elencate dall'API (season id
+  risolti a runtime da `/league-list`; `[footystats.season_ids]` è solo un fallback se la lista non risponde).
+  Tutte le squadre che vi hanno partecipato restano nello storico, anche quelle poi retrocesse, promosse o
+  fallite: mantengono la loro grafia canonica (*historical teams*) e servono a valutare le avversarie, ma non
+  entrano in classifica/previsioni. Le partite `suspended`/`canceled` sono scartate; le `incomplete` future della
+  stagione corrente diventano `fixtures.csv`, le loro quote `data/odds/footystats.csv`
+  (`match_id,bookmaker,market,selection,odds`, bookmaker `FootyStats`).
+- Statistiche mancanti: FootyStats usa `0`/`-1` per i dati non raccolti; tiri a 0 per entrambe le squadre o xG a 0
+  per entrambe vengono letti come assenti (`NaN`), così il modello non li confonde con zeri veri.
+- Nomi squadra: `config/footystats_teams.json` memorizza la mappa *id FootyStats → nome canonico* e viene
+  aggiornato a ogni esecuzione (gli id battono il fuzzy matching; un hit esatto/alias del dizionario batte
+  entrambi). Correggi lì il campo `canonical` se una squadra è mappata male. Le squadre che nessun dizionario
+  conosce mantengono il `cleanName` FootyStats e sono elencate come *unmapped teams*.
+- Limiti: circa **1800 richieste/ora** sui piani standard; un run completo (4 competizioni × 3 stagioni) ne usa
+  ~25. Il 429 viene ritentato con backoff; la cache in `data/raw/` evita di riscaricare le stagioni concluse.
+- Exit code della CLI: `0` ok, `2` chiave mancante (con le istruzioni), `1` raccolta fallita o parziale (il CSV
+  esistente non viene sovrascritto senza `--allow-partial`).
+- La facade `src.ingestion.harvester.Harvester` prova i provider in ordine (`footystats`, poi `sofascore`
+  quando una chiave è disponibile; solo `sofascore` altrimenti): `python -m src.ingestion.harvester --odds-out ...`
+  usa quindi FootyStats e ripiega su SofaScore competizione per competizione in caso di errore.
+
+## 📥 Ingestion: raccolta dati reali (SofaScore, fallback)
+
+Il **perimetro** è il dizionario della stagione corrente (`config/teams_2026_27.json`: le 60 squadre dei tre
+gironi ufficiali Lega Pro più le 20 della Serie B, 80 in tutto): solo queste squadre vengono classificate, previste
+e prezzate. Le stagioni precedenti servono **unicamente come base storica** per stimare meglio la forza delle
+squadre correnti. L'harvester SofaScore copre i soli gironi di Serie C; la Serie B arriva da FootyStats.
 
 ```bash
 # dal proprio PC (connessione residenziale, vedi la nota 403): ultime 3 stagioni (default) in UN solo CSV
@@ -173,14 +291,28 @@ scp data/processed/matches.csv data/processed/fixtures.csv utente@server:/percor
 - **Tassi**: λ = exp(α_casa − β_ospite + γ_girone), μ = exp(α_ospite − β_casa); β alto = difesa solida.
 - **Dipendenza bassi punteggi**: τ(x,y,λ,μ,ρ) di Dixon–Coles su 0-0, 1-0, 0-1, 1-1.
 - **Ponderazione temporale**: w(t) = exp(−ξ·t), t in giorni dalla partita più recente (ξ default 0.0018).
-- **Identificabilità**: Σα = 0 per ciascun girone (vincolo di uguaglianza SLSQP, o riparametrizzazione con L-BFGS-B).
+- **Identificabilità**: Σα = 0 per ciascuna competizione (vincolo di uguaglianza SLSQP, o riparametrizzazione con L-BFGS-B);
+  un fattore campo γ per competizione (Serie B compresa). Le divisioni non si incontrano nella stessa stagione, quindi
+  ogni blocco è identificato dal proprio vincolo e dal proprio livello di gol; la stima **congiunta** fra Serie B e
+  Serie C è legata dai *movers*: una squadra promossa o retrocessa conserva un solo nome canonico, il dizionario
+  corrente decide il suo gruppo e le sue partite nell'altra divisione restano nella verosimiglianza (Pescara porta in
+  girone B la forza mostrata contro avversarie di Serie B). α resta centrato per competizione: confronta le squadre
+  dentro la stessa competizione. Se una competizione del dizionario non ha ancora partite nei dati (Serie B non
+  raccolta), le sue squadre restano correnti ma, per il solo vincolo, entrano nel gruppo della competizione in cui
+  hanno giocato (le promosse non vengono centrate a zero da sole) e nessun γ viene stimato per essa: il fit lo
+  segnala e le sue partite in programma sono saltate finché non la si raccoglie.
 - **Gradiente analitico** verificato numericamente nei test.
 - **Prior gaussiana (stima MAP)** per campioni piccoli: `DixonColesConfig.with_gaussian_prior()` traduce deviazioni
   standard a priori (α/β 0.30, γ 0.25 ± 0.15, ρ 0.10) in penalità ridge; la ridge su β è centrata per girone così il
   livello medio dei gol non viene distorto. `main.py` (`--prior auto|on|off`) la attiva finché il girone meno coperto
   ha in media meno di 15 partite per squadra (con 20 squadre per girone: fino alla 14ª giornata inclusa); una soglia
-  sul totale delle partite non basta, perché 100 gare su 60 squadre sono meno di 2 a testa e la MLE pura porta γ e ρ
-  sui limiti dell'ottimizzatore (nel simulatore succede ancora in 1 fit su 10 a 12 gare per squadra, mai da 15).
+  sul totale delle partite non basta, perché 100 gare sulle 80 squadre del perimetro sono poco più di 1 a testa e la
+  MLE pura porta γ e ρ sui limiti dell'ottimizzatore (nel simulatore succede ancora in 1 fit su 10 a 12 gare per
+  squadra, mai da 15). La copertura è contata **per competizione** (ogni girone di Serie C e la Serie B a sé) sulle
+  sole partite della stagione corrente fra squadre del perimetro; una competizione del dizionario **senza alcuna
+  partita nei dati** (es. Serie B con il solo harvester SofaScore, che non la copre) non conta come copertura zero ma
+  viene ignorata dalla regola, e il banner lo dichiara (`Serie B senza partite nei dati (ignorata nel calcolo della
+  copertura)`); una competizione con storico ma senza partite della stagione in corso resta a copertura zero.
   Dopo la stima la console segnala i parametri finiti sui limiti dell'ottimizzatore.
 - **Mercati**: 1X2, Over/Under 1.5-2.5-3.5, Goal/No Goal dalla matrice congiunta 11×11.
 - **Valore**: de-vigging proporzionale (anche power e Shin), EV = P·quota − 1, Kelly frazionario (1/8 o 1/4),
@@ -188,7 +320,7 @@ scp data/processed/matches.csv data/processed/fixtures.csv utente@server:/percor
   della stagione corrente.
 - **Perimetro e storico (stagioni)**: il modello può essere stimato sulle ultime 3 stagioni (2024/25, 2025/26,
   2026/27: la stagione di una partita è `season_of(date)`, luglio–giugno), ma il *perimetro* è il dizionario della
-  stagione corrente passato a `DixonColesEngine.fit(matches, registry=...)`: le sue 60 squadre sono le uniche
+  stagione corrente passato a `DixonColesEngine.fit(matches, registry=...)`: le sue 80 squadre sono le uniche
   classificate (`ranking()`), previste e prezzate. Le squadre presenti solo nello storico (retrocesse, promosse,
   escluse: Ternana, Rimini, Vicenza, Arezzo, …) restano nella verosimiglianza come avversarie — così le forze delle
   squadre correnti sono stimate contro l'opposizione giusta — ma sono `FittedParams.historical_teams`:
@@ -204,7 +336,7 @@ scp data/processed/matches.csv data/processed/fixtures.csv utente@server:/percor
   di storico non rendono più lunga la stagione in corso.
 
 > Il dizionario squadre di default è `config/teams_2026_27.json` (`src.common.teams.DEFAULT_SEASON = "2026_27"`,
-> composizione ufficiale Lega Pro dei tre gironi); `teams_2025_26.json` resta come fonte di alias storici
+> composizione ufficiale Lega Pro dei tre gironi più la Serie B, chiave `SB`); `teams_2025_26.json` resta come fonte di alias storici
 > (`TeamRegistry.with_historical_aliases`, `load_registry(with_history=True)`): `Juventus U23` → `Juventus Next Gen`,
 > `Ternana Calcio` → `Ternana` (grafia storica, squadra non corrente). Per una nuova stagione basta aggiungere
 > `config/teams_<stagione>.json` con la stessa struttura (`season`, `gironi` → squadra → alias), aggiornare
@@ -215,10 +347,17 @@ scp data/processed/matches.csv data/processed/fixtures.csv utente@server:/percor
 ## 🖥️ Dashboard e demo a console
 
 - **Perimetro sempre dichiarato**: badge della sidebar e sottotitolo della pagina riportano
-  `Stagione 2026/27 · 60 squadre · N partite stagione corrente · M partite storiche (2024/25-2025/26)`; la console di
-  `main.py` apre con `Perimetro: Serie C 2026/27 (60 squadre) · stagione corrente: N partite · storico: M partite
-  2024/25-2025/26` e stampa il riepilogo per stagione (partite, squadre attuali e storiche).
-- **Classifica Forza**: solo le 60 squadre correnti, colonna *Girone* = girone del dizionario 2026/27.
+  `Perimetro: Serie C 2026/27 Gironi A/B/C + Serie B (80 squadre) · N partite stagione corrente · M partite storiche
+  (2024/25-2025/26)`; la console di `main.py` apre con `Perimetro: Serie C 2026/27 Gironi A/B/C + Serie B (80 squadre) ·
+  stagione corrente: N partite · storico: M partite 2024/25-2025/26` e stampa il riepilogo per stagione (partite,
+  squadre attuali e storiche). La frase è derivata da `config/competitions.toml` e dal dizionario, mai cablata.
+- **Selettore Competizione**: `Tutti` + l'etichetta breve di ogni competizione configurata (`Girone A`, `Girone B`,
+  `Girone C`, `Serie B`); filtra classifica, partite e opportunità.
+- **Classifica Forza**: solo le 80 squadre correnti, colonna *Competizione* = competizione del dizionario 2026/27
+  (`Girone A`, ..., `Serie B`); stesso nome di colonna nel pannello valore e negli alert.
+- **Quote**: ogni CSV in `data/odds/` è un bookmaker come gli altri, compreso quello scritto dall'harvester FootyStats
+  (`bookmaker = FootyStats`, quote pre-match 1X2 / Over-Under / GG-NG): la colonna *Bookmaker* del pannello valore dice
+  da dove viene ogni quota.
 - **Match & Heatmap / Opportunità di Valore**: solo partite in programma della stagione corrente fra squadre
   correnti; le partite datate in un'altra stagione (fixtures stantii dell'anno scorso), con una squadra storica o
   sconosciuta allo storico sono elencate come saltate in *Dettagli pipeline* (e il tab Match lo segnala quando non
@@ -232,7 +371,7 @@ scp data/processed/matches.csv data/processed/fixtures.csv utente@server:/percor
   (0-2, default 2) stagioni sintetiche *precedenti* quella del dizionario (2024/25-2025/26 per il 2026/27) con
   composizione in parte diversa (squadre storiche reali, Inter U23 nel girone A, Atalanta U23 nel C, Juventus Next
   Gen nel B) alimentano lo storico; se i nomi storici reali non bastano (12 dei 20 giocano la Serie C 2025/26) il
-  generatore completa con le squadre storiche del dizionario e, in ultima istanza, con club sintetici `Storica N`,
+  generatore completa con le squadre storiche del dizionario e, in ultima istanza, con club sintetici `Storica 01`, `Storica 02`, ...,
   mai con un errore. `SERIEC_SIM_ROUNDS=N` fissa invece le giornate giocate. Se una combinazione di variabili è
   comunque rifiutata dalla pipeline, la pagina mostra l'errore e ripiega sulla configurazione predefinita.
 - **Console (`main.py`)**: `--mode full` segue il calendario come la dashboard (`--as-of AAAA-MM-GG`, default oggi:
@@ -240,8 +379,9 @@ scp data/processed/matches.csv data/processed/fixtures.csv utente@server:/percor
   giornata, a stagione finita si tiene l'ultima come turno da prevedere) oppure `--rounds N` fissa le giornate
   giocate (es. `--rounds 30` per il report di recupero dei parametri); `--mode mini` è un'istantanea fissa di inizio
   stagione (prime 20 partite = giornate 1-3, 4ª giornata da prevedere) e lo dichiara in testa all'output. Opzioni
-  comuni: `--history 0|1|2`, `--season`. Ogni output apre con il perimetro (`Perimetro: Serie C 2026/27 (60 squadre) ·
-  stagione corrente: N partite · storico: M partite 2024/25-2025/26`) e la posizione nel calendario.
+  comuni: `--history 0|1|2`, `--season`. Ogni output apre con il perimetro (`Perimetro: Serie C 2026/27 Gironi A/B/C +
+  Serie B (80 squadre) · stagione corrente: N partite · storico: M partite 2024/25-2025/26`, derivato da
+  `config/competitions.toml`) e la posizione nel calendario.
 
 # ⚙️ Stack Tecnologico
 
@@ -262,7 +402,7 @@ La raccolta dati si lancia a mano (`python -m src.ingestion.harvester ...`): non
 ```mermaid
 graph TD
     A[SofaScore / FotMob Endpoints] -->|Scraping Asincrono| B[Data Sanitizer & Storage]
-    B --> C[Master Dataset Gironi A-B-C]
+    B --> C[Master Dataset Serie C A-B-C + Serie B]
     C --> D[Dixon-Coles Optimizer]
     D --> E[Matrice Bivariata di Probabilità]
     F[Palinsesto Quote Bookmaker] --> G[De-Vigging Module]

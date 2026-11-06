@@ -1,7 +1,7 @@
 {
   "season": "2025/26",
-  "competition": "Serie C NOW",
-  "note": "Canonical team names per girone. Aliases are the spellings used by SofaScore, FotMob and bookmakers. Update this file (or add a new season file) when the composition changes; the fuzzy matcher falls back to similarity scoring for unknown spellings.",
+  "competition": "Serie C NOW (Gironi A/B/C) + Serie B",
+  "note": "Canonical team names per competition (keys = competition codes of config/competitions.toml: A/B/C = Serie C gironi, SB = Serie B). Aliases are the spellings used by FootyStats, SofaScore, FotMob and bookmakers. This file is HISTORY for the 2026/27 perimeter: TeamRegistry.with_historical_aliases merges its spellings so that a club keeps one canonical name across seasons and divisions (Pescara: Serie B 2025/26 -> Serie C girone B 2026/27; Vicenza: girone A 2025/26 -> Serie B 2026/27), while clubs that left the perimeter (Frosinone, Monza, Venezia, Ternana, ...) stay as historical opponents. Update this file (or add a new season file) when the composition changes; the fuzzy matcher falls back to similarity scoring for unknown spellings.",
   "gironi": {
     "A": {
       "AlbinoLeffe": ["Albinoleffe", "U.C. AlbinoLeffe"],
@@ -68,6 +68,28 @@
       "Siracusa": ["Siracusa Calcio"],
       "Sorrento": ["Sorrento Calcio", "Sorrento 1945"],
       "Trapani": ["Trapani Calcio", "FC Trapani 1905"]
+    },
+    "SB": {
+      "Avellino": ["US Avellino", "Avellino 1912", "US Avellino 1912"],
+      "Bari": ["SSC Bari", "Bari 1908"],
+      "Carrarese": ["Carrarese Calcio", "Carrarese Calcio 1908"],
+      "Catanzaro": ["US Catanzaro", "US Catanzaro 1929", "Catanzaro 1929"],
+      "Cesena": ["Cesena FC", "AC Cesena"],
+      "Empoli": ["Empoli FC"],
+      "Frosinone": ["Frosinone Calcio"],
+      "Juve Stabia": ["SS Juve Stabia", "Juve Stabia 1907"],
+      "Mantova": ["Mantova 1911", "AC Mantova"],
+      "Modena": ["Modena FC", "Modena FC 2018"],
+      "Monza": ["AC Monza", "Monza 1912"],
+      "Padova": ["Padova Calcio", "Calcio Padova", "Padova 1910"],
+      "Palermo": ["Palermo FC", "US Palermo", "Palermo 1900"],
+      "Pescara": ["Delfino Pescara", "Delfino Pescara 1936", "Pescara Calcio"],
+      "Reggiana": ["AC Reggiana", "Reggiana 1919"],
+      "Sampdoria": ["UC Sampdoria", "Sampdoria 1946"],
+      "Spezia": ["Spezia Calcio"],
+      "Südtirol": ["FC Südtirol", "Sudtirol", "Alto Adige", "FC Sudtirol"],
+      "Venezia": ["Venezia FC", "Venezia Calcio"],
+      "Virtus Entella": ["Entella", "Virtus Entella Chiavari"]
     }
   }
 }

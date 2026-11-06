@@ -1,0 +1,61 @@
+# Competitions of the perimeter, one [[competition]] table each, in DISPLAY ORDER.
+#
+# This file is the single source of truth for "which leagues exist": the Girone
+# enum (src/common/schemas.py) is built from it at import time, the team registry
+# (config/teams_<season>.json) uses the codes as keys, the engine fits one home
+# advantage and one sum(alpha) = 0 constraint group per code, the simulator, the
+# console and the dashboard iterate it instead of hard-coding A/B/C.
+#
+# To add a league: append a [[competition]] table here, add its teams under the
+# same code in config/teams_<season>.json and add the FootyStats league to your
+# footystats.org account (the `footystats_name` is the `name` field returned by
+# /league-list). Codes are short upper-case identifiers (letters and digits) and
+# must be unique; `family` groups the gironi of one league ("Serie C" has three
+# codes, "Serie B" one), `tier` is the level in the Italian pyramid (2 = Serie B,
+# 3 = Serie C) and is informational only.
+#
+# `sofascore_tournament_id` is the undocumented SofaScore unique-tournament id
+# used by the legacy harvester (see config/endpoints.toml); FootyStats resolves
+# its own season ids from /league-list, so nothing here is needed for it.
+
+[[competition]]
+code = "A"
+label = "Serie C Girone A"
+short = "Girone A"
+country = "Italy"
+footystats_name = "Italy Serie C Group A"
+sofascore_tournament_id = 141
+tier = 3
+family = "Serie C"
+
+[[competition]]
+code = "B"
+label = "Serie C Girone B"
+short = "Girone B"
+country = "Italy"
+footystats_name = "Italy Serie C Group B"
+sofascore_tournament_id = 142
+tier = 3
+family = "Serie C"
+
+[[competition]]
+code = "C"
+label = "Serie C Girone C"
+short = "Girone C"
+country = "Italy"
+footystats_name = "Italy Serie C Group C"
+sofascore_tournament_id = 143
+tier = 3
+family = "Serie C"
+
+[[competition]]
+code = "SB"
+label = "Serie B"
+short = "Serie B"
+country = "Italy"
+footystats_name = "Italy Serie B"
+# TO VERIFY: 53 is the SofaScore unique-tournament id commonly reported for Serie B;
+# it is unused as long as Serie B is harvested through FootyStats.
+sofascore_tournament_id = 53
+tier = 2
+family = "Serie B"

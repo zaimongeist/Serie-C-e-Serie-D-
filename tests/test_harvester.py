@@ -146,6 +146,19 @@ def _restore_root_logging() -> Any:
     root.setLevel(level)
 
 
+@pytest.fixture(autouse=True)
+def _no_footystats_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A developer's FootyStats key (environment or ``.env``) must not change the default provider
+    order these SofaScore tests rely on; the facade tests pass their key explicitly."""
+    from src.ingestion import footystats  # noqa: PLC0415
+
+    def explicit_only(explicit: str | None = None, **kwargs: Any) -> str | None:
+        return explicit.strip() if explicit and explicit.strip() else None
+
+    monkeypatch.delenv("FOOTYSTATS_API_KEY", raising=False)
+    monkeypatch.setattr(footystats, "find_api_key", explicit_only)
+
+
 @pytest.fixture
 def http_cfg() -> HttpConfig:
     return HttpConfig(
@@ -1026,7 +1039,7 @@ def test_cli_parser_defaults() -> None:
 def test_cli_main_writes_outputs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
     seen: dict[str, Any] = {}
 
-    async def fake_harvest_all(self: Harvester, gironi, *, season_id=None, seasons=3, with_stats=True) -> HarvestResult:
+    async def fake_harvest_all(self: Harvester, gironi, *, season_id=None, seasons=3, with_stats=True, with_odds=True) -> HarvestResult:
         seen.update(gironi=list(gironi), season_id=season_id, seasons=seasons, with_stats=with_stats, providers=self.providers)
         matches = hv.matches_to_frame([MatchRecord("SS-1", date(2025, 8, 23), 1, Girone.A, "Pro Vercelli", "Vicenza", 0, 2)])
         return HarvestResult(
@@ -1179,7 +1192,7 @@ async def test_sofascore_harvest_treats_no_rounds_as_failure(http_cfg: HttpConfi
 
 
 def _fake_harvest_all(matches: pd.DataFrame, failures: dict[str, str]) -> Callable[..., Any]:
-    async def fake(self: Harvester, gironi, *, season_id=None, seasons=3, with_stats=True) -> HarvestResult:
+    async def fake(self: Harvester, gironi, *, season_id=None, seasons=3, with_stats=True, with_odds=True) -> HarvestResult:
         return HarvestResult(
             matches=matches,
             fixtures=[Fixture("SS-9", date(2025, 9, 6), 3, Girone.A, "AlbinoLeffe", "Lumezzane")],
@@ -1479,7 +1492,9 @@ def test_season_label_helpers() -> None:
 def test_registry_with_history_merges_older_dictionaries(current_registry: TeamRegistry, tmp_path: Path) -> None:
     merged = Harvester.registry_with_history(current_registry)
     assert merged.canonical_names == current_registry.canonical_names  # perimeter unchanged
-    assert {"Ternana", "Vicenza", "Pro Patria", "Rimini"} <= set(merged.historical_names)
+    # Vicenza and Arezzo play Serie B in the 2026/27 perimeter (code SB), so they are current, not historical.
+    assert {"Ternana", "Pontedera", "Pro Patria", "Rimini"} <= set(merged.historical_names)
+    assert merged.is_current_team("Vicenza") and merged.is_current_team("Arezzo")
     assert merged.exact("Ternana Calcio") == "Ternana" and merged.exact("Juventus U23") == "Juventus Next Gen"
     legacy = Harvester.registry_with_history(load_registry(LEGACY_SEASON))
     assert legacy.historical_names == ()  # nothing older than 2025/26 ships
@@ -1542,7 +1557,8 @@ async def test_harvest_all_three_seasons_on_current_registry(tmp_path: Path, cur
     # perimeter bookkeeping
     assert result.registry_season == "2026/27" == result.perimeter_season
     assert result.n_historical_matches == 5
-    assert result.historical_teams == ("Arezzo", "Pontedera", "Rimini", "Ternana")  # Ascoli only in the dropped fixture
+    # Arezzo and Ascoli are Serie B teams of the 2026/27 perimeter (current); Ascoli only appears in the dropped fixture anyway
+    assert result.historical_teams == ("Pontedera", "Rimini", "Ternana")
     assert result.unmapped_teams == {"SPAL": 1}
     assert set(result.historical_teams).isdisjoint(result.unmapped_teams)
     assert result.season_lines() == [
@@ -1550,7 +1566,7 @@ async def test_harvest_all_three_seasons_on_current_registry(tmp_path: Path, cur
         "  2025/26: 3 matches (history)",
         "  2024/25: 2 matches (history)",
     ]
-    assert "season=2026/27 seasons=2026/27,2025/26,2024/25 historical_matches=5 historical_teams=4 unmapped_teams=1" in result.summary()
+    assert "season=2026/27 seasons=2026/27,2025/26,2024/25 historical_matches=5 historical_teams=3 unmapped_teams=1" in result.summary()
 
     # seasons=1 restricts to the current season
     only_current = await Harvester(
@@ -1606,7 +1622,7 @@ async def test_pinned_past_season_is_historical_relative_to_the_perimeter(
     result = await harvester.harvest_all([Girone.B], season_id=SEASON_B_2526, with_stats=False)
     assert result.seasons == ("2025/26",) and result.registry_season == "2026/27"
     assert result.n_historical_matches == 3 == len(result.matches)  # everything is history for the perimeter
-    assert result.historical_teams == ("Arezzo", "Ascoli", "Pontedera", "Rimini", "Ternana")
+    assert result.historical_teams == ("Pontedera", "Rimini", "Ternana")  # Arezzo and Ascoli: current Serie B teams
 
 
 @pytest.mark.asyncio
@@ -1660,7 +1676,7 @@ def test_cli_seasons_flags_and_season_report(tmp_path: Path, monkeypatch: pytest
 
     seen: dict[str, Any] = {}
 
-    async def fake_harvest_all(self: Harvester, gironi, *, season_id=None, seasons=3, with_stats=True) -> HarvestResult:
+    async def fake_harvest_all(self: Harvester, gironi, *, season_id=None, seasons=3, with_stats=True, with_odds=True) -> HarvestResult:
         seen.update(seasons=seasons, season_id=season_id, registry=self.registry.season_label, historical=sorted(self.matcher.historical_names)[:1])
         matches = hv.matches_to_frame(
             [
@@ -1685,11 +1701,11 @@ def test_cli_seasons_flags_and_season_report(tmp_path: Path, monkeypatch: pytest
     out, fixtures_out = tmp_path / "matches.csv", tmp_path / "fixtures.csv"
     code = hv.main(["--gironi", "B", "--seasons", "2", "--out", str(out), "--fixtures-out", str(fixtures_out), "--cache-dir", str(tmp_path / "raw")])
     assert code == 0
-    assert seen == {"seasons": 2, "season_id": None, "registry": "2026/27", "historical": ["Arezzo"]}
+    assert seen == {"seasons": 2, "season_id": None, "registry": "2026/27", "historical": ["Bra"]}
     loaded = Harvester.load_processed(out)
     assert list(loaded.columns) == list(MATCH_COLUMNS) and len(loaded) == 3  # one CSV, no season column
     printed = capsys.readouterr().out
-    assert "perimeter: season 2026/27 (config/teams_2026_27.json, 60 current teams)" in printed
+    assert "perimeter: season 2026/27 (config/teams_2026_27.json, 80 current teams)" in printed  # 60 Serie C + 20 Serie B
     assert "  2026/27: 1 matches (perimeter)" in printed and "  2024/25: 1 matches (history)" in printed
     assert "historical matches used: 2" in printed
     assert "historical teams (not in the 2026/27 perimeter, history only): Ternana (1)" in printed
@@ -1875,7 +1891,7 @@ def test_cli_history_cache_ttl_flag(tmp_path: Path, monkeypatch: pytest.MonkeyPa
 
     seen: dict[str, Any] = {}
 
-    async def fake_harvest_all(self: Harvester, gironi, *, season_id=None, seasons=3, with_stats=True) -> HarvestResult:
+    async def fake_harvest_all(self: Harvester, gironi, *, season_id=None, seasons=3, with_stats=True, with_odds=True) -> HarvestResult:
         seen.update(ttl=self.cache.ttl, stable_ttl=self.cache.stable_ttl)
         matches = hv.matches_to_frame([MatchRecord("SS-90001", date(2026, 8, 23), 1, Girone.B, "Perugia", "Ravenna", 2, 1)])
         return HarvestResult(matches=matches, fixtures=[], unmapped_teams={}, stats={"requests": 1, "retries": 0, "cache_hits": 0, "errors": 0}, provider="sofascore")
@@ -1887,3 +1903,239 @@ def test_cli_history_cache_ttl_flag(tmp_path: Path, monkeypatch: pytest.MonkeyPa
     assert hv.main([*common, "--cache-ttl-hours", "1", "--history-cache-ttl-hours", "0"]) == 0
     assert seen == {"ttl": timedelta(hours=1), "stable_ttl": timedelta(0)}
     capsys.readouterr()
+
+
+# ============================================================================ facade: FootyStats provider
+FS_FIXTURES = Path(__file__).parent / "fixtures" / "footystats"
+FS_HOST = "api.football-data-api.com"
+FS_KEY = "facade-test-key-9f8e7d6c"
+FS_NOW = datetime(2026, 11, 6, 12, 0, tzinfo=UTC)  # the FootyStats fixture's open matches kick off on 2027-01-15
+
+
+def footystats_router(request: httpx.Request) -> httpx.Response:
+    """Serve the FootyStats fixture files (one season, 17 matches) for any season id."""
+    assert request.url.params.get("key") == FS_KEY, "the key must reach the transport"
+    files = {"/league-list": "league_list_sample.json", "/league-teams": "league_teams_sample.json", "/league-matches": "league_matches_sample.json"}
+    name = files.get(request.url.path)
+    if name is None:
+        return json_response({"success": False, "message": "not found"}, status=404)
+    return json_response(json.loads((FS_FIXTURES / name).read_text(encoding="utf-8")))
+
+
+def dual_router(request: httpx.Request) -> httpx.Response:
+    return footystats_router(request) if request.url.host == FS_HOST else sofascore_router(request)
+
+
+def test_default_providers_depend_on_the_key(tmp_path: Path, registry: TeamRegistry, monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.ingestion import footystats  # noqa: PLC0415
+
+    cfg = load_endpoints()
+    assert hv.PROVIDER_NAMES == ("footystats", "sofascore", "fotmob")
+    assert hv.default_providers() == ("sofascore",)  # no key anywhere (autouse fixture)
+    assert hv.default_providers("k") == ("footystats", "sofascore")
+    assert Harvester(endpoints=cfg, registry=registry, cache_dir=tmp_path).providers == ("sofascore",)
+    assert Harvester(endpoints=cfg, registry=registry, cache_dir=tmp_path, api_key="k").providers == ("footystats", "sofascore")
+    monkeypatch.setattr(footystats, "find_api_key", lambda *args, **kwargs: "from-env")
+    assert hv.default_providers() == ("footystats", "sofascore")
+    assert Harvester(endpoints=cfg, registry=registry, cache_dir=tmp_path).providers == ("footystats", "sofascore")
+    assert Harvester(endpoints=cfg, registry=registry, cache_dir=tmp_path, providers=("sofascore",)).providers == ("sofascore",)
+    assert hv._build_parser().parse_args([]).providers is None
+    assert hv._build_parser().parse_args(["--providers", "footystats", "sofascore"]).providers == ["footystats", "sofascore"]
+    assert cfg.footystats.base_url == "https://api.football-data-api.com" and cfg.footystats.key_env == "FOOTYSTATS_API_KEY"
+
+
+@pytest.mark.asyncio
+async def test_harvest_all_prefers_footystats_and_collects_odds(tmp_path: Path, registry: TeamRegistry, monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.ingestion import footystats  # noqa: PLC0415
+
+    monkeypatch.setattr(footystats, "_utc_now", lambda: FS_NOW)
+    cfg = load_endpoints()
+    transport = CountingTransport(dual_router)
+    harvester = Harvester(
+        endpoints=cfg,
+        registry=registry,
+        cache_dir=tmp_path / "raw",
+        providers=("footystats", "sofascore"),
+        api_key=FS_KEY,
+        transport=transport,
+        sleeper=RecordingSleeper(),
+        mapping_path=tmp_path / "footystats_teams.json",
+    )
+    result = await harvester.harvest_all([Girone.A], seasons=1)
+    assert result.provider == "footystats" and result.failures == {}
+    assert list(result.matches.columns) == list(MATCH_COLUMNS) and len(result.matches) == 13
+    assert result.matches["girone"].unique().tolist() == ["A"] and result.matches["match_id"].str.startswith("FS-").all()
+    assert [f.match_id for f in result.fixtures] == ["FS-900001", "FS-900002"]
+    assert len(result.odds) == 5 + 3 and {q.match_id for q in result.odds} == {"FS-900001", "FS-900002"}
+    assert all(r.url.host == FS_HOST for r in transport.requests) and transport.calls == 3  # list, teams, matches
+    assert "2026/27" in result.seasons and result.n_matches_by_season["2018/19"] == 13  # demo payload dates
+    assert "odds=8" in result.summary() and result.stats["requests"] == 3
+    assert (tmp_path / "footystats_teams.json").exists()
+    assert FS_KEY not in (tmp_path / "footystats_teams.json").read_text(encoding="utf-8")
+    assert not [p for p in (tmp_path / "raw").glob("*.json") if FS_KEY in p.read_text(encoding="utf-8")]
+
+    # --no-odds equivalent
+    dry = await Harvester(
+        endpoints=cfg, registry=registry, cache_dir=tmp_path / "raw", providers=("footystats",), api_key=FS_KEY,
+        transport=transport, sleeper=RecordingSleeper(), mapping_path=tmp_path / "footystats_teams.json",
+    ).harvest_all([Girone.A], seasons=1, with_odds=False)
+    assert dry.odds == [] and len(dry.fixtures) == 2
+
+
+@pytest.mark.asyncio
+async def test_harvest_all_falls_back_to_sofascore_when_footystats_fails(tmp_path: Path, registry: TeamRegistry, caplog: pytest.LogCaptureFixture) -> None:
+    cfg = load_endpoints()
+
+    def footystats_down(request: httpx.Request) -> httpx.Response:
+        if request.url.host == FS_HOST:
+            return json_response({"error": "down"}, status=503)
+        return sofascore_router(request)
+
+    harvester = Harvester(
+        endpoints=cfg, registry=registry, cache_dir=tmp_path / "raw", providers=("footystats", "sofascore"), api_key=FS_KEY,
+        transport=CountingTransport(footystats_down), sleeper=RecordingSleeper(), rng=random.Random(3), mapping_path=tmp_path / "map.json",
+    )
+    with caplog.at_level(logging.ERROR):
+        result = await harvester.harvest_all([Girone.A], seasons=1)
+    assert result.provider == "sofascore" and len(result.matches) == 5 and result.odds == []
+    assert list(result.failures) == ["A:footystats"] and "503" in result.failures["A:footystats"]
+    assert FS_KEY not in result.failures["A:footystats"]
+    assert FS_KEY not in "\n".join(f"{r.getMessage()} {r.__dict__}" for r in caplog.records)
+
+    # No key at all: FootyStats is recorded as unavailable and SofaScore still delivers.
+    keyless = Harvester(
+        endpoints=cfg, registry=registry, cache_dir=tmp_path / "raw2", providers=("footystats", "sofascore"),
+        transport=CountingTransport(sofascore_router), sleeper=RecordingSleeper(), rng=random.Random(3), mapping_path=tmp_path / "map.json",
+    )
+    second = await keyless.harvest_all([Girone.A], seasons=1)
+    assert second.provider == "sofascore" and "API key" in second.failures["A:footystats"]
+
+    # FootyStats alone and down: the HarvestError propagates like any single-provider failure.
+    only = Harvester(
+        endpoints=cfg, registry=registry, cache_dir=tmp_path / "raw3", providers=("footystats",), api_key=FS_KEY,
+        transport=CountingTransport(footystats_down), sleeper=RecordingSleeper(), mapping_path=tmp_path / "map.json",
+    )
+    with pytest.raises(HarvestError):
+        await only.harvest_all([Girone.A], seasons=1)
+
+
+@pytest.mark.asyncio
+async def test_harvest_all_reports_gironi_a_provider_cannot_serve(tmp_path: Path, registry: TeamRegistry) -> None:
+    cfg = load_endpoints()
+    serie_b = Girone.parse("SB")
+    assert serie_b not in cfg.sofascore.tournament_ids  # SofaScore knows the three Serie C gironi only
+    transport = CountingTransport(sofascore_router)
+    harvester = Harvester(endpoints=cfg, registry=registry, cache_dir=tmp_path, providers=("sofascore",), transport=transport, sleeper=RecordingSleeper())
+    result = await harvester.harvest_all([serie_b], seasons=1)
+    assert result.matches.empty and result.failures == {"SB:sofascore": "no SofaScore tournament id configured for girone SB"}
+    assert transport.calls == 0
+
+
+def test_save_odds_round_trip_and_aliases(tmp_path: Path) -> None:
+    from src.common.schemas import Market, OddsQuote  # noqa: PLC0415
+    from src.dashboard.state import load_odds_quotes  # noqa: PLC0415
+    import src.ingestion as package  # noqa: PLC0415
+
+    quotes = [
+        OddsQuote("FS-1", "FootyStats", Market.MATCH_ODDS, {"1": 2.1, "X": 3.3, "2": 3.5}),
+        OddsQuote("FS-1", "FootyStats", Market.BTTS, {"GG": 1.8, "NG": 1.95}),
+        OddsQuote("FS-2", "Book", Market.OVER_UNDER_25, {"Over 2.5": 1.9, "Under 2.5": 1.9}),
+    ]
+    path = hv.save_odds(quotes, tmp_path / "odds" / "footystats.csv")
+    lines = path.read_text(encoding="utf-8").splitlines()
+    assert lines[0] == ",".join(hv.ODDS_COLUMNS) and lines[1] == "FS-1,FootyStats,1X2,1,2.1" and len(lines) == 1 + 7
+    loaded = load_odds_quotes(path.parent)
+    assert [(q.match_id, q.bookmaker, q.market, q.odds) for q in loaded] == [(q.match_id, q.bookmaker, q.market, q.odds) for q in quotes]
+    empty = hv.save_odds([], tmp_path / "odds" / "footystats.csv")
+    assert empty.read_text(encoding="utf-8").splitlines() == [",".join(hv.ODDS_COLUMNS)] and load_odds_quotes(path.parent) == []
+    assert hv.save_odds is Harvester.save_odds and package.save_odds is Harvester.save_odds and package.ODDS_COLUMNS is hv.ODDS_COLUMNS
+    assert HarvestResult(matches=hv.empty_matches_frame(), fixtures=[], unmapped_teams={}, stats={}, provider="x").odds == []
+
+
+def test_cli_odds_out_and_no_odds(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    from src.common.schemas import Market, OddsQuote  # noqa: PLC0415
+
+    seen: dict[str, Any] = {}
+
+    async def fake_harvest_all(self: Harvester, gironi, *, season_id=None, seasons=3, with_stats=True, with_odds=True) -> HarvestResult:
+        seen.update(with_odds=with_odds, providers=self.providers)
+        return HarvestResult(
+            matches=hv.matches_to_frame([MatchRecord("FS-1", date(2026, 8, 23), 1, Girone.A, "Pro Vercelli", "Vicenza", 0, 2)]),
+            fixtures=[Fixture("FS-2", date(2026, 11, 8), 3, Girone.A, "AlbinoLeffe", "Lumezzane")],
+            unmapped_teams={},
+            stats={"requests": 3, "retries": 0, "cache_hits": 0, "errors": 0},
+            provider="footystats",
+            odds=[OddsQuote("FS-2", "FootyStats", Market.MATCH_ODDS, {"1": 2.1, "X": 3.3, "2": 3.5})] if with_odds else [],
+        )
+
+    monkeypatch.setattr(Harvester, "harvest_all", fake_harvest_all)
+    out, fixtures_out, odds_out = tmp_path / "m.csv", tmp_path / "f.csv", tmp_path / "odds" / "fs.csv"
+    base = ["--gironi", "A", "--out", str(out), "--fixtures-out", str(fixtures_out), "--odds-out", str(odds_out), "--cache-dir", str(tmp_path / "raw")]
+    assert hv.main([*base, "--providers", "footystats", "sofascore"]) == 0
+    assert seen == {"with_odds": True, "providers": ("footystats", "sofascore")}
+    assert odds_out.exists() and f"odds -> {odds_out}" in capsys.readouterr().out
+    assert hv._build_parser().parse_args(base).odds_out == odds_out
+    odds_out.unlink()
+    assert hv.main([*base, "--no-odds"]) == 0 and seen["with_odds"] is False and not odds_out.exists()
+    assert "odds=0" in capsys.readouterr().out
+
+
+def test_default_providers_honour_the_configured_key_env(tmp_path: Path, registry: TeamRegistry, monkeypatch: pytest.MonkeyPatch) -> None:
+    """``[footystats] key_env`` renames the variable: the facade must look the key up under that name."""
+    from dataclasses import replace  # noqa: PLC0415
+    from src.ingestion import footystats  # noqa: PLC0415
+
+    def keyed(explicit: str | None = None, *, key_env: str = "FOOTYSTATS_API_KEY", **kwargs: Any) -> str | None:
+        return "k" if key_env == "MY_FS_KEY" else None
+
+    monkeypatch.setattr(footystats, "find_api_key", keyed)
+    cfg = load_endpoints()
+    custom = replace(cfg, footystats=replace(cfg.footystats, key_env="MY_FS_KEY"))
+    assert hv.default_providers() == ("sofascore",)
+    assert hv.default_providers(key_env="MY_FS_KEY") == ("footystats", "sofascore")
+    assert Harvester(endpoints=cfg, registry=registry, cache_dir=tmp_path).providers == ("sofascore",)
+    assert Harvester(endpoints=custom, registry=registry, cache_dir=tmp_path).providers == ("footystats", "sofascore")
+    assert Harvester(endpoints=custom, registry=registry, cache_dir=tmp_path, providers=("sofascore",)).providers == ("sofascore",)
+
+
+@pytest.mark.asyncio
+async def test_harvest_all_default_gironi_are_those_the_providers_can_serve(tmp_path: Path, registry: TeamRegistry) -> None:
+    """A default call on a SofaScore-only installation must not record Serie B (no tournament id) as a failure."""
+    from dataclasses import replace  # noqa: PLC0415
+
+    cfg = load_endpoints()
+    serie_b = Girone.parse("SB")
+    sofa_only = Harvester(endpoints=cfg, registry=registry, cache_dir=tmp_path / "a", providers=("sofascore",), transport=CountingTransport(sofascore_router), sleeper=RecordingSleeper())
+    assert sofa_only.supported_gironi() == tuple(g for g in Girone if g in cfg.sofascore.tournament_ids)
+    assert Girone.A in sofa_only.supported_gironi() and serie_b not in sofa_only.supported_gironi()
+    with_footystats = Harvester(endpoints=cfg, registry=registry, cache_dir=tmp_path / "b", providers=("footystats", "sofascore"), api_key=FS_KEY, transport=CountingTransport(dual_router), sleeper=RecordingSleeper())
+    assert with_footystats.supported_gironi() == tuple(Girone)
+    assert Harvester(endpoints=cfg, registry=registry, cache_dir=tmp_path / "c", providers=("fotmob",), transport=CountingTransport(sofascore_router)).supported_gironi() == tuple(Girone)
+
+    # end to end: the fixture router serves girone A only, so pin the SofaScore ids to A and call with the default
+    a_only = replace(cfg, sofascore=replace(cfg.sofascore, tournament_ids={Girone.A: cfg.sofascore.tournament_ids[Girone.A]}))
+    harvester = Harvester(endpoints=a_only, registry=registry, cache_dir=tmp_path / "d", providers=("sofascore",), transport=CountingTransport(sofascore_router), sleeper=RecordingSleeper(), rng=random.Random(3))
+    assert harvester.supported_gironi() == (Girone.A,)
+    result = await harvester.harvest_all(seasons=1)
+    assert result.failures == {} and len(result.matches) == 5 and result.matches["girone"].unique().tolist() == ["A"]
+    assert hv._write_decision(result, tmp_path / "m.csv", allow_partial=False) == (True, None)
+    # an explicit request is still attempted and reported
+    explicit = await harvester.harvest_all([serie_b], seasons=1)
+    assert explicit.failures == {"SB:sofascore": "no SofaScore tournament id configured for girone SB"}
+
+
+def test_save_odds_keeps_the_quoted_precision(tmp_path: Path) -> None:
+    """Odds are written as quoted (101.25, 10.125), not rounded to four significant digits (101.2, 10.12)."""
+    from src.common.schemas import Market, OddsQuote  # noqa: PLC0415
+    from src.dashboard.state import load_odds_quotes  # noqa: PLC0415
+
+    quotes = [
+        OddsQuote("FS-1", "FootyStats", Market.MATCH_ODDS, {"1": 1.95, "X": 10.125, "2": 101.25}),
+        OddsQuote("FS-2", "FootyStats", Market.BTTS, {"GG": 2.1, "NG": 1.666}),
+    ]
+    path = hv.save_odds(quotes, tmp_path / "odds.csv")
+    lines = path.read_text(encoding="utf-8").splitlines()
+    assert lines[1:] == ["FS-1,FootyStats,1X2,1,1.95", "FS-1,FootyStats,1X2,X,10.125", "FS-1,FootyStats,1X2,2,101.25", "FS-2,FootyStats,GG/NG,GG,2.1", "FS-2,FootyStats,GG/NG,NG,1.666"]
+    loaded = load_odds_quotes(path.parent)
+    assert [q.odds for q in loaded] == [q.odds for q in quotes]
+

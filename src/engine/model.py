@@ -1,16 +1,17 @@
-"""Dixon-Coles engine for Italian Serie C (Gironi A / B / C).
+"""Dixon-Coles engine for the configured competitions (Serie C Gironi A / B / C and Serie B).
 
 Model
 -----
-For a match between ``home`` and ``away`` played in girone ``g`` the goal
-rates are log-linear::
+For a match between ``home`` and ``away`` played in competition ``g`` (a
+*girone* in the code: a Serie C girone or Serie B, whatever
+``config/competitions.toml`` lists) the goal rates are log-linear::
 
     lambda = exp(alpha[home] - beta[away] + gamma[g])     # expected home goals
     mu     = exp(alpha[away] - beta[home])                # expected away goals
 
 ``alpha`` is attack strength, ``beta`` is defensive solidity (a *higher* beta
 concedes *less*), ``gamma`` is the home advantage estimated separately for each
-girone (or shared, see :attr:`DixonColesConfig.girone_specific_home`) and
+competition (or shared, see :attr:`DixonColesConfig.girone_specific_home`) and
 ``rho`` is the Dixon-Coles low-score dependence parameter that corrects the
 independent-Poisson probabilities of the 0-0, 1-0, 0-1 and 1-1 scores through
 :func:`tau`.
@@ -77,6 +78,38 @@ played in (the frame's ``girone`` column), never the team's current girone.
 Without a registry every fitted team is current (the behaviour of earlier
 releases is unchanged).
 
+Several divisions in one fit
+----------------------------
+Nothing in the engine is specific to three gironi: competitions are whatever
+the dynamic :class:`src.common.schemas.Girone` enum lists (``A``, ``B``, ``C``
+and ``SB`` for Serie B by default), each with its own home advantage and its
+own ``sum(alpha) == 0`` constraint group, in configuration order (also the
+tie-break order when a historical team played equally often in two
+competitions). A club promoted or relegated between Serie B and Serie C keeps
+**one canonical name** across seasons (``'Pescara'`` in Serie B 2025/26 and in
+girone B 2026/27): the registry of the current season decides its group, and
+its matches in the other division stay in the likelihood. Within one season
+the divisions never meet, so each block is identified by its own constraint
+and its own goal level; it is through these *movers* that the joint fit across
+divisions is identified: a relegated club carries the strength it showed
+against Serie B opposition into its Serie C group, and the Serie B strengths
+are estimated against the right opposition when a promoted club's Serie C
+history is in the frame. The centring is still per competition, so an alpha is
+read relative to the average of *its* division (a Serie B average and a Serie C
+average both sit at 0): compare teams across divisions through the movers'
+matches, not through the raw alphas.
+
+A registry competition may have current teams but no match at all in the frame
+(Serie B clubs that appear only in Serie C history because Serie B has not
+been harvested yet). Those teams stay current and keep their registry
+competition in every report, but no home advantage exists for it and they
+join, for the constraint only, the group of the competition they played most
+matches in (:attr:`TeamIndex.constraint_girone`): centring the promoted
+clubs on their own would force the strongest teams of the lower division to
+average zero. The fit logs a warning; a fixture of that competition is not
+predictable until its matches are harvested (``KeyError`` from
+:meth:`DixonColesEngine.rates`, skipped with a note by the callers).
+
 The objective exposes an analytic gradient (:func:`negative_log_likelihood_grad`)
 which is passed to :func:`scipy.optimize.minimize`.
 """
@@ -85,7 +118,7 @@ from __future__ import annotations
 import json
 import math
 import time
-from dataclasses import MISSING, asdict, dataclass, fields
+from dataclasses import MISSING, asdict, dataclass, field, fields
 from datetime import date, datetime
 from difflib import get_close_matches
 from pathlib import Path
@@ -562,14 +595,27 @@ def _as_data(data: tuple[Any, ...]) -> LikelihoodData:
 class TeamIndex:
     """Team <-> parameter position bookkeeping for one fit.
 
-    ``teams`` is the global team order (girone A teams first, alphabetical within
-    the girone, then B, then C). ``gironi`` are the gironi that appear in the
-    match frame, in letter order; they index the home-advantage parameters when
-    ``girone_specific_home`` is true (otherwise there is a single shared gamma).
-    ``teams_by_girone`` are the constraint groups of the ``sum(alpha) == 0``
-    identifiability constraint. ``historical`` lists the fitted teams that are
-    not part of the current perimeter (see :func:`build_team_index` with a
-    registry); it is empty when no registry was used.
+    ``teams`` is the global team order: the competitions in the order of
+    ``config/competitions.toml``, alphabetical within a competition. ``gironi``
+    are the competitions that appear in the match frame, in that same order;
+    they index the home-advantage parameters when ``girone_specific_home`` is
+    true (otherwise there is a single shared gamma). ``teams_by_girone`` is the
+    *reported* competition of every team (the registry competition for current
+    teams) and, normally, also its ``sum(alpha) == 0`` constraint group.
+    ``historical`` lists the fitted teams that are not part of the current
+    perimeter (see :func:`build_team_index` with a registry); it is empty when no
+    registry was used.
+
+    A registry competition can have current teams but no match at all in the
+    frame (Serie B clubs that appear only in Serie C history because Serie B has
+    not been harvested yet). Such a group has no home advantage to estimate and
+    must not be centred on its own (its members are typically the promoted,
+    i.e. strongest, teams of the lower division): ``constraint_girone`` maps
+    each of those teams to the competition it played most matches in, whose
+    constraint group it joins. :meth:`constraint_groups` gives the effective
+    groups, :meth:`constraint_girone_of` the group of one team, while
+    :meth:`girone_of` keeps answering the reported competition. Building an
+    index with such a group and no override raises ``ValueError``.
     """
 
     teams: tuple[str, ...]
@@ -577,6 +623,7 @@ class TeamIndex:
     gironi: tuple[Girone, ...]
     girone_specific_home: bool = True
     historical: tuple[str, ...] = ()
+    constraint_girone: dict[str, Girone] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if len(set(self.teams)) != len(self.teams):
@@ -584,13 +631,26 @@ class TeamIndex:
         assigned = [t for g in self.teams_by_girone.values() for t in g]
         if sorted(assigned) != sorted(self.teams):
             raise ValueError("teams_by_girone does not partition TeamIndex.teams")
-        for g in self.teams_by_girone:
+        overrides = {str(t): Girone.parse(g) for t, g in self.constraint_girone.items()}
+        unknown_override = sorted(set(overrides) - set(self.teams))
+        if unknown_override:
+            raise ValueError(f"constraint_girone names teams not in TeamIndex.teams: {unknown_override}")
+        bad_target = sorted(t for t, g in overrides.items() if g not in self.gironi)
+        if bad_target:
+            raise ValueError(f"constraint_girone must point to a girone with matches; offending teams: {bad_target}")
+        for g, members in self.teams_by_girone.items():
             if g not in self.gironi:
-                raise ValueError(f"girone {g.value} has teams but no matches")
+                orphans = [t for t in members if t not in overrides]
+                if orphans:
+                    raise ValueError(
+                        f"girone {g.value} has teams but no matches ({orphans[:5]}{', ...' if len(orphans) > 5 else ''}): "
+                        "no home advantage can be estimated; pass constraint_girone to attach them to a girone with matches"
+                    )
         unknown = sorted(set(self.historical) - set(self.teams))
         if unknown:
             raise ValueError(f"historical teams not in TeamIndex.teams: {unknown}")
         object.__setattr__(self, "historical", tuple(str(t) for t in self.historical))
+        object.__setattr__(self, "constraint_girone", overrides)
 
     @property
     def n_teams(self) -> int:
@@ -620,10 +680,29 @@ class TeamIndex:
                 return g
         raise KeyError(team)
 
+    def constraint_girone_of(self, team: str) -> Girone:
+        """Competition whose ``sum(alpha) == 0`` group ``team`` belongs to (its reported one unless overridden)."""
+        override = self.constraint_girone.get(team)
+        return override if override is not None else self.girone_of(team)
+
+    def constraint_groups(self) -> dict[Girone, tuple[str, ...]]:
+        """Effective ``sum(alpha) == 0`` groups, in ``teams_by_girone`` order.
+
+        The reported groups of the competitions that have matches, each extended
+        with the teams :attr:`constraint_girone` attaches to it.
+        """
+        groups: dict[Girone, list[str]] = {g: list(members) for g, members in self.teams_by_girone.items() if g in self.gironi}
+        for g, members in self.teams_by_girone.items():
+            if g in self.gironi:
+                continue
+            for team in members:
+                groups.setdefault(self.constraint_girone[team], []).append(team)
+        return {g: tuple(members) for g, members in groups.items() if members}
+
     def team_girone_positions(self) -> np.ndarray:
-        """For every team, the position of its girone inside ``gironi``."""
+        """For every team, the position inside ``gironi`` of its constraint competition (centres the beta ridge)."""
         girone_pos = {g: i for i, g in enumerate(self.gironi)}
-        return np.array([girone_pos[self.girone_of(t)] for t in self.teams], dtype=np.int64)
+        return np.array([girone_pos[self.constraint_girone_of(t)] for t in self.teams], dtype=np.int64)
 
     def gamma_position(self, girone: Girone | str) -> int:
         """Position of the home-advantage parameter used for matches of ``girone``."""
@@ -636,9 +715,9 @@ class TeamIndex:
             raise KeyError(f"girone {g.value} was not present in the fitted matches") from exc
 
     def alpha_groups(self) -> list[np.ndarray]:
-        """Team positions of every girone that has at least one team (constraint groups)."""
+        """Team positions of every constraint group (``sum(alpha) == 0`` is imposed on each; see :meth:`constraint_groups`)."""
         positions = self.team_positions()
-        return [np.array([positions[t] for t in members], dtype=np.int64) for members in self.teams_by_girone.values() if members]
+        return [np.array([positions[t] for t in members], dtype=np.int64) for members in self.constraint_groups().values() if members]
 
 
 def build_team_index(
@@ -650,17 +729,23 @@ def build_team_index(
 ) -> TeamIndex:
     """Build the :class:`TeamIndex` of a *validated* match frame.
 
-    Without ``registry`` a team appearing in more than one girone is assigned to
-    the girone where it played most matches (ties broken by letter order) and a
-    warning is logged. With a ``registry`` every team of the registry (matched by
-    its canonical name) is a *current* team and is assigned to its **registry**
-    girone, whatever girone its matches were played in (a team that moved girone
-    between seasons is logged at INFO level, not warned about); every other team
-    is *historical*: it is still estimated, listed in ``TeamIndex.historical``
-    and placed in the constraint group of the girone it played most matches in.
-    Teams with fewer than ``min_matches_per_team`` matches are still estimated
-    but reported in the log. Only teams that appear in ``matches`` are indexed:
-    a registry team without any match has no identifiable strength.
+    Without ``registry`` a team appearing in more than one competition is
+    assigned to the one where it played most matches (ties broken by the order
+    of ``config/competitions.toml``) and a warning is logged. With a ``registry``
+    every team of the registry (matched by its canonical name) is a *current*
+    team and is assigned to its **registry** competition, whatever competition
+    its matches were played in (a club that moved girone, or division, between
+    seasons is logged at INFO level, not warned about); every other team is
+    *historical*: it is still estimated, listed in ``TeamIndex.historical`` and
+    placed in the constraint group of the competition it played most matches in.
+    When a registry competition has current teams but no match in the frame
+    (Serie B not harvested yet), those teams keep their registry competition but
+    join, for the ``sum(alpha) == 0`` constraint only, the group of the
+    competition they played in (``TeamIndex.constraint_girone``, logged as a
+    warning); no home advantage is estimated for that competition. Teams with
+    fewer than ``min_matches_per_team`` matches are still estimated but
+    reported in the log. Only teams that appear in ``matches`` are indexed: a
+    registry team without any match has no identifiable strength.
     """
     long = pd.concat(
         [
@@ -669,10 +754,13 @@ def build_team_index(
         ],
         ignore_index=True,
     )
+    order = {g.value: i for i, g in enumerate(Girone)}
     counts = long.groupby(["team", "girone"], observed=True).size().reset_index(name="n")
-    counts = counts.sort_values(["team", "n", "girone"], ascending=[True, False, True], kind="stable")
+    counts = counts.assign(_pos=counts["girone"].astype(str).map(order))
+    counts = counts.sort_values(["team", "n", "_pos"], ascending=[True, False, True], kind="stable")
     best = counts.drop_duplicates(subset="team", keep="first")
-    assignment: dict[str, Girone] = {str(t): Girone.parse(g) for t, g in zip(best["team"], best["girone"])}
+    played_in: dict[str, Girone] = {str(t): Girone.parse(g) for t, g in zip(best["team"], best["girone"])}
+    assignment: dict[str, Girone] = dict(played_in)
 
     current_set = set(registry.canonical_names) if registry is not None else set(assignment)
     historical = tuple(sorted(t for t in assignment if t not in current_set))
@@ -720,22 +808,34 @@ def build_team_index(
             teams_by_girone[g] = members
     teams = tuple(t for g in Girone for t in teams_by_girone.get(g, ()))
     gironi = tuple(g for g in Girone if g.value in set(matches["girone"].astype(str)))
-    if registry is not None:
-        # A current team whose matches were all played in another girone still needs a
-        # gamma for its registry girone only when it has matches *there*; the gamma
-        # index follows the match's girone, so no extra parameter is created here.
-        missing = [g.value for g in teams_by_girone if g not in gironi]
-        if missing:
-            raise ValueError(
-                f"registry gironi {missing} have current teams but no match was played in them: "
-                "the home advantage of those gironi cannot be estimated"
-            )
+    constraint_girone: dict[str, Girone] = {}
+    missing = [g for g in teams_by_girone if g not in gironi]
+    if missing:
+        # Only possible with a registry: current teams of a registry competition whose
+        # matches were all played elsewhere (promoted clubs before their new division is
+        # harvested). The gamma index follows the match's competition, so no parameter
+        # is created for theirs; for the sum(alpha) == 0 constraint they join the group
+        # of the competition they played most matches in (centring them on their own
+        # would force the strongest teams of the lower division to average zero).
+        for g in missing:
+            for team in teams_by_girone[g]:
+                constraint_girone[team] = played_in[team]
+        log.warning(
+            "registry gironi with current teams but no matches: no home advantage estimated, "
+            "teams constrained with the girone they played in",
+            extra={
+                "season": registry.season_label if registry is not None else None,
+                "gironi": [g.value for g in missing],
+                "teams": {t: g.value for t, g in constraint_girone.items()},
+            },
+        )
     return TeamIndex(
         teams=teams,
         teams_by_girone=teams_by_girone,
         gironi=gironi,
         girone_specific_home=girone_specific_home,
         historical=historical,
+        constraint_girone=constraint_girone,
     )
 
 
@@ -1080,7 +1180,10 @@ class FittedParams:
     registry passed to :meth:`DixonColesEngine.fit` (empty without a registry);
     :attr:`current_teams` are the others and :meth:`is_current` tells them apart.
     ``teams_by_girone`` holds every fitted team (current and historical) in its
-    constraint group.
+    reported competition (the registry one for current teams), which is also its
+    constraint group except for the teams of a registry competition without
+    matches (see :class:`TeamIndex`); ``gamma`` has one entry per competition
+    that had matches, so such a competition is absent from it.
     """
 
     alpha: dict[str, float]
@@ -1126,7 +1229,7 @@ class FittedParams:
 
     @property
     def teams(self) -> tuple[str, ...]:
-        """All fitted teams (current and historical) in girone order (A, B, C), alphabetical within a girone."""
+        """All fitted teams (current and historical) in competition order (``config/competitions.toml``), alphabetical within one."""
         return tuple(t for g in Girone for t in self.teams_by_girone.get(g, ()))
 
     @property
@@ -1396,6 +1499,7 @@ class DixonColesEngine:
                 "n_historical_teams": len(index.historical),
                 "perimeter": registry.season_label if registry is not None else None,
                 "gironi": [g.value for g in index.gironi],
+                "constraint_overrides": {t: g.value for t, g in index.constraint_girone.items()},
                 "method": cfg.method,
                 "xi": cfg.xi,
                 "l2_penalty": cfg.l2_penalty,

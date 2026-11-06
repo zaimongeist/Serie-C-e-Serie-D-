@@ -1,14 +1,23 @@
-# Raccolta dati post-giornata: scarica le ultime 3 stagioni di Serie C (Gironi A/B/C),
-# aggiorna data/processed/*.csv e committa solo se qualcosa è cambiato.
+# Raccolta dati post-giornata: scarica le ultime 3 stagioni di Serie C (Gironi A/B/C) e Serie B,
+# aggiorna data/processed/*.csv (+ le quote pre-match in data/odds/footystats.csv) e committa solo
+# se qualcosa è cambiato.
+#
+# Sorgente dati:
+#   - FootyStats (API ufficiale, raggiungibile anche dai datacenter): serve la chiave API del tuo
+#     account footystats.org, salvata come SEGRETO di repository FOOTYSTATS_API_KEY
+#     (Settings → Secrets and variables → Actions → New repository secret). Sul sito aggiungi al tuo
+#     account le leghe: Italy Serie C Group A / B / C e Italy Serie B ("Choose leagues").
+#     La chiave non compare mai nei log, nella cache né nei file committati.
+#   - senza segreto si usa SofaScore. ATTENZIONE: SofaScore risponde spesso HTTP 403 agli IP dei
+#     datacenter; in quel caso il job fallisce e il riepilogo lo spiega.
 #
 # Dove gira:
-#   - per default sui runner GitHub (ubuntu-latest). ATTENZIONE: SofaScore risponde spesso
-#     HTTP 403 agli IP dei datacenter; in quel caso il job fallisce e il riepilogo lo spiega.
-#   - per girare dal tuo PC (IP residenziale, la via affidabile): registra un self-hosted runner
+#   - per default sui runner GitHub (ubuntu-latest), sufficiente con FootyStats.
+#   - per girare dal tuo PC (IP residenziale, necessario per SofaScore): registra un self-hosted runner
 #     (Settings → Actions → Runners → New self-hosted runner) e imposta la variabile di repository
 #     HARVEST_RUNNER = self-hosted (Settings → Secrets and variables → Actions → Variables).
 #     Il job partirà sul PC quando è acceso e il runner è in esecuzione.
-name: Aggiorna dati Serie C
+name: Aggiorna dati Serie C e Serie B
 
 on:
   schedule:
@@ -20,8 +29,12 @@ on:
         description: "Numero di stagioni da raccogliere (le più recenti)"
         default: "3"
         required: false
+      competitions:
+        description: "Competizioni FootyStats (codici separati da spazio: A B C SB)"
+        default: "A B C SB"
+        required: false
       with_stats:
-        description: "Scaricare anche tiri/angoli/xG (true/false)"
+        description: "SofaScore: scaricare anche tiri/angoli/xG (true/false)"
         default: "true"
         required: false
 
@@ -36,6 +49,10 @@ jobs:
   harvest:
     runs-on: ${{ vars.HARVEST_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 120
+    env:
+      # Vuoto quando il segreto non è configurato: in quel caso parte il passo SofaScore.
+      FOOTYSTATS_API_KEY: ${{ secrets.FOOTYSTATS_API_KEY }}
+      SERIEC_LOG_LEVEL: INFO
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -55,29 +72,83 @@ jobs:
         uses: actions/cache@v4
         with:
           path: data/raw
-          key: sofascore-raw-${{ github.ref_name }}-${{ github.run_id }}
+          key: harvest-raw-${{ github.ref_name }}-${{ github.run_id }}
           restore-keys: |
+            harvest-raw-${{ github.ref_name }}-
             sofascore-raw-${{ github.ref_name }}-
 
-      - name: Raccolta dati
-        id: harvest
-        env:
-          SERIEC_LOG_LEVEL: INFO
+      - name: Raccolta dati (FootyStats)
+        if: env.FOOTYSTATS_API_KEY != ''
+        run: |
+          set -o pipefail
+          SEASONS="${{ github.event.inputs.seasons || '3' }}"
+          COMPETITIONS="${{ github.event.inputs.competitions || 'A B C SB' }}"
+          echo "Sorgente: FootyStats (competizioni: $COMPETITIONS, stagioni: $SEASONS)" | tee harvest.log
+          # shellcheck disable=SC2086
+          python -m src.ingestion.footystats --competitions $COMPETITIONS --seasons "$SEASONS" \
+            --odds-out data/odds/footystats.csv 2>&1 | tee -a harvest.log
+
+      - name: Raccolta dati (SofaScore, nessun segreto FOOTYSTATS_API_KEY)
+        if: env.FOOTYSTATS_API_KEY == ''
         run: |
           set -o pipefail
           SEASONS="${{ github.event.inputs.seasons || '3' }}"
           STATS_FLAG=""
           if [ "${{ github.event.inputs.with_stats || 'true' }}" = "false" ]; then STATS_FLAG="--no-stats"; fi
-          python -m src.ingestion.harvester --gironi A B C --seasons "$SEASONS" $STATS_FLAG 2>&1 | tee harvest.log
+          echo "Sorgente: SofaScore (nessun segreto FOOTYSTATS_API_KEY configurato)" | tee harvest.log
+          python -m src.ingestion.harvester --gironi A B C --seasons "$SEASONS" $STATS_FLAG 2>&1 | tee -a harvest.log
+
+      - name: Riepilogo (partite per competizione e stagione)
+        if: success()
+        run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          import pandas as pd
+          from src.common.schemas import season_of
+
+          lines = ["## Dati raccolti", ""]
+          source = Path("harvest.log").read_text(encoding="utf-8").splitlines()[0] if Path("harvest.log").exists() else ""
+          if source:
+              lines += [source, ""]
+          matches = Path("data/processed/matches.csv")
+          if matches.exists():
+              df = pd.read_csv(matches, parse_dates=["date"])
+              df["season"] = df["date"].map(season_of)
+              table = df.pivot_table(index="girone", columns="season", values="match_id", aggfunc="count", fill_value=0)
+              table = table[sorted(table.columns, reverse=True)]
+              lines.append(f"**{len(df)} partite** in `data/processed/matches.csv`")
+              lines.append("")
+              lines.append("| competizione | " + " | ".join(table.columns) + " | totale |")
+              lines.append("|---|" + "---|" * (len(table.columns) + 1))
+              for code, row in table.iterrows():
+                  lines.append(f"| {code} | " + " | ".join(str(int(v)) for v in row) + f" | {int(row.sum())} |")
+          fixtures = Path("data/processed/fixtures.csv")
+          if fixtures.exists():
+              fx = pd.read_csv(fixtures)
+              per = ", ".join(f"{g}: {n}" for g, n in fx["girone"].value_counts().sort_index().items())
+              lines += ["", f"Prossime partite: {len(fx)} ({per})"]
+          odds = Path("data/odds/footystats.csv")
+          if odds.exists():
+              od = pd.read_csv(odds)
+              lines.append(f"Quote pre-match FootyStats: {len(od)} righe per {od['match_id'].nunique()} partite")
+          Path(os.environ["GITHUB_STEP_SUMMARY"]).open("a", encoding="utf-8").write("\n".join(lines) + "\n")
+          PY
 
       - name: Riepilogo in caso di errore
         if: failure()
         run: |
           {
             echo "## Raccolta dati non riuscita"
-            if grep -qE "status=403|HTTP 403|Forbidden" harvest.log; then
+            if grep -qiE "API key (not configured|missing)|footystats: FootyStats API key" harvest.log; then
+              echo "Manca la chiave FootyStats: aggiungi il segreto di repository **FOOTYSTATS_API_KEY** (Settings → Secrets and variables → Actions)."
+            elif grep -qE "chosen leagues" harvest.log; then
+              echo "Una competizione non è fra le leghe del tuo account FootyStats: su footystats.org aggiungi *Italy Serie C Group A/B/C* e *Italy Serie B* (Choose leagues)."
+            elif grep -qE "status=403|HTTP 403|Forbidden" harvest.log; then
               echo "SofaScore ha risposto **403 Forbidden**: l'IP del runner è bloccato."
-              echo "Soluzione: esegui il job da un self-hosted runner sul tuo PC (variabile HARVEST_RUNNER=self-hosted) oppure lancia \`avvia.command\` / \`avvia.bat\` in locale."
+              echo "Soluzione: configura il segreto FOOTYSTATS_API_KEY (API ufficiale), oppure esegui il job da un self-hosted runner sul tuo PC (variabile HARVEST_RUNNER=self-hosted) o lancia \`avvia.command\` / \`avvia.bat\` in locale."
+            elif grep -qE "status=429|HTTP 429" harvest.log; then
+              echo "FootyStats ha risposto **429**: superato il limite orario di richieste (~1800/h). Il job riproverà alla prossima esecuzione."
             else
               echo "Vedi il log del passo *Raccolta dati*."
             fi
@@ -90,6 +161,8 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add data/processed/matches.csv data/processed/fixtures.csv
+          [ -f data/odds/footystats.csv ] && git add data/odds/footystats.csv
+          [ -f config/footystats_teams.json ] && git add config/footystats_teams.json
           if git diff --cached --quiet; then
             echo "Nessuna variazione nei dati: niente da committare." | tee -a "$GITHUB_STEP_SUMMARY"
             exit 0
@@ -98,6 +171,6 @@ jobs:
           import pandas as pd; print(len(pd.read_csv("data/processed/matches.csv")))
           PY
           )
-          git commit -m "Aggiorna dati Serie C ($(date -u +%Y-%m-%d), $N partite)"
+          git commit -m "Aggiorna dati Serie C / Serie B ($(date -u +%Y-%m-%d), $N partite)"
           git push
           echo "Dati aggiornati: $N partite in data/processed/matches.csv" >> "$GITHUB_STEP_SUMMARY"

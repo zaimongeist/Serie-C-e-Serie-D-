@@ -456,13 +456,17 @@ class TestRegressionTraps:
         assert {t.team for t in detect_regression_traps(trapped_matches)} <= {t.team for t in loose}
 
     def test_sorted_by_severity_desc(self, trapped_matches: pd.DataFrame) -> None:
-        df = inject_regression_trap(trapped_matches, "Perugia", xga_total=6.0)
+        # 12 xGA against in three matches is far beyond any trap the simulator produces by itself (the 80-team league
+        # does throw up natural traps with severity around 5), so the injected team must come first
+        df = inject_regression_trap(trapped_matches, "Perugia", xga_total=12.0)
         traps = detect_regression_traps(df)
         severities = [t.severity for t in traps]
         assert severities == sorted(severities, reverse=True)
         assert traps[0].team == "Perugia"
-        assert traps[0].severity == pytest.approx(6.0 - 1)
+        assert traps[0].severity == pytest.approx(12.0 - 1)
         assert TRAP_TEAM in {t.team for t in traps}
+        natural = [t for t in traps if t.team not in (TRAP_TEAM, "Perugia")]
+        assert all(t.severity < traps[0].severity for t in natural)
 
     def test_window_parameter(self, trapped_matches: pd.DataFrame) -> None:
         traps = detect_regression_traps(trapped_matches, window=4, min_xg_against=0.0, max_goals_against=50)

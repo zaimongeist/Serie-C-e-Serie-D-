@@ -1,5 +1,6 @@
-"""Seasons, perimeter and history: the 2026/27 registry is the only set of teams that is
-ranked, predicted and priced; older seasons are history (and historical teams opponents only).
+"""Seasons, perimeter and history: the 2026/27 registry (Serie C Gironi A/B/C + Serie B, 80 teams) is the
+only set of teams that is ranked, predicted and priced; older seasons are history (and historical teams
+opponents only). A club keeps one canonical name across divisions: the registry decides its competition.
 
 Covers ``season_of``/``season_bounds``, the registry defaults and historical aliases, the
 calendar-anchored simulator with synthetic past seasons, the registry-aware engine
@@ -20,6 +21,7 @@ import pytest
 import main as pipeline
 from src.common.schemas import Fixture, Girone, MatchRecord, matches_to_frame, season_bounds, season_of
 from src.common.teams import DEFAULT_SEASON, TeamRegistry, list_seasons, load_registry
+from src.common.teams import normalize_name
 from src.dashboard.state import (
     MAX_HISTORY_SEASONS,
     build_state,
@@ -50,7 +52,19 @@ from src.simulation.generator import (
 )
 
 TODAY = date(2026, 11, 6)
-MOVED = {"Inter U23": Girone.C, "Atalanta U23": Girone.B, "Juventus Next Gen": Girone.A, "Latina": Girone.B, "Carpi": Girone.A}
+#: Current teams that played elsewhere in 2025/26: girone moves inside Serie C and division moves (Pescara / Spezia from
+#: Serie B to girone B, Vicenza / Arezzo from Serie C to Serie B). The 2026/27 registry decides their competition.
+MOVED = {
+    "Inter U23": Girone.C,
+    "Atalanta U23": Girone.B,
+    "Juventus Next Gen": Girone.A,
+    "Latina": Girone.B,
+    "Carpi": Girone.A,
+    "Pescara": Girone.B,
+    "Spezia": Girone.B,
+    "Vicenza": Girone.SB,
+    "Arezzo": Girone.SB,
+}
 
 
 # ----------------------------------------------------------------------------- fixtures
@@ -107,10 +121,11 @@ def test_season_bounds_roundtrip_and_validation() -> None:
 
 
 # ----------------------------------------------------------------------------- registry
-def test_default_registry_is_2026_27_with_60_teams(registry: TeamRegistry) -> None:
+def test_default_registry_is_2026_27_with_80_teams(registry: TeamRegistry) -> None:
     assert DEFAULT_SEASON == "2026_27"
-    assert registry.season_label == "2026/27" and registry.n_teams == 60
-    assert all(len(registry.teams(g)) == 20 for g in Girone)
+    assert registry.season_label == "2026/27" and registry.n_teams == 80
+    assert all(len(registry.teams(g)) == 20 for g in Girone) and registry.gironi == tuple(Girone)
+    assert registry.perimeter_label == "Serie C 2026/27 Gironi A/B/C + Serie B (80 squadre)"
     assert list_seasons() == ["2025_26", "2026_27"]
     assert load_registry("2026/27").canonical_names == registry.canonical_names  # label with a slash works too
     for team, girone in MOVED.items():
@@ -130,7 +145,10 @@ def test_with_historical_aliases_keeps_current_teams_and_maps_old_spellings(regi
     # a team that is gone: its old canonical spelling and aliases map to the historical spelling itself
     assert merged.exact("Ternana Calcio") == "Ternana" and merged.exact("Ternana") == "Ternana"
     assert not merged.is_current_team("Ternana Calcio")
-    assert "Ternana" in merged.historical_names and "Vicenza" in merged.historical_names
+    assert "Ternana" in merged.historical_names and "Frosinone" in merged.historical_names  # Frosinone: Serie B 2025/26, gone in 2026/27
+    # clubs that changed division keep ONE canonical name: Vicenza (girone A -> Serie B), Pescara (Serie B -> girone B)
+    assert merged.is_current_team("L.R. Vicenza") and merged.girone_of("Vicenza") is Girone.SB and old.girone_of("Vicenza") is Girone.A
+    assert merged.exact("Delfino Pescara") == "Pescara" and merged.girone_of("Pescara") is Girone.B and old.girone_of("Pescara") is Girone.SB
     assert not set(merged.historical_names) & set(registry.canonical_names)
     # a current team that changed girone keeps the current girone
     assert merged.girone_of("Latina") is Girone.B and old.girone_of("Latina") is Girone.C
@@ -147,8 +165,8 @@ def test_calendar_anchored_to_the_real_season(current) -> None:
     assert current.matches["date"].min().date() == SEASON_2026_27_START
     assert set(current.matches["date"].dt.weekday) == {6}
     # as of 2026-11-06: rounds dated before it are played (11), round 12 on 2026-11-08 is the fixture list
-    assert int(current.matches["round"].max()) == 11 and len(current.matches) == 11 * 30
-    assert len(current.fixtures) == 30 and {fx.round for fx in current.fixtures} == {12}
+    assert int(current.matches["round"].max()) == 11 and len(current.matches) == 11 * 40  # 30 Serie C + 10 Serie B matches a round
+    assert len(current.fixtures) == 40 and {fx.round for fx in current.fixtures} == {12}
     assert {fx.date for fx in current.fixtures} == {date(2026, 11, 8)}
     assert current.registry.season_label == "2026/27" and set(current.teams) == set(load_registry().canonical_names)
     # exactly on a match day the round is still to be played
@@ -166,9 +184,9 @@ def test_calendar_anchored_to_the_real_season(current) -> None:
 def test_simulate_history_composition_and_determinism(history, current, registry: TeamRegistry) -> None:
     assert history.seasons == HISTORY_SEASONS == ("2024/25", "2025/26")
     assert history.fixtures == [] and history.odds == []
-    assert len(history.matches) == 2 * 3 * 380  # two full double round robins of three 20-team gironi
+    assert len(history.matches) == 2 * 4 * 380  # two full double round robins of four 20-team competitions
     by_season = history.matches["date"].map(season_of)
-    assert by_season.value_counts().to_dict() == {"2024/25": 1140, "2025/26": 1140}
+    assert by_season.value_counts().to_dict() == {"2024/25": 1520, "2025/26": 1520}
     assert history.matches["date"].min().date() == date(2024, 8, 25)
     assert history.matches["match_id"].str.startswith("HIST").all()
     assert pd.concat([history.matches["match_id"], current.matches["match_id"]]).is_unique
@@ -180,25 +198,35 @@ def test_simulate_history_composition_and_determinism(history, current, registry
     assert historical and historical <= set(HISTORICAL_TEAMS)
     for label, comp in history.season_registries.items():
         assert all(len(comp.teams(g)) == 20 for g in Girone), label
-        assert len(set(comp.canonical_names) - set(registry.canonical_names)) >= 9  # 3 swaps per girone
-    # real past compositions: Inter U23 in A (2025/26, absent in 2024/25), Atalanta U23 C/A, Juventus Next Gen B/C
+        assert len(set(comp.canonical_names) - set(registry.canonical_names)) >= 12  # 3 swaps per competition
+    # real past compositions: Inter U23 in A (2025/26, absent in 2024/25), Atalanta U23 C/A, Juventus Next Gen B/C,
+    # Pescara / Spezia / Reggiana / Bari in Serie B 2025/26, Vicenza / Arezzo / Ascoli / Benevento in Serie C
     s26, s25 = history.season_registries["2025/26"], history.season_registries["2024/25"]
     assert s26.girone_of("Inter U23") is Girone.A and s26.girone_of("Atalanta U23") is Girone.C
     assert s26.girone_of("Juventus Next Gen") is Girone.B and s26.girone_of("Latina") is Girone.C and s26.girone_of("Carpi") is Girone.B
-    assert "Inter U23" not in s25.canonical_names
+    assert s26.girone_of("Pescara") is Girone.SB and s26.girone_of("Spezia") is Girone.SB and s26.girone_of("Bari") is Girone.SB
+    assert s26.girone_of("Vicenza") is Girone.A and s26.girone_of("Arezzo") is Girone.B and s26.girone_of("Benevento") is Girone.C
+    assert not {"Cremonese", "Pisa", "Hellas Verona"} & set(s26.canonical_names)  # Serie A in 2025/26
+    assert "Inter U23" not in s25.canonical_names and not {"Empoli", "Hellas Verona"} & set(s25.canonical_names)
     assert s25.girone_of("Atalanta U23") is Girone.A and s25.girone_of("Juventus Next Gen") is Girone.C
+    assert s25.girone_of("Padova") is Girone.A and s25.girone_of("Virtus Entella") is Girone.B and s25.girone_of("Cittadella") is Girone.SB
     # deterministic
     again = simulate_history(seed=7)
     pd.testing.assert_frame_equal(again.matches, history.matches)
     assert again.true_params == history.true_params
-    # only the moves, no swaps: girone A loses two teams (Juventus Next Gen, Carpi) and gains Inter U23, so one
-    # historical club fills it; girone C gains two and loses one, so one current team is dropped
+    # only the moves, no swaps: girone A loses Juventus Next Gen and Carpi but gains Inter U23 and Vicenza (balanced);
+    # girone B loses five (Atalanta U23, Latina, Pescara, Reggiana, Spezia) and gains four, so one historical club
+    # fills it; girone C loses Bari and Inter U23, gains three, so one current team is dropped; Serie B loses the four
+    # promoted clubs and the three Serie A clubs of 2025/26, gains the four relegated ones, so three fills
     moves_only = simulate_history(seed=1, seasons=("2025/26",), swap_per_girone=0)
     comp = moves_only.season_registries["2025/26"]
     extra_hist = set(comp.canonical_names) - set(registry.canonical_names)
-    assert len(extra_hist) == 1 and extra_hist <= set(HISTORICAL_TEAMS) and comp.girone_of(next(iter(extra_hist))) is Girone.A
+    assert len(extra_hist) == 4 and extra_hist <= set(HISTORICAL_TEAMS)
+    assert sorted(comp.girone_of(t).value for t in extra_hist) == ["B", "SB", "SB", "SB"]
     assert comp.girone_of("Inter U23") is Girone.A and all(len(comp.teams(g)) == 20 for g in Girone)
-    assert len(set(registry.teams("C")) - set(comp.teams("C"))) == 2  # Inter U23 (moved to A) + one dropped
+    assert set(registry.teams("A")) - set(comp.teams("A")) == {"Carpi", "Juventus Next Gen"}
+    assert len(set(registry.teams("C")) - set(comp.teams("C"))) == 3  # Bari + Inter U23 (moved) + one dropped
+    assert set(registry.teams("SB")) - set(comp.teams("SB")) == {"Arezzo", "Ascoli", "Benevento", "Vicenza", "Cremonese", "Pisa", "Hellas Verona"}
 
 
 def test_mini_dataset_uses_current_teams() -> None:
@@ -215,7 +243,7 @@ def test_mini_dataset_uses_current_teams() -> None:
 def test_fit_with_registry_assigns_current_teams_to_registry_girone(fit, registry: TeamRegistry) -> None:
     engine, params = fit
     assert params.converged
-    assert set(params.current_teams) == set(registry.canonical_names) and len(params.historical_teams) >= 9
+    assert set(params.current_teams) == set(registry.canonical_names) and len(params.historical_teams) >= 12
     assert not set(params.historical_teams) & set(registry.canonical_names)
     for team, girone in MOVED.items():
         assert params.girone_of(team) is girone, team
@@ -225,8 +253,9 @@ def test_fit_with_registry_assigns_current_teams_to_registry_girone(fit, registr
     assert not params.is_current("Nowhere FC")
     # the ranking lists only the perimeter, in the registry girone
     table = engine.ranking()
-    assert len(table) == 60 and not set(table["team"]) & set(params.historical_teams)
+    assert len(table) == 80 and not set(table["team"]) & set(params.historical_teams)
     assert table.loc[table["team"] == "Inter U23", "girone"].item() == "C"
+    assert table.loc[table["team"] == "Pescara", "girone"].item() == "B" and table.loc[table["team"] == "Vicenza", "girone"].item() == "SB"
     assert table.loc[table["team"] == "Atalanta U23", "girone"].item() == "B"
     assert table.loc[table["team"] == "Juventus Next Gen", "girone"].item() == "A"
     for g in Girone:
@@ -254,7 +283,8 @@ def test_registry_fit_recovers_current_strengths(fit, current) -> None:
 def test_predictions_work_for_current_fixtures_and_history_only_sharpens(fit, current, all_matches, registry) -> None:
     engine, params = fit
     preds = engine.predict_fixtures(current.fixtures)
-    assert len(preds) == 30 and all(p.matrix.sum() == pytest.approx(1.0) for p in preds)
+    assert len(preds) == 40 and all(p.matrix.sum() == pytest.approx(1.0) for p in preds)
+    assert sum(1 for p in preds if p.fixture.girone is Girone.SB) == 10
     assert all(params.is_current(p.fixture.home_team) and params.is_current(p.fixture.away_team) for p in preds)
     # the engine itself can still price any fitted team (the perimeter filter lives in the callers)
     historical = params.historical_teams[0]
@@ -301,17 +331,21 @@ def test_build_team_index_with_registry_and_without(all_matches, registry: TeamR
     # a current team whose only matches were played in another girone still goes to its registry girone ...
     only_hist = df.loc[df["date"] < pd.Timestamp("2026-07-01")].reset_index(drop=True)
     assert build_team_index(only_hist, registry=registry).girone_of("Inter U23") is Girone.C
-    # ... unless its registry girone has no match at all: that home advantage cannot be estimated
+    # ... and when its registry girone has no match at all (girone C not harvested) that home advantage cannot be
+    # estimated: the team keeps its registry girone but joins, for the constraint only, the girone it played in
     no_c = only_hist.loc[only_hist["girone"] != "C"].reset_index(drop=True)
-    with pytest.raises(ValueError, match="no match was played"):
-        build_team_index(no_c, registry=registry)
+    with caplog.at_level(logging.WARNING, logger="src.engine.model"):
+        fallback = build_team_index(no_c, registry=registry)
+    assert Girone.C not in fallback.gironi and fallback.girone_of("Inter U23") is Girone.C and fallback.is_current("Inter U23")
+    assert fallback.constraint_girone_of("Inter U23") is Girone.A and Girone.C not in fallback.constraint_groups()
+    assert any("registry gironi with current teams but no matches" in rec.getMessage() for rec in caplog.records)
 
 
 # ----------------------------------------------------------------------------- coverage rule
 def test_prior_rule_counts_current_season_matches_of_current_teams_only(all_matches, current, registry) -> None:
     label = registry.season_label
     cur, hist = split_by_season(all_matches, label)
-    assert len(cur) == len(current.matches) == 330 and len(hist) == 2280
+    assert len(cur) == len(current.matches) == 440 and len(hist) == 3040
     assert perimeter_matches(all_matches, registry=registry, season=label).equals(cur)
     # without the perimeter arguments the legacy rule sees three seasons (43+ per team)
     assert matches_per_team(all_matches) > 40 and not prior_recommended(all_matches)
@@ -328,7 +362,7 @@ def test_prior_rule_counts_current_season_matches_of_current_teams_only(all_matc
 def test_main_mini_and_full_print_the_perimeter_banner(capsys: pytest.CaptureFixture[str]) -> None:
     out = pipeline.main(["--mode", "mini", "--no-export", "--log-level", "ERROR"])
     console = capsys.readouterr().out
-    assert "Perimetro: Serie C 2026/27 (14 squadre) · stagione corrente: 20 partite · storico: 108 partite 2024/25-2025/26" in console
+    assert "Perimetro: Serie C 2026/27 Gironi A/B/C (14 squadre) · stagione corrente: 20 partite · storico: 108 partite 2024/25-2025/26" in console
     assert out.season_label == "2026/27" and out.registry is not None and out.registry.season_label == "2026/27"
     assert len(out.current_matches) == 20 and len(out.history_matches) == 108 and len(out.matches) == 128 == out.params.n_matches
     assert out.params.historical_teams and not set(out.params.historical_teams) & set(out.registry.canonical_names)
@@ -347,17 +381,19 @@ def test_main_mini_and_full_print_the_perimeter_banner(capsys: pytest.CaptureFix
 
     full = pipeline.main(["--mode", "full", "--no-export", "--log-level", "ERROR", "--seed", "3", "--history", "1", "--as-of", "2026-11-06"])
     console = capsys.readouterr().out
-    assert "Perimetro: Serie C 2026/27 (60 squadre) · stagione corrente: 330 partite · storico: 1140 partite 2025/26" in console
+    assert "Perimetro: Serie C 2026/27 Gironi A/B/C + Serie B (80 squadre) · stagione corrente: 440 partite · storico: 1520 partite 2025/26" in console
     assert "Calendario simulato al 2026-11-06: giornate con data precedente giocate (11), la prima giornata in data uguale o successiva (2026-11-08)" in console
-    assert full.recovery is not None and set(full.recovery["n_teams"]) == {20}
-    assert (full.recovery["corr_alpha"] > 0.85).all()
+    assert full.recovery is not None and set(full.recovery["n_teams"]) == {20} and len(full.recovery) == 4
+    assert full.recovery["competizione"].tolist() == ["Girone A", "Girone B", "Girone C", "Serie B"]
+    assert (full.recovery["corr_alpha"] > 0.75).all()  # 11 rounds + one synthetic season: a thin sample
     assert full.params.girone_of("Inter U23") is Girone.C and full.params.girone_of("Atalanta U23") is Girone.B
+    assert full.params.girone_of("Pescara") is Girone.B and full.params.girone_of("Vicenza") is Girone.SB
     assert "RECUPERO DEI PARAMETRI VERI DEL SIMULATORE (squadre 2026/27)" in console
-    assert {p.fixture.date for p in full.predictions} == {date(2026, 11, 8)} and len(full.predictions) == 30
+    assert {p.fixture.date for p in full.predictions} == {date(2026, 11, 8)} and len(full.predictions) == 40
 
     fixed = pipeline.main(["--mode", "full", "--no-export", "--log-level", "ERROR", "--seed", "3", "--history", "1", "--rounds", "30"])
     console = capsys.readouterr().out
-    assert "Perimetro: Serie C 2026/27 (60 squadre) · stagione corrente: 900 partite · storico: 1140 partite 2025/26" in console
+    assert "Perimetro: Serie C 2026/27 Gironi A/B/C + Serie B (80 squadre) · stagione corrente: 1200 partite · storico: 1520 partite 2025/26" in console
     assert "30 giornate giocate (--rounds)" in console and fixed.recovery is not None and (fixed.recovery["corr_alpha"] > 0.85).all()
 
     with pytest.raises(SystemExit) as exc:
@@ -374,13 +410,13 @@ def test_main_real_data_skips_fixtures_outside_the_perimeter(tmp_path: Path, his
     save_fixtures([*current.fixtures, extra], fixtures)
     out = pipeline.main(["--processed", str(processed), "--fixtures", str(fixtures), "--no-export", "--log-level", "ERROR"])
     console = capsys.readouterr().out
-    assert len(out.matches) == 2610 and len(out.current_matches) == 330 and len(out.history_matches) == 2280
-    assert len(out.fixtures) == 31 and len(out.predictions) == 30
+    assert len(out.matches) == 3480 and len(out.current_matches) == 440 and len(out.history_matches) == 3040
+    assert len(out.fixtures) == 41 and len(out.predictions) == 40
     assert out.skipped_fixtures == [extra.label]
     assert f"partita saltata, squadra fuori dal perimetro 2026/27 ({historical})" in console
     assert any("fuori dal perimetro 2026/27" in n for n in out.notes)
     assert out.params.xi == pytest.approx(0.0018) and historical in out.params.historical_teams
-    assert "Perimetro: Serie C 2026/27 (60 squadre) · stagione corrente: 330 partite · storico: 2280 partite 2024/25-2025/26" in console
+    assert "Perimetro: Serie C 2026/27 Gironi A/B/C + Serie B (80 squadre) · stagione corrente: 440 partite · storico: 3040 partite 2024/25-2025/26" in console
 
 
 # ----------------------------------------------------------------------------- dashboard data layer
@@ -392,42 +428,43 @@ def sim_state():
 def test_build_state_simulated_uses_the_2026_27_perimeter(sim_state) -> None:
     state = sim_state
     assert state.source == "simulated" and state.season_label == "2026/27"
-    assert state.registry is not None and state.registry.n_teams == 60
-    assert state.n_current_matches == 330 and state.n_history_matches == 2280 and state.n_matches == 2610
+    assert state.registry is not None and state.registry.n_teams == 80
+    assert state.n_current_matches == 440 and state.n_history_matches == 3040 and state.n_matches == 3480
     assert state.history_label == "2024/25-2025/26"
-    assert state.perimeter_text == "Stagione 2026/27 · 60 squadre · 330 partite stagione corrente · 2280 partite storiche (2024/25-2025/26)"
-    assert state.n_current_teams == 60 and state.n_historical_teams >= 9
+    assert state.perimeter_text == "Perimetro: Serie C 2026/27 Gironi A/B/C + Serie B (80 squadre) · 440 partite stagione corrente · 3040 partite storiche (2024/25-2025/26)"
+    assert state.n_current_teams == 80 and state.n_historical_teams >= 12
     historical = set(state.params.historical_teams)
-    assert len(state.fixtures) == 30 == len(state.predictions) and state.skipped_fixtures == []
+    assert len(state.fixtures) == 40 == len(state.predictions) and state.skipped_fixtures == []
     assert {p.fixture.date for p in state.predictions} == {date(2026, 11, 8)}
     assert not any(t in historical for p in fixtures_for(state, None) for t in (p.fixture.home_team, p.fixture.away_team))
     teams_in_value = set(value_table(state, -1.0)["Partita"].str.split(" - ").explode())
     assert teams_in_value and not teams_in_value & historical
     assert not set(traps_table(state)["Squadra"]) & historical and state.traps
     ranking = ranking_table(state, None)
-    assert len(ranking) == 60 and not set(ranking["Squadra"]) & historical
-    assert ranking.loc[ranking["Squadra"] == "Inter U23", "Girone"].item() == "C"
-    assert ranking.loc[ranking["Squadra"] == "Juventus Next Gen", "Girone"].item() == "A"
+    assert len(ranking) == 80 and not set(ranking["Squadra"]) & historical
+    assert ranking.loc[ranking["Squadra"] == "Inter U23", "Competizione"].item() == "Girone C"
+    assert ranking.loc[ranking["Squadra"] == "Juventus Next Gen", "Competizione"].item() == "Girone A"
+    assert ranking.loc[ranking["Squadra"] == "Vicenza", "Competizione"].item() == "Serie B"
     assert state.prior_enabled, "11 current-season rounds are below the 15-per-team threshold, history does not count"
     joined = "\n".join(state.notes)
     assert "Calendario simulato al 2026-11-06" in joined and "11 giornate giocate" in joined
-    assert "Storico simulato: 2280 partite delle stagioni 2024/25, 2025/26" in joined
-    assert "Perimetro: Serie C 2026/27, 60 squadre nel dizionario, 60 con partite" in joined
+    assert "Storico simulato: 3040 partite delle stagioni 2024/25, 2025/26" in joined
+    assert "Perimetro: Serie C 2026/27 Gironi A/B/C + Serie B (80 squadre), 80 squadre con partite nei dati" in joined
 
 
 def test_build_state_history_options_and_validation() -> None:
     none = build_state(simulate=True, seed=7, xi=0.0, as_of=TODAY, history_seasons=0)
-    assert none.n_history_matches == 0 and none.params.historical_teams == () and none.n_matches == 330
-    assert none.perimeter_text == "Stagione 2026/27 · 60 squadre · 330 partite stagione corrente · 0 partite storiche"
+    assert none.n_history_matches == 0 and none.params.historical_teams == () and none.n_matches == 440
+    assert none.perimeter_text == "Perimetro: Serie C 2026/27 Gironi A/B/C + Serie B (80 squadre) · 440 partite stagione corrente · 0 partite storiche"
     one = build_state(simulate=True, seed=7, xi=0.0, as_of=TODAY, history_seasons=1)
-    assert one.n_history_matches == 1140 and one.history_label == "2025/26"
+    assert one.n_history_matches == 1520 and one.history_label == "2025/26"
     with pytest.raises(ValueError, match="history_seasons"):
         build_state(simulate=True, seed=7, xi=0.0, history_seasons=MAX_HISTORY_SEASONS + 1)
     # before the kick-off one round is simulated anyway; after the end the last round stays as fixtures
     early = build_state(simulate=True, seed=7, xi=0.0, as_of=date(2026, 8, 1), history_seasons=0)
-    assert early.n_current_matches == 30 and len(early.fixtures) == 30 and any("non è ancora iniziata" in n for n in early.notes)
+    assert early.n_current_matches == 40 and len(early.fixtures) == 40 and any("non è ancora iniziata" in n for n in early.notes)
     late = build_state(simulate=True, seed=7, xi=0.0, as_of=date(2027, 7, 1), history_seasons=0)
-    assert late.n_current_matches == 37 * 30 and len(late.fixtures) == 30 and any("è conclusa" in n for n in late.notes)
+    assert late.n_current_matches == 37 * 40 and len(late.fixtures) == 40 and any("è conclusa" in n for n in late.notes)
 
 
 def test_build_state_processed_three_seasons(tmp_path: Path, history, current) -> None:
@@ -439,16 +476,17 @@ def test_build_state_processed_three_seasons(tmp_path: Path, history, current) -
     save_fixtures([*current.fixtures, extra], processed / "fixtures.csv")
     state = build_state(processed_dir=processed, odds_dir=tmp_path / "odds", xi=0.0)
     assert state.source == "processed" and state.season_label == "2026/27"
-    assert state.n_current_matches == 330 and state.n_history_matches == 2280
-    assert len(state.fixtures) == 31 and len(state.predictions) == 30 and state.skipped_fixtures == [extra.label]
+    assert state.n_current_matches == 440 and state.n_history_matches == 3040
+    assert len(state.fixtures) == 41 and len(state.predictions) == 40 and state.skipped_fixtures == [extra.label]
     assert any("fuori dal perimetro 2026/27" in n for n in state.notes)
     assert historical in state.params.historical_teams and state.prior_enabled
     # the registry season can be changed: with 2025/26 the current season is the middle one
     old = build_state(processed_dir=processed, odds_dir=tmp_path / "odds", xi=0.0, season="2025_26")
-    assert old.season_label == "2025/26" and old.n_current_matches == 1140 and old.n_history_matches == 1470
-    assert old.registry is not None and old.registry.n_teams == 60 and "Vicenza" in old.params.current_teams
+    assert old.season_label == "2025/26" and old.n_current_matches == 1520 and old.n_history_matches == 1960
+    assert old.registry is not None and old.registry.n_teams == 80 and "Vicenza" in old.params.current_teams
+    assert old.params.girone_of("Vicenza") is Girone.A and old.params.girone_of("Pescara") is Girone.SB  # 2025/26 competitions
     # the fixtures are dated November 2026: for a 2025/26 perimeter they belong to another season and are all skipped
-    assert old.predictions == [] and len(old.skipped_fixtures) == 31
+    assert old.predictions == [] and len(old.skipped_fixtures) == 41
     assert any("partita di una stagione successiva (2026/27), fuori dal perimetro 2025/26" in n for n in old.notes)
     # 2026/27 newcomers (Desenzano, Spezia, Bari, ...) are historical for that perimeter
     assert "Desenzano" in old.params.historical_teams and old.params.girone_of("Inter U23") is Girone.A
@@ -515,18 +553,20 @@ def test_historical_pool_is_size_safe(caplog: pytest.LogCaptureFixture, registry
     with caplog.at_level(logging.WARNING, logger="src.simulation.generator"):
         history = simulate_history(seed=7, registry=old)
     assert any("historical pool exhausted" in rec.getMessage() for rec in caplog.records)
-    assert len(history.matches) == 2 * 3 * 380
+    assert len(history.matches) == 2 * 4 * 380
     for label, comp in history.season_registries.items():
         assert all(len(comp.teams(g)) == 20 for g in Girone), label
         extra = set(comp.canonical_names) - set(old.canonical_names)
-        assert len(extra) >= 9 and not extra & set(old.canonical_names)
+        assert len(extra) >= 12 and not extra & set(old.canonical_names)
     synthetic = {t for t in history.teams if t.startswith(SYNTHETIC_HISTORICAL_PREFIX)}
-    assert synthetic == {"Storica 1", "Storica 2"}
+    assert synthetic == {f"Storica {i:02d}" for i in range(1, 7)}  # 8 real names left for 4 competitions x 3 swaps + fills
+    # zero-padded on purpose: normalize_name drops single-character tokens, so 'Storica 1'/'Storica 2' would collide
+    assert len({normalize_name(t) for t in synthetic}) == len(synthetic) == 6
     # every team that plays has true strengths (the extra names draw from the same distribution)
     assert set(history.teams) <= set(history.true_params.alpha) and set(history.teams) <= set(history.true_params.beta)
-    # the eight real names left are used before any synthetic one
+    # the eight real names left (15 of the 23 play in the 2025/26 perimeter) are used before any synthetic one
     real_left = set(HISTORICAL_TEAMS) - set(old.canonical_names)
-    assert real_left <= set(history.teams)
+    assert len(real_left) == 8 and real_left <= set(history.teams)
     # without swaps the moves alone fit in the real pool: no synthetic club
     moves_only = simulate_history(seed=7, registry=old, swap_per_girone=0)
     assert not any(t.startswith(SYNTHETIC_HISTORICAL_PREFIX) for t in moves_only.teams)
@@ -547,31 +587,32 @@ def test_non_default_season_runs_end_to_end_and_is_consistent(capsys: pytest.Cap
     """Findings 1 + 3 on every surface: ``--season 2025_26`` neither crashes nor swaps current and history."""
     mini = pipeline.main(["--mode", "mini", "--no-export", "--log-level", "ERROR", "--season", "2025_26"])
     console = capsys.readouterr().out
-    assert "Perimetro: Serie C 2025/26 (14 squadre) · stagione corrente: 20 partite · storico: 108 partite 2023/24-2024/25" in console
+    assert "Perimetro: Serie C 2025/26 Gironi A/B/C (14 squadre) · stagione corrente: 20 partite · storico: 108 partite 2023/24-2024/25" in console
     assert "Demo mini: istantanea fissa di inizio stagione 2025/26 (giornate 1-3 giocate, 20 partite; turno da prevedere: 4ª giornata del 2025-09-14)" in console
     assert set(mini.current_matches["date"].map(season_of)) == {"2025/26"} and {p.fixture.date for p in mini.predictions} == {date(2025, 9, 14)}
     assert set(mini.history_matches["date"].map(season_of)) == {"2023/24", "2024/25"}
 
     full = pipeline.main(["--mode", "full", "--no-export", "--log-level", "ERROR", "--season", "2025_26", "--as-of", "2025-11-06", "--history", "1"])
     console = capsys.readouterr().out
-    assert "Perimetro: Serie C 2025/26 (60 squadre) · stagione corrente: 330 partite · storico: 1140 partite 2024/25" in console
+    assert "Perimetro: Serie C 2025/26 Gironi A/B/C + Serie B (80 squadre) · stagione corrente: 440 partite · storico: 1520 partite 2024/25" in console
     assert "Calendario simulato al 2025-11-06: giornate con data precedente giocate (11), la prima giornata in data uguale o successiva (2025-11-09)" in console
     assert full.registry is not None and full.registry.season_label == "2025/26" and "Vicenza" in full.params.current_teams
     assert full.params.girone_of("Atalanta U23") is Girone.C and full.params.girone_of("Juventus Next Gen") is Girone.B  # 2025/26 gironi
+    assert full.params.girone_of("Pescara") is Girone.SB and full.params.girone_of("Vicenza") is Girone.A  # 2025/26 divisions
     assert any(t.startswith(SYNTHETIC_HISTORICAL_PREFIX) for t in full.params.historical_teams)
-    assert len(full.predictions) == 30 and {p.fixture.date for p in full.predictions} == {date(2025, 11, 9)} and full.skipped_fixtures == []
+    assert len(full.predictions) == 40 and {p.fixture.date for p in full.predictions} == {date(2025, 11, 9)} and full.skipped_fixtures == []
     assert full.params.penalty > 0.0, "11 current-season rounds: the prior is on, the history does not count as coverage"
 
     state = build_state(simulate=True, seed=7, xi=0.0, as_of=date(2025, 11, 6), season="2025_26")
-    assert state.season_label == "2025/26" and state.registry is not None and state.registry.n_teams == 60
-    assert state.n_current_matches == 330 and state.n_history_matches == 2280 and state.history_label == "2023/24-2024/25"
-    assert state.perimeter_text == "Stagione 2025/26 · 60 squadre · 330 partite stagione corrente · 2280 partite storiche (2023/24-2024/25)"
-    assert len(state.predictions) == 30 and {p.fixture.date for p in state.predictions} == {date(2025, 11, 9)} and state.skipped_fixtures == []
+    assert state.season_label == "2025/26" and state.registry is not None and state.registry.n_teams == 80
+    assert state.n_current_matches == 440 and state.n_history_matches == 3040 and state.history_label == "2023/24-2024/25"
+    assert state.perimeter_text == "Perimetro: Serie C 2025/26 Gironi A/B/C + Serie B (80 squadre) · 440 partite stagione corrente · 3040 partite storiche (2023/24-2024/25)"
+    assert len(state.predictions) == 40 and {p.fixture.date for p in state.predictions} == {date(2025, 11, 9)} and state.skipped_fixtures == []
     assert state.prior_enabled and not set(ranking_table(state, None)["Squadra"]) & set(state.params.historical_teams)
     assert any("Calendario simulato al 2025-11-06" in n for n in state.notes)
     # as of today the 2025/26 season is over: the last round is kept as fixtures, dated in that season
     over = build_state(simulate=True, seed=7, xi=0.0, as_of=TODAY, season="2025_26", history_seasons=0)
-    assert over.n_current_matches == 37 * 30 and {p.fixture.date for p in over.predictions} == {date(2026, 5, 10)}
+    assert over.n_current_matches == 37 * 40 and {p.fixture.date for p in over.predictions} == {date(2026, 5, 10)}
     assert any("la stagione 2025/26 è conclusa" in n for n in over.notes)
 
 
@@ -581,7 +622,7 @@ def test_stale_fixtures_of_last_season_are_never_predicted(tmp_path: Path, capsy
     panel. Fixtures dated in another season are skipped on both surfaces."""
     old = load_registry("2025_26")
     league = simulate_league(seed=5, registry=old, n_rounds=37, start_date=season_start_date("2025/26"))
-    assert {fx.date for fx in league.fixtures} == {date(2026, 5, 10)} and len(league.fixtures) == 30
+    assert {fx.date for fx in league.fixtures} == {date(2026, 5, 10)} and len(league.fixtures) == 40
     processed = tmp_path / "processed"
     save_processed(league.matches, processed / "matches.csv")
     # one current-season fixture between current teams among the stale ones: it is the only one predicted
@@ -590,18 +631,18 @@ def test_stale_fixtures_of_last_season_are_never_predicted(tmp_path: Path, capsy
     save_fixtures([*league.fixtures, fresh], processed / "fixtures.csv")
 
     state = build_state(processed_dir=processed, odds_dir=tmp_path / "odds", xi=0.0)
-    assert state.season_label == "2026/27" and state.n_current_matches == 0 and state.n_history_matches == 1110
+    assert state.season_label == "2026/27" and state.n_current_matches == 0 and state.n_history_matches == 1480
     assert [p.fixture.match_id for p in state.predictions] == ["FRESH-1"]
-    assert len(state.skipped_fixtures) == 30 and set(state.skipped_fixtures) == {fx.label for fx in league.fixtures}
-    assert any("30 partite in programma saltate (partita di una stagione precedente (2025/26), fuori dal perimetro 2026/27)" in n for n in state.notes)
+    assert len(state.skipped_fixtures) == 40 and set(state.skipped_fixtures) == {fx.label for fx in league.fixtures}
+    assert any("40 partite in programma saltate (partita di una stagione precedente (2025/26), fuori dal perimetro 2026/27)" in n for n in state.notes)
     assert value_table(state, -1.0).empty and all(p.fixture.date >= date(2026, 7, 1) for p in fixtures_for(state, None))
 
     out = pipeline.main(["--processed", str(processed / "matches.csv"), "--fixtures", str(processed / "fixtures.csv"), "--no-export", "--log-level", "ERROR"])
     console = capsys.readouterr().out
-    assert [p.fixture.match_id for p in out.predictions] == ["FRESH-1"] and len(out.skipped_fixtures) == 30
+    assert [p.fixture.match_id for p in out.predictions] == ["FRESH-1"] and len(out.skipped_fixtures) == 40
     assert "partita saltata, partita di una stagione precedente (2025/26), fuori dal perimetro 2026/27" in console
-    assert any(n.startswith("30 partite in programma saltate (partite di un'altra stagione, non della 2026/27)") for n in out.notes)
-    assert "Perimetro: Serie C 2026/27 (60 squadre) · stagione corrente: 0 partite · storico: 1110 partite 2025/26" in console
+    assert any(n.startswith("40 partite in programma saltate (partite di un'altra stagione, non della 2026/27)") for n in out.notes)
+    assert "Perimetro: Serie C 2026/27 Gironi A/B/C + Serie B (80 squadre) · stagione corrente: 0 partite · storico: 1480 partite 2025/26" in console
     assert other_season_reason("2025/26", "2026/27") == "partita di una stagione precedente (2025/26), fuori dal perimetro 2026/27"
     assert other_season_reason("2027/28", "2026/27").startswith("partita di una stagione successiva (2027/28)")
 
@@ -611,16 +652,16 @@ def test_main_full_mode_follows_the_calendar(capsys: pytest.CaptureFixture[str])
     its round 4 of September is a fixed snapshot."""
     early = pipeline.main(["--mode", "full", "--no-export", "--log-level", "ERROR", "--history", "0", "--as-of", "2026-08-01"])
     console = capsys.readouterr().out
-    assert len(early.current_matches) == 30 and {p.fixture.date for p in early.predictions} == {date(2026, 8, 30)}
+    assert len(early.current_matches) == 40 and {p.fixture.date for p in early.predictions} == {date(2026, 8, 30)}
     assert "Calendario simulato al 2026-08-01: la stagione 2026/27 non è ancora iniziata; simulo comunque 1 giornata" in console
     assert "1 giornate giocate al 2026-08-01" in console
     late = pipeline.main(["--mode", "full", "--no-export", "--log-level", "ERROR", "--history", "0", "--as-of", "2027-07-01"])
     console = capsys.readouterr().out
-    assert len(late.current_matches) == 37 * 30 and {p.fixture.date for p in late.predictions} == {date(2027, 5, 9)}
+    assert len(late.current_matches) == 37 * 40 and {p.fixture.date for p in late.predictions} == {date(2027, 5, 9)}
     assert "la stagione 2026/27 è conclusa; tengo l'ultima giornata come partite in programma (37 giornate giocate)" in console
     clamped = pipeline.main(["--mode", "full", "--no-export", "--log-level", "ERROR", "--history", "0", "--rounds", "50"])
     console = capsys.readouterr().out
-    assert len(clamped.current_matches) == 37 * 30 and "valore limitato a 37" in console and len(clamped.predictions) == 30
+    assert len(clamped.current_matches) == 37 * 40 and "valore limitato a 37" in console and len(clamped.predictions) == 40
     assert any("limitato a 37" in n for n in clamped.notes)
     # invalid values are CLI errors, not tracebacks
     for bad in (["--rounds", "0"], ["--as-of", "yesterday"]):
@@ -632,7 +673,7 @@ def test_main_full_mode_follows_the_calendar(capsys: pytest.CaptureFixture[str])
     reg = load_registry()
     notes: list[str] = []
     league, played = simulate_current_season(7, reg, as_of=TODAY, notes=notes)
-    assert played == 11 and len(league.matches) == 330 and {fx.date for fx in league.fixtures} == {date(2026, 11, 8)}
+    assert played == 11 and len(league.matches) == 440 and {fx.date for fx in league.fixtures} == {date(2026, 11, 8)}
     assert notes == ["Calendario simulato al 2026-11-06: giornate con data precedente giocate (11), la prima giornata in data uguale o successiva (2026-11-08) è il turno da prevedere."]
     fixed, played = simulate_current_season(7, reg, n_rounds=50, as_of=TODAY, notes=notes)
-    assert played == 37 and len(fixed.fixtures) == 30 and "limitato a 37" in notes[-1]
+    assert played == 37 and len(fixed.fixtures) == 40 and "limitato a 37" in notes[-1]

@@ -10,8 +10,11 @@ Environment variables
     Always use the synthetic league, even when ``data/processed/matches.csv`` exists.
 ``SERIEC_SEASON`` (default ``2026_27``)
     Registry season (``config/teams_<season>.json``): the perimeter of teams that
-    are ranked, predicted and priced. Older seasons in the data are history only;
-    the simulated league of another season runs on that season's calendar.
+    are ranked, predicted and priced, in every competition the file holds (the
+    three Serie C gironi and Serie B; the competition selector, the tables and
+    the perimeter banner follow ``config/competitions.toml``). Older seasons in
+    the data are history only; the simulated league of another season runs on
+    that season's calendar.
 ``SERIEC_HISTORY`` (int 0-2, default 2)
     Synthetic seasons before the registry season (2024/25 and 2025/26 for
     2026/27) prepended to the simulated league.
@@ -57,6 +60,7 @@ import streamlit as st
 
 st.set_page_config(page_title="Serie C Quant Lab", page_icon="⚽", layout="wide")
 
+from src.common.competitions import describe_competitions
 from src.common.logging_config import get_logger
 from src.common.schemas import Girone, Market, MatchPrediction
 from src.common.teams import DEFAULT_SEASON, list_seasons, season_file_stem
@@ -83,7 +87,11 @@ from src.dashboard.state import (
 
 log = get_logger(__name__)
 
-GIRONE_OPTIONS: Final[tuple[str, ...]] = ("Tutti", "A", "B", "C")
+#: Competition selector: *Tutti* plus the short label of every configured competition
+#: (``'Girone A'``, ``'Girone B'``, ``'Girone C'``, ``'Serie B'`` with the shipped ``config/competitions.toml``).
+GIRONE_OPTIONS: Final[tuple[str, ...]] = ("Tutti", *(g.short for g in Girone))
+#: Competitions named in the sidebar caption, e.g. ``'Serie C Gironi A/B/C + Serie B'``.
+COMPETITIONS_TEXT: Final[str] = describe_competitions()
 KELLY_OPTIONS: Final[dict[str, float]] = {"1/8": 0.125, "1/4": 0.25}
 #: Played rounds the dashboard simulated before the calendar-anchored league; kept for compatibility,
 #: the default is now ``None`` (rounds derived from ``SERIEC_AS_OF``/today).
@@ -218,7 +226,7 @@ def load_state(
 
 
 def selected_girone(label: str) -> Girone | None:
-    """Map the sidebar label to a :class:`Girone` (``None`` for *Tutti*)."""
+    """Map the sidebar label (``'Girone A'``, ``'Serie B'``, or a bare code) to a :class:`Girone`; ``None`` for *Tutti*."""
     return None if label == "Tutti" else Girone.parse(label)
 
 
@@ -229,8 +237,8 @@ def render_sidebar() -> tuple[Girone | None, float, float, float]:
     """Controls; returns ``(girone, min_ev_fraction, kelly_fraction, bankroll_units)``."""
     with st.sidebar:
         st.title("⚽ Serie C Quant Lab")
-        st.caption("Modello Dixon-Coles per i Gironi A/B/C e ricerca di valore atteso (+EV) contro le quote dei bookmaker.")
-        girone_label = st.selectbox("Girone", GIRONE_OPTIONS, index=0, key="girone", help="Filtra classifica, partite e opportunità.")
+        st.caption(f"Modello Dixon-Coles per {COMPETITIONS_TEXT} e ricerca di valore atteso (+EV) contro le quote dei bookmaker.")
+        girone_label = st.selectbox("Competizione", GIRONE_OPTIONS, index=0, key="girone", help="Filtra classifica, partite e opportunità per competizione (girone di Serie C o Serie B).")
         ev_pct = st.slider("Soglia EV minima (%)", min_value=0.0, max_value=15.0, value=3.5, step=0.5, key="min_ev_pct", help="Una selezione è di valore quando P_modello × Quota − 1 supera questa soglia.")
         kelly_label = st.radio("Frazione di Kelly", list(KELLY_OPTIONS), index=0, horizontal=True, key="kelly", help="Quota del Kelly pieno da puntare.")
         bankroll = st.number_input("Bankroll (unità)", min_value=1.0, max_value=1_000_000.0, value=100.0, step=10.0, key="bankroll", help="100 unità = ogni unità vale l'1% del bankroll.")
@@ -251,6 +259,10 @@ def render_source_badge(container: st.delta_generator.DeltaGenerator, state: Pip
         f"Convergenza: {'sì' if params.converged else 'no'} · {params.fit_seconds:.2f} s  \n"
         f"Prior gaussiana: {'attiva' if state.prior_enabled else 'disattivata'}"
     )
+    if state.coverage is not None:
+        body += f"  \nCopertura {state.season_label}: {state.coverage.thinnest:.1f} partite per squadra nella competizione meno coperta"
+        if state.coverage.ignored:
+            body += f" · {state.coverage.describe_ignored()}"
     if state.source == "processed":
         container.success(f"**Dati reali** (data/processed)  \n{body}", icon="✅")
     else:
@@ -263,13 +275,14 @@ def render_source_badge(container: st.delta_generator.DeltaGenerator, state: Pip
 def render_ranking_tab(state: PipelineState, girone: Girone | None) -> None:
     st.subheader("Classifica di forza (parametri Dixon-Coles)")
     st.caption(
-        "α = forza offensiva, β = solidità difensiva (più alto = subisce meno), γ = vantaggio casa del girone; indici = exp(parametro). "
-        f"Solo le squadre della Serie C {state.season_label} nel girone del dizionario corrente; le squadre delle stagioni passate "
-        f"({state.n_historical_teams}) entrano nella stima solo come avversarie."
+        "α = forza offensiva, β = solidità difensiva (più alto = subisce meno), γ = vantaggio casa della competizione; indici = exp(parametro). "
+        f"Solo le squadre del perimetro {state.season_label} ({state.perimeter_label}) nella competizione del dizionario corrente; "
+        f"le squadre delle stagioni passate ({state.n_historical_teams}) entrano nella stima solo come avversarie. "
+        "α e β sono centrati per competizione: confronta le squadre dentro la stessa competizione."
     )
     table = ranking_table(state, girone)
     if table.empty:
-        st.info("Nessuna squadra stimata per il girone selezionato.")
+        st.info("Nessuna squadra stimata per la competizione selezionata.")
         return
     st.dataframe(
         table,
@@ -277,7 +290,7 @@ def render_ranking_tab(state: PipelineState, girone: Girone | None) -> None:
         **FULL_WIDTH["dataframe"],
         column_config={
             "Squadra": st.column_config.TextColumn("Squadra"),
-            "Girone": st.column_config.TextColumn("Girone", width="small"),
+            "Competizione": st.column_config.TextColumn("Competizione", width="small"),
             "Forza Offensiva (α)": st.column_config.NumberColumn("Forza Offensiva (α)", format="%+.3f"),
             "Solidità Difensiva (β)": st.column_config.NumberColumn("Solidità Difensiva (β)", format="%+.3f"),
             "Vantaggio Casa (γ)": st.column_config.NumberColumn("Vantaggio Casa (γ)", format="%+.3f"),
@@ -289,9 +302,9 @@ def render_ranking_tab(state: PipelineState, girone: Girone | None) -> None:
         columns = st.columns(len(state.gironi) or 1)
         for col, g in zip(columns, state.gironi):
             with col:
-                st.plotly_chart(strength_figure(ranking_table(state, g), title=f"Girone {g.value}"), **FULL_WIDTH["plotly_chart"], key=f"strength_{g.value}")
+                st.plotly_chart(strength_figure(ranking_table(state, g), title=g.short), **FULL_WIDTH["plotly_chart"], key=f"strength_{g.value}")
     else:
-        st.plotly_chart(strength_figure(table, title=f"Girone {girone.value}: α e β per squadra"), **FULL_WIDTH["plotly_chart"], key=f"strength_{girone.value}")
+        st.plotly_chart(strength_figure(table, title=f"{girone.short}: α e β per squadra"), **FULL_WIDTH["plotly_chart"], key=f"strength_{girone.value}")
 
 
 def heatmap_goals_control(full_goals: int) -> int:
@@ -328,7 +341,7 @@ def render_match_tab(state: PipelineState, girone: Girone | None) -> None:
     st.subheader("Partita e matrice dei punteggi")
     preds = fixtures_for(state, girone)
     if not preds:
-        message = "Nessuna partita in programma per il girone selezionato."
+        message = "Nessuna partita in programma per la competizione selezionata."
         if state.skipped_fixtures:
             message += (
                 f" {len(state.skipped_fixtures)} partite caricate sono state saltate perché di un'altra stagione o con squadre "
@@ -391,6 +404,8 @@ def render_value_tab(state: PipelineState, girone: Girone | None, min_ev: float)
             **FULL_WIDTH["dataframe"],
             column_config={
                 "Data": st.column_config.DateColumn("Data", format="DD/MM/YYYY"),
+                "Competizione": st.column_config.TextColumn("Competizione", width="small"),
+                "Bookmaker": st.column_config.TextColumn("Bookmaker", help="Fonte della quota (es. FootyStats, SimBook o il book del CSV in data/odds)."),
                 "Quota Book": st.column_config.NumberColumn("Quota Book", format="%.2f"),
                 "Quota Fair": st.column_config.NumberColumn("Quota Fair", format="%.2f"),
                 "P. Modello (%)": st.column_config.NumberColumn("P. Modello (%)", format="%.1f %%"),
@@ -413,6 +428,7 @@ def render_value_tab(state: PipelineState, girone: Girone | None, min_ev: float)
             hide_index=True,
             **FULL_WIDTH["dataframe"],
             column_config={
+                "Competizione": st.column_config.TextColumn("Competizione", width="small"),
                 "xGA": st.column_config.NumberColumn("xGA", format="%.2f"),
                 "Severità": st.column_config.NumberColumn("Severità", format="%+.2f"),
                 "Ultima Gara": st.column_config.DateColumn("Ultima Gara", format="DD/MM/YYYY"),
@@ -508,7 +524,7 @@ def main() -> None:
     render_source_badge(badge, state)
 
     st.title("⚽ Serie C Quant Lab")
-    scope = "tutti i gironi" if girone is None else f"Girone {girone.value}"
+    scope = "tutte le competizioni" if girone is None else girone.short
     st.caption(
         f"{state.perimeter_text} · Dixon-Coles su {state.n_matches} partite · {len(state.predictions)} previsioni · "
         f"soglia EV {min_ev:.1%} · Kelly x{kelly_fraction:g} · bankroll {bankroll:g} unità · vista: {scope}"

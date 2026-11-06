@@ -212,22 +212,24 @@ def test_load_odds_quotes_skips_invalid_groups(tmp_path: Path) -> None:
 def test_ranking_table_labels_and_counts(sim_state: PipelineState) -> None:
     full = ranking_table(sim_state, None)
     assert list(full.columns) == list(RANKING_COLUMNS)
-    # only the 60 current teams are ranked; the historical opponents of the synthetic past seasons are fitted but hidden
-    assert len(full) == len(sim_state.params.current_teams) == 60 < len(sim_state.params.teams)
+    # only the 80 current teams (Serie C A/B/C + Serie B) are ranked; the historical opponents of the synthetic past
+    # seasons are fitted but hidden
+    assert len(full) == len(sim_state.params.current_teams) == 80 < len(sim_state.params.teams)
     assert not set(full["Squadra"]) & set(sim_state.params.historical_teams)
     current_by_girone = sim_state.params.current_teams_by_girone()
     for g in Girone:
         table = ranking_table(sim_state, g)
         assert list(table.columns) == list(RANKING_COLUMNS)
         assert len(table) == len(current_by_girone[g]) == 20
-        assert set(table["Squadra"]) == set(sim_state.registry.teams(g)), "Girone = girone del dizionario 2026/27"
-        assert set(table["Girone"]) == {g.value}
+        assert set(table["Squadra"]) == set(sim_state.registry.teams(g)), "Competizione = competizione del dizionario 2026/27"
+        assert set(table["Competizione"]) == {g.short}  # the short label, not the code
         alphas = table["Forza Offensiva (α)"].to_numpy()
         assert np.all(np.diff(alphas) <= 1e-9), "sorted by alpha descending"
         # rounded to 3 decimals
         for col in RANKING_COLUMNS[2:]:
             assert np.allclose(table[col], table[col].round(3))
-    assert ranking_table(sim_state, "B")["Girone"].eq("B").all()
+    assert ranking_table(sim_state, "B")["Competizione"].eq("Girone B").all()
+    assert ranking_table(sim_state, "Serie B")["Competizione"].eq("Serie B").all() and len(ranking_table(sim_state, Girone.SB)) == 20
 
 
 def test_strength_figure(sim_state: PipelineState) -> None:
@@ -245,7 +247,7 @@ def test_fixtures_for_sorted_and_filtered(sim_state: PipelineState) -> None:
     assert keys == sorted(keys)
     only_a = fixtures_for(sim_state, Girone.A)
     assert only_a and all(p.fixture.girone == Girone.A for p in only_a)
-    assert len(only_a) + len(fixtures_for(sim_state, Girone.B)) + len(fixtures_for(sim_state, Girone.C)) == len(all_preds)
+    assert sum(len(fixtures_for(sim_state, g)) for g in Girone) == len(all_preds) and len(fixtures_for(sim_state, Girone.SB)) == 10
 
 
 def test_value_table_threshold_and_order(sim_state: PipelineState) -> None:
@@ -260,7 +262,8 @@ def test_value_table_threshold_and_order(sim_state: PipelineState) -> None:
     by_girone = value_table(sim_state, 0.035, Girone.B)
     expected_b = sum(1 for o in sim_state.opportunities if o.ev >= 0.035 and o.girone == Girone.B)
     assert len(by_girone) == expected_b > 0, "the girone filter must keep every Girone B value selection"
-    assert set(by_girone["Girone"]) == {"B"}
+    assert set(by_girone["Competizione"]) == {"Girone B"}
+    assert set(value_table(sim_state, 0.035, Girone.SB)["Competizione"]) == {"Serie B"}
     assert len(by_girone) < len(value_table(sim_state, 0.035)), "other gironi are filtered out"
     assert str(table["Data"].dtype).startswith("datetime64")
     flagged = value_table(sim_state, -1.0)
@@ -425,17 +428,22 @@ def test_app_renders_with_apptest(monkeypatch: pytest.MonkeyPatch) -> None:
     assert len(at.get("download_button")) >= 1
     assert any("Dati simulati" in i.value for i in at.sidebar.info)
     # the badge and the subtitle state the perimeter: season, teams, current-season vs historical matches
-    perimeter = "Stagione 2026/27 · 60 squadre · 240 partite stagione corrente · 2280 partite storiche (2024/25-2025/26)"
+    perimeter = "Perimetro: Serie C 2026/27 Gironi A/B/C + Serie B (80 squadre) · 320 partite stagione corrente · 3040 partite storiche (2024/25-2025/26)"
     assert any(perimeter in i.value for i in at.sidebar.info)
     assert any(perimeter in c.value for c in at.caption)
     assert any("squadre storiche escluse" in i.value for i in at.sidebar.info)
     assert at.metric, "the match tab shows the metrics row"
     assert any("EV = P_modello" in c.value for c in at.caption)
 
-    at.selectbox(key="girone").select("A").run()
+    assert at.selectbox(key="girone").options == ["Tutti", "Girone A", "Girone B", "Girone C", "Serie B"]  # from config/competitions.toml
+    at.selectbox(key="girone").select("Girone A").run()
     assert not at.exception, [e.value for e in at.exception]
     assert len(at.selectbox(key="fixture").options) == 10  # Girone A: 20 teams -> 10 fixtures
     assert at.dataframe, "tables are rendered"
+    at.selectbox(key="girone").select("Serie B").run()
+    assert not at.exception, [e.value for e in at.exception]
+    assert len(at.selectbox(key="fixture").options) == 10 and all(o.startswith("[SB]") for o in at.selectbox(key="fixture").options)
+    assert any("vista: Serie B" in c.value for c in at.caption)
 
 
 def free_port() -> int:
@@ -499,9 +507,9 @@ def test_build_state_clamps_full_season_rounds() -> None:
     assert MIN_SIM_ROUNDS == 1
     state = build_state(simulate=True, seed=3, xi=0.0, n_rounds=50)
     assert state.source == "simulated"
-    assert state.n_current_matches == upper * 30  # 3 gironi x 10 matches per round
+    assert state.n_current_matches == upper * 40  # 4 competitions (3 Serie C gironi + Serie B) x 10 matches per round
     assert state.n_matches == state.n_current_matches + state.n_history_matches
-    assert len(state.fixtures) == 30 and len(state.predictions) == 30
+    assert len(state.fixtures) == 40 and len(state.predictions) == 40
     assert state.quotes and state.opportunities, "the synthetic bookmaker still quotes the last round"
     assert state.traps and any(o.is_trap for o in state.opportunities), "the trap is still injected"
     joined = "\n".join(state.notes)
@@ -512,7 +520,7 @@ def test_build_state_clamps_full_season_rounds() -> None:
     assert not any("limitato a" in n for n in plain.notes)
     # the lower bound is valid too: one played round, prior on (history does not count as coverage), next round predicted
     tiny = build_state(simulate=True, seed=3, xi=0.0, n_rounds=MIN_SIM_ROUNDS)
-    assert tiny.n_current_matches == 30 and tiny.n_history_matches > 0 and len(tiny.predictions) == 30 and tiny.prior_enabled
+    assert tiny.n_current_matches == 40 and tiny.n_history_matches > 0 and len(tiny.predictions) == 40 and tiny.prior_enabled
 
 
 def test_no_odds_message_is_source_aware(sim_state: PipelineState) -> None:
@@ -570,7 +578,7 @@ def test_app_survives_out_of_range_env(monkeypatch: pytest.MonkeyPatch) -> None:
     assert any("Dati simulati" in i.value for i in at.sidebar.info)
     assert not any("0 partite in programma" in i.value for i in at.sidebar.info)
     assert at.metric, "fixtures exist, so the match tab shows its metrics"
-    assert len(at.selectbox(key="fixture").options) == 30
+    assert len(at.selectbox(key="fixture").options) == 40
     assert any("limitato a 37" in m.value for m in at.markdown), "the clamp is reported in 'Dettagli pipeline'"
     assert not any("aggiungi file CSV" in i.value for i in at.info)
 
@@ -579,16 +587,16 @@ def test_app_survives_out_of_range_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("SERIEC_HISTORY", "7")  # out of range -> default (2 synthetic seasons)
     at.run()
     assert not at.exception, [e.value for e in at.exception]
-    assert len(at.selectbox(key="fixture").options) == 30
+    assert len(at.selectbox(key="fixture").options) == 40
     assert any("seed=7, 11 giornate giocate" in m.value for m in at.markdown)  # 2026-08-23 .. 2026-11-01 played
-    assert any("Stagione 2026/27 · 60 squadre · 330 partite stagione corrente · 2280 partite storiche (2024/25-2025/26)" in i.value for i in at.sidebar.info)
+    assert any("Perimetro: Serie C 2026/27 Gironi A/B/C + Serie B (80 squadre) · 440 partite stagione corrente · 3040 partite storiche (2024/25-2025/26)" in i.value for i in at.sidebar.info)
 
     monkeypatch.setenv("SERIEC_AS_OF", "not-a-date")  # unparseable -> today, page still renders
     monkeypatch.setenv("SERIEC_SEASON", "1999_00")  # unknown season file -> default 2026/27
     monkeypatch.setenv("SERIEC_HISTORY", "0")
     at.run()
     assert not at.exception, [e.value for e in at.exception]
-    assert any("Stagione 2026/27 · 60 squadre" in i.value and "0 partite storiche" in i.value for i in at.sidebar.info)
+    assert any("Perimetro: Serie C 2026/27 Gironi A/B/C + Serie B (80 squadre)" in i.value and "0 partite storiche" in i.value for i in at.sidebar.info)
 
 
 def test_app_heatmap_renders_complete_matrix(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -638,12 +646,12 @@ def test_app_non_default_season_renders_on_its_own_calendar(monkeypatch: pytest.
     at.run()
     assert not at.exception, [e.value for e in at.exception]
     assert not at.error, [e.value for e in at.error]
-    perimeter = "Stagione 2025/26 · 60 squadre · 330 partite stagione corrente · 2280 partite storiche (2023/24-2024/25)"
+    perimeter = "Perimetro: Serie C 2025/26 Gironi A/B/C + Serie B (80 squadre) · 440 partite stagione corrente · 3040 partite storiche (2023/24-2024/25)"
     assert any(perimeter in i.value for i in at.sidebar.info)
     options = at.selectbox(key="fixture").options
-    assert len(options) == 30 and all("2025-11-09" in o for o in options)
+    assert len(options) == 40 and all("2025-11-09" in o for o in options)
     assert any("Calendario simulato al 2025-11-06" in m.value for m in at.markdown)
-    assert any("Storica 1" in m.value or "Caldiero Terme" in m.value for m in at.markdown), "the padded history is reported"
+    assert any("Storica 01" in m.value or "Caldiero Terme" in m.value for m in at.markdown), "the padded history is reported"
 
 
 def test_app_resolves_today_on_every_run_and_survives_a_pipeline_error(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -680,5 +688,5 @@ def test_app_resolves_today_on_every_run_and_survives_a_pipeline_error(monkeypat
     assert not at.exception, [e.value for e in at.exception]
     assert any("Pipeline non eseguibile con i parametri richiesti" in e.value and "stagione 2026/27" in e.value for e in at.error)
     assert received and received[0] == date.today()  # the refused call (the fallback may be served by the cache)
-    assert any("Stagione 2026/27 · 60 squadre" in i.value for i in at.sidebar.info)
+    assert any("Perimetro: Serie C 2026/27 Gironi A/B/C + Serie B (80 squadre)" in i.value for i in at.sidebar.info)
     assert at.metric, "the fallback state renders the match tab"

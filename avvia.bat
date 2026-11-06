@@ -29,8 +29,33 @@ python -m pip install --quiet --disable-pip-version-check -r requirements.txt ||
   echo ERRORE nell'installazione delle dipendenze ^(serve la connessione internet^). & pause & exit /b 1)
 
 if /I "%~1"=="--solo-dashboard" goto dashboard
-echo ^>^> Aggiorno i dati reali ^(ultime 3 stagioni, Gironi A/B/C^). La prima volta serve qualche decina di minuti...
-python -m src.ingestion.harvester --gironi A B C --seasons 3
+REM Sorgente dati: FootyStats (API ufficiale, con quote pre-match) se la chiave e' nella variabile
+REM d'ambiente FOOTYSTATS_API_KEY o nel file .env accanto a questo script (vedi .env.example),
+REM altrimenti SofaScore (solo da connessione residenziale). La chiave non viene mai stampata.
+REM Il controllo e' delegato allo stesso parser Python della CLI (variabile d'ambiente o .env, anche con
+REM BOM, CRLF, "export", spazi iniziali, virgolette e commenti), cosi' lanciatore e CLI non possono essere in disaccordo.
+set "USE_FOOTYSTATS="
+python -c "import sys; from src.ingestion.footystats import find_api_key; from src.ingestion.harvester import load_endpoints; sys.exit(0 if find_api_key(key_env=load_endpoints().footystats.key_env) else 1)" >nul 2>&1 && set "USE_FOOTYSTATS=1"
+if not defined USE_FOOTYSTATS if not exist ".env" (
+  echo ^>^> Nessuna chiave FootyStats trovata.
+  echo    Incolla qui la chiave API di FootyStats e premi Invio ^(oppure premi solo Invio per usare SofaScore^).
+  set "FS_KEY="
+  set /p "FS_KEY=   Chiave: "
+  if defined FS_KEY (
+    > ".env" echo FOOTYSTATS_API_KEY=%FS_KEY: =%
+    echo    Chiave salvata nel file .env ^(resta solo su questo computer^).
+    set "FS_KEY="
+    python -c "import sys; from src.ingestion.footystats import find_api_key; from src.ingestion.harvester import load_endpoints; sys.exit(0 if find_api_key(key_env=load_endpoints().footystats.key_env) else 1)" >nul 2>&1 && set "USE_FOOTYSTATS=1"
+  )
+)
+if defined USE_FOOTYSTATS (
+  echo ^>^> Aggiorno i dati reali da FootyStats ^(Serie C Gironi A/B/C + Serie B, ultime 3 stagioni, quote pre-match^)...
+  python -m src.ingestion.footystats --competitions A B C SB --seasons 3 --odds-out data\odds\footystats.csv
+) else (
+  echo ^>^> Nessuna chiave FootyStats ^(FOOTYSTATS_API_KEY o file .env, vedi .env.example^): uso SofaScore.
+  echo ^>^> Aggiorno i dati reali ^(ultime 3 stagioni, Gironi A/B/C^). La prima volta serve qualche decina di minuti...
+  python -m src.ingestion.harvester --gironi A B C --seasons 3
+)
 if errorlevel 1 (
   echo ATTENZIONE: raccolta dati non riuscita ^(vedi messaggi sopra^).
   if exist "data\processed\matches.csv" (echo Uso i dati reali raccolti in precedenza.) else (echo Nessun dato reale disponibile: la dashboard mostrera' la lega simulata.)

@@ -173,6 +173,24 @@ def test_blank_id_and_team_cells_count_as_missing(csv_like: pd.DataFrame, caplog
     assert report.missing_required == (f"row {blank.index[0]}", second)  # a row without an id is still named
 
 
+def test_girone_column_accepts_every_configured_competition(mini: pd.DataFrame) -> None:
+    """The girone column is validated against the dynamic enum (config/competitions.toml): Serie B rows pass,
+    in any accepted spelling, and are stored as the code."""
+    frame = mini.head(4).copy()
+    frame["girone"] = frame["girone"].astype(object)
+    frame.loc[frame.index[0], "girone"] = "SB"
+    frame.loc[frame.index[1], "girone"] = "Serie B"
+    frame.loc[frame.index[2], "girone"] = "Italy Serie B"
+    frame.loc[frame.index[3], "girone"] = "Girone C"
+    out = validate_matches_df(frame)
+    assert sorted(out["girone"].tolist()) == ["C", "SB", "SB", "SB"]
+    assert str(out["girone"].dtype) == "string" and [g.value for g in Girone] == ["A", "B", "C", "SB"]
+    with pytest.raises(ValueError, match=r"expected one of \['A', 'B', 'C', 'SB'\]"):
+        validate_matches_df(frame.assign(girone="Serie A"))
+    record = MatchRecord("SB-1", date(2026, 8, 22), 1, "Serie B", "Palermo", "Sampdoria", 2, 1)
+    assert record.girone is Girone.SB and record.to_dict()["girone"] == "SB"
+
+
 def test_unknown_girone_raises_naming_the_rows(mini: pd.DataFrame) -> None:
     bad = mini.head(3).copy()
     bad["girone"] = bad["girone"].astype(object)

@@ -24,9 +24,36 @@ source .venv/bin/activate
 python -m pip install --quiet --disable-pip-version-check -r requirements.txt || {
   echo "ERRORE nell'installazione delle dipendenze (serve la connessione internet)."; read -r -p "Premi Invio per chiudere." _; exit 1; }
 
+# Sorgente dati: FootyStats (API ufficiale, con quote pre-match) se la chiave è disponibile nella
+# variabile d'ambiente FOOTYSTATS_API_KEY o nel file .env accanto a questo script (vedi .env.example),
+# altrimenti SofaScore (solo da connessione residenziale). La chiave non viene mai stampata.
+# Il controllo è delegato allo stesso parser Python della CLI (variabile d'ambiente o .env, anche con BOM,
+# CRLF, "export", spazi iniziali, virgolette e commenti), così lanciatore e CLI non possono essere in disaccordo.
+has_footystats_key() {
+  python -c 'import sys; from src.ingestion.footystats import find_api_key; from src.ingestion.harvester import load_endpoints; sys.exit(0 if find_api_key(key_env=load_endpoints().footystats.key_env) else 1)' >/dev/null 2>&1
+}
+
 if [ "${1:-}" != "--solo-dashboard" ]; then
-  echo ">> Aggiorno i dati reali (ultime 3 stagioni, Gironi A/B/C). La prima volta serve qualche decina di minuti..."
-  if ! python -m src.ingestion.harvester --gironi A B C --seasons 3; then
+  if ! has_footystats_key && [ ! -f .env ]; then
+    echo ">> Nessuna chiave FootyStats trovata."
+    echo "   Incolla qui la chiave API di FootyStats e premi Invio (oppure premi solo Invio per usare SofaScore)."
+    read -r -p "   Chiave: " FS_KEY
+    FS_KEY="$(printf '%s' "$FS_KEY" | tr -d '[:space:]"'"'"')"
+    if [ -n "$FS_KEY" ]; then
+      printf 'FOOTYSTATS_API_KEY=%s\n' "$FS_KEY" > .env
+      echo "   Chiave salvata nel file .env (resta solo su questo computer)."
+    fi
+    unset FS_KEY
+  fi
+  if has_footystats_key; then
+    echo ">> Aggiorno i dati reali da FootyStats (Serie C Gironi A/B/C + Serie B, ultime 3 stagioni, quote pre-match)..."
+    HARVEST="python -m src.ingestion.footystats --competitions A B C SB --seasons 3 --odds-out data/odds/footystats.csv"
+  else
+    echo ">> Nessuna chiave FootyStats (FOOTYSTATS_API_KEY o file .env, vedi .env.example): uso SofaScore."
+    echo ">> Aggiorno i dati reali (ultime 3 stagioni, Gironi A/B/C). La prima volta serve qualche decina di minuti..."
+    HARVEST="python -m src.ingestion.harvester --gironi A B C --seasons 3"
+  fi
+  if ! $HARVEST; then
     echo "ATTENZIONE: raccolta dati non riuscita (vedi messaggi sopra)."
     if [ -s data/processed/matches.csv ]; then
       echo "Uso i dati reali raccolti in precedenza."
