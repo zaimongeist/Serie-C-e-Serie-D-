@@ -32,15 +32,38 @@ def test_mini_mode_runs_end_to_end(tmp_path: Path, capsys: pytest.CaptureFixture
     # the injected regression trap is detected and shown
     assert out.traps, "the mini demo injects a REGRESSION_TRAP; it must be detected"
     assert "REGRESSION_TRAP" in captured
-    # all seven console sections are printed
-    for section in ("1) DATASET", "2) STIMA DIXON-COLES", "3) RANKING", "4) PREVISIONI", "5) QUOTE BOOKMAKER", "6) ALERT REGRESSION_TRAP", "7) EXPORT"):
+    # all console sections are printed; section 8 (matchday picks) comes after the trap alerts and before the export
+    for section in ("1) DATASET", "2) STIMA DIXON-COLES", "3) RANKING", "4) PREVISIONI", "5) QUOTE BOOKMAKER", "6) ALERT REGRESSION_TRAP", "8) SELEZIONI DI GIORNATA", "7) EXPORT"):
         assert section in captured, section
+    assert captured.index("6) ALERT REGRESSION_TRAP") < captured.index("8) SELEZIONI DI GIORNATA") < captured.index("7) EXPORT")
+    assert pipeline.LEGEND_POINTER == "Legenda: tab Legenda della dashboard oppure README" and pipeline.LEGEND_POINTER in captured
     # export is a well-formed CSV with one row per evaluated selection
     assert export.exists()
     with export.open(newline="", encoding="utf-8") as fh:
         rows = list(csv.DictReader(fh))
     assert len(rows) == n_selections
     assert {"match_id", "market", "selection", "book_odds", "fair_odds", "ev", "stake_units"} <= set(rows[0])
+    # the matchday picks: 5 draws and up to 12 GG of the next matchday (the mini demo has 7 fixtures), written next to the report
+    assert len(out.matchdays) == 1 and out.next_matchday is not None and out.next_matchday.n_fixtures == len(out.predictions) == 7
+    assert len(out.draw_picks) == 5 and len(out.btts_picks) == 7
+    assert all(p.selection == "X" for p in out.draw_picks) and all(p.selection == "GG" for p in out.btts_picks)
+    assert out.next_matchday.label in captured and "le 5 partite più probabili da X" in captured and "le 7 partite più probabili da GG" in captured
+    assert out.picks_export_path == tmp_path / "value_selezioni.csv" == pipeline.picks_export_path(export) and out.picks_export_path.exists()
+    picks = pd.read_csv(out.picks_export_path)
+    assert list(picks.columns)[:3] == ["Lista", "Giornata", "#"] and picks["Lista"].tolist() == ["X"] * 5 + ["GG"] * 7
+    assert picks["Giornata"].eq(out.next_matchday.label).all() and {"Partita", "P. Modello (%)", "Quota Fair", "Quota Book", "EV (%)", "Flag", "Nota"} <= set(picks.columns)
+    assert f"selezioni di giornata scritte in: {out.picks_export_path}" in captured
+
+
+def test_pick_list_sizes_are_flags(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    out = pipeline.main(["--mode", "mini", "--no-export", "--log-level", "ERROR", "--n-draws", "2", "--n-btts", "3"])
+    captured = capsys.readouterr().out
+    assert len(out.draw_picks) == 2 and len(out.btts_picks) == 3 and out.picks_export_path is None
+    assert "le 2 partite più probabili da X" in captured and "le 3 partite più probabili da GG" in captured
+    assert out.draw_picks[0].p_model >= out.draw_picks[1].p_model
+    with pytest.raises(SystemExit) as exc:
+        pipeline.main(["--mode", "mini", "--no-export", "--n-draws", "0"])
+    assert exc.value.code == 2 and "--n-draws 0" in capsys.readouterr().err
 
 
 def test_mini_mode_predictions_are_sane() -> None:

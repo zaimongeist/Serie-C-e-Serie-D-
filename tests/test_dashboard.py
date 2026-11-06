@@ -7,6 +7,7 @@ import inspect
 import io
 import json
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -24,31 +25,43 @@ import plotly.graph_objects as go
 import plotly.io as pio
 import pytest
 
-from src.common.schemas import SELECTIONS, Girone, Market, OddsQuote
+from src.common.schemas import SELECTIONS, Fixture, Girone, Market, OddsQuote
+from src.dashboard.legend import POOR_EXAMPLE_FLAGS, SYNTHETIC_REASON_NO_QUOTES, SYNTHETIC_REASON_NO_VALUE, pick_example_row
 from src.dashboard import LEGACY_FULL_WIDTH, MODERN_FULL_WIDTH, container_width_kwargs
 from src.dashboard.state import (
+    ALL_MATCHDAYS,
     MARKETS_COLUMNS,
     MIN_SIM_ROUNDS,
+    PICKS_EXPORT_COLUMNS,
     RANKING_COLUMNS,
     TRAPS_COLUMNS,
     VALUE_COLUMNS,
     PipelineState,
+    btts_picks_table,
     build_state,
+    draw_picks_table,
     export_csv_bytes,
+    find_matchday,
     fixtures_for,
     heatmap_figure,
     load_odds_quotes,
     markets_table,
+    matchday_predictions,
     max_sim_rounds,
     no_odds_message,
     opportunities_table,
+    picks_csv_bytes,
+    picks_export_frame,
     predictions_table,
     quotes_for,
     ranking_table,
+    resolve_matchday,
     strength_figure,
     traps_table,
+    value_opportunities,
     value_table,
 )
+from src.engine.picks import PICKS_COLUMNS
 from src.ingestion.harvester import save_fixtures, save_processed
 from src.simulation.generator import simulate_league, simulate_mini_dataset
 
@@ -92,10 +105,64 @@ def rendered_heatmap(at: AppTest) -> tuple[np.ndarray, dict]:
     return plotly_array(trace["z"]).astype(float), spec["layout"]
 
 
+EXAMPLE_HEADER = re.compile(r"^\*\*(?P<partita>.+?)\*\* \((?P<comp>[^)]+)\) · mercato (?P<mercato>.+?), esito \*\*(?P<esito>[^*]+)\*\* · quota (?P<quota>[0-9.]+) di (?P<book>.+)$")
+
+
+def worked_example_shown(at: AppTest) -> tuple[dict[str, str], str]:
+    """``(header fields, whole markdown)`` of the Legenda tab's worked example (the markdown that holds 'Kelly pieno')."""
+    text = next(m.value for m in at.markdown if "Kelly pieno" in m.value and "**Stake**" in m.value)
+    match = EXAMPLE_HEADER.match(text.splitlines()[0])
+    assert match is not None, text.splitlines()[0]
+    return match.groupdict(), text
+
+
+def assert_example_is_the_panel_row(at: AppTest) -> None:
+    """The worked example is the first row of the value table shown without LONGSHOT / SUSPICIOUS_EDGE (the first row when all are flagged)."""
+    panels = [d.value for d in at.dataframe if list(d.value.columns) == list(VALUE_COLUMNS)]
+    fields, text = worked_example_shown(at)
+    if not panels or panels[0].empty:
+        assert "Esempio costruito" in text and SYNTHETIC_REASON_NO_VALUE in text and SYNTHETIC_REASON_NO_QUOTES not in text
+        assert any(c.value.startswith("Nessuna riga nel pannello Opportunità di Valore") for c in at.caption)
+        return
+    panel = panels[0]
+    ordinary = panel[~panel["Flag"].str.contains("LONGSHOT|SUSPICIOUS_EDGE", regex=True, na=False)]
+    row = (ordinary if not ordinary.empty else panel).iloc[0]
+    assert "Esempio costruito" not in text
+    assert fields["partita"] == row["Partita"] and fields["esito"] == row["Esito"] and float(fields["quota"]) == pytest.approx(row["Quota Book"], abs=0.005)
+    assert fields["comp"] == row["Competizione"] and fields["book"] == row["Bookmaker"]
+    assert any(c.value.startswith("Esempio preso dal pannello Opportunità di Valore con i filtri correnti (") for c in at.caption)
+
+
 @pytest.fixture(scope="module")
 def sim_state() -> PipelineState:
     """One simulated pipeline run shared by the view tests (seed 7, 15 rounds, stationary)."""
     return build_state(simulate=True, seed=7, xi=0.0, n_rounds=15)
+
+
+def multi_round_processed_dir(tmp_path: Path, *, seed: int = 11, played: int = 8, sb_rounds: int = 2) -> tuple[Path, Path, dict[int, list[Fixture]]]:
+    """A processed dir whose fixtures span three future rounds per Serie C girone (``sb_rounds`` for Serie B), with odds for all.
+
+    ``simulate_league(seed, n_rounds=k)`` always draws the same schedule, so the
+    fixture round of the ``played``, ``played + 1`` and ``played + 2`` leagues are
+    rounds ``played + 1 .. played + 3`` of one calendar; the matches come from the
+    first league only. Returns ``(processed_dir, odds_dir, fixtures_by_round)``.
+    """
+    base = simulate_league(seed=seed, n_rounds=played)
+    processed, odds_dir = tmp_path / "processed", tmp_path / "odds"
+    save_processed(base.matches, processed / "matches.csv")
+    fixtures: list[Fixture] = []
+    quotes: list[OddsQuote] = []
+    by_round: dict[int, list[Fixture]] = {}
+    for k in range(3):
+        league = simulate_league(seed=seed, n_rounds=played + k)
+        keep = [f for f in league.fixtures if f.girone != Girone.SB or k < sb_rounds]
+        by_round[played + 1 + k] = keep
+        fixtures += keep
+        kept_ids = {f.match_id for f in keep}
+        quotes += [q for q in league.odds if q.match_id in kept_ids]
+    save_fixtures(fixtures, processed / "fixtures.csv")
+    write_odds_csv(quotes, odds_dir / "simbook.csv")
+    return processed, odds_dir, by_round
 
 
 # ----------------------------------------------------------------------------- build_state
@@ -166,6 +233,11 @@ def test_build_state_processed_without_fixtures(tmp_path: Path) -> None:
     assert state.source == "processed"
     assert state.fixtures == [] and state.predictions == [] and state.opportunities == []
     assert predictions_table(state).empty
+    # no fixtures: no matchday, and every matchday-aware view is empty instead of raising
+    assert state.matchdays == [] and state.next_matchday is None and resolve_matchday(state, None) is None
+    assert fixtures_for(state, None) == [] and matchday_predictions(state) == [] and value_table(state, -1.0).empty
+    assert draw_picks_table(state, None).empty and btts_picks_table(state, None).empty
+    assert list(draw_picks_table(state, None).columns) == list(PICKS_COLUMNS)
 
 
 def test_small_sample_uses_prior(tmp_path: Path) -> None:
@@ -242,12 +314,84 @@ def test_strength_figure(sim_state: PipelineState) -> None:
 
 def test_fixtures_for_sorted_and_filtered(sim_state: PipelineState) -> None:
     all_preds = fixtures_for(sim_state, None)
-    assert len(all_preds) == len(sim_state.predictions)
+    assert len(all_preds) == len(sim_state.predictions)  # the simulated league has one round: the next matchday is everything
     keys = [(p.fixture.date, p.fixture.label) for p in all_preds]
     assert keys == sorted(keys)
     only_a = fixtures_for(sim_state, Girone.A)
     assert only_a and all(p.fixture.girone == Girone.A for p in only_a)
     assert sum(len(fixtures_for(sim_state, g)) for g in Girone) == len(all_preds) and len(fixtures_for(sim_state, Girone.SB)) == 10
+    # one matchday with every competition at round 16 (15 played); the explicit forms agree with the default
+    assert len(sim_state.matchdays) == 1 and sim_state.next_matchday is not None
+    assert sim_state.next_matchday.rounds == {g: 16 for g in Girone} and sim_state.next_matchday.n_fixtures == 40
+    assert fixtures_for(sim_state, None, sim_state.next_matchday) == all_preds == fixtures_for(sim_state, None, ALL_MATCHDAYS)
+    assert any("raggruppate in 1 giornata" in n for n in sim_state.notes)
+
+
+def test_matchday_defaults_with_a_season_long_fixture_list(tmp_path: Path) -> None:
+    """With FootyStats the fixture list is the whole remaining season: the selector, the value panel and the picks
+    must default to the next matchday (the sum of the next rounds), while the exports keep every fixture."""
+    processed, odds_dir, by_round = multi_round_processed_dir(tmp_path)
+    state = build_state(processed_dir=processed, odds_dir=odds_dir, xi=0.0)
+    assert state.source == "processed" and len(state.fixtures) == 110 == len(state.predictions)  # 40 + 40 + 30 (Serie B has two rounds left)
+    assert [m.n_fixtures for m in state.matchdays] == [40, 40, 30]
+    first, second, third = state.matchdays
+    assert first.rounds == {g: 9 for g in Girone} and second.rounds == {g: 10 for g in Girone} and third.rounds == {g: 11 for g in (Girone.A, Girone.B, Girone.C)}
+    assert first.fixture_ids == {f.match_id for f in by_round[9]} and third.fixture_ids == {f.match_id for f in by_round[11]}
+    assert first.key == first.start.isoformat() and "g.9" in first.label and "Serie B g.9" in first.label and "Serie B" not in third.label
+    assert state.next_matchday is first and find_matchday(state, second.key) is second and find_matchday(state, "nope") is None
+    assert resolve_matchday(state, None) is first and resolve_matchday(state, ALL_MATCHDAYS) is None and resolve_matchday(state, second.key) is second
+    assert resolve_matchday(state, "stale-key") is first and resolve_matchday(state, third) is third
+    # the selector: next matchday by default (40, not the whole season), one girone of it, another matchday, everything
+    assert len(fixtures_for(state, None)) == 40 and {p.fixture.round for p in fixtures_for(state, None)} == {9}
+    assert len(fixtures_for(state, Girone.SB)) == 10 and len(fixtures_for(state, Girone.SB, third)) == 0
+    assert len(fixtures_for(state, None, second)) == 40 and len(fixtures_for(state, None, third)) == 30
+    assert len(fixtures_for(state, None, ALL_MATCHDAYS)) == 110 == len(predictions_table(state))
+    preds_second = matchday_predictions(state, second)
+    assert len(preds_second) == 40 and all(second.contains(p) for p in preds_second)
+    assert len(matchday_predictions(state, ALL_MATCHDAYS)) == 110 and len(matchday_predictions(state)) == 40
+    # the value panel: next matchday by default, every matchday on request
+    everything = value_table(state, -1.0, matchday=ALL_MATCHDAYS)
+    assert len(everything) == len(state.opportunities) > 0
+    default = value_table(state, -1.0)
+    assert 0 < len(default) < len(everything)
+    first_labels = {f"{f.home_team} - {f.away_team}" for f in by_round[9]}
+    assert set(default["Partita"]) <= first_labels
+    assert len(default) == sum(1 for o in state.opportunities if o.match_id in first.fixture_ids)
+    only_third = value_table(state, -1.0, matchday=third)
+    assert set(only_third["Competizione"]) <= {"Girone A", "Girone B", "Girone C"} and len(only_third) == sum(1 for o in state.opportunities if o.match_id in third.fixture_ids)
+    assert len(value_table(state, -1.0, Girone.SB, matchday=third)) == 0
+    assert len(opportunities_table(state)) == len(state.opportunities), "the export keeps every evaluated selection"
+    # value_opportunities is the panel as objects: same rows, same order (EV desc, then match, market, selection)
+    rows = value_opportunities(state, -1.0)
+    assert len(rows) == len(default) and [f"{o.home_team} - {o.away_team}" for o in rows] == default["Partita"].tolist()
+    assert [o.selection for o in rows] == default["Esito"].tolist() and [round(o.ev * 100.0, 2) for o in rows] == default["EV (%)"].tolist()
+    assert value_opportunities(state, -1.0, Girone.SB, matchday=third) == [] and len(value_opportunities(state, -1.0, matchday=ALL_MATCHDAYS)) == len(everything)
+    # the Legenda example comes from the panel's own rows (next matchday), skipping long shots and suspicious edges
+    example = pick_example_row(value_opportunities(state, 0.035))
+    assert example is not None and first.contains(example.match_id) and POOR_EXAMPLE_FLAGS.isdisjoint(example.flags)
+    assert example.ev >= 0.035 and example is value_opportunities(state, 0.035)[[POOR_EXAMPLE_FLAGS.isdisjoint(o.flags) for o in value_opportunities(state, 0.035)].index(True)]
+    best_overall = max((o for o in state.opportunities if o.value), key=lambda o: o.ev)
+    assert example is not best_overall or first.contains(best_overall.match_id), "the example is never a row of another matchday"
+    # the picks: sized 5 / 12, restricted to the matchday, with the synthetic bookmaker's prices
+    draws = draw_picks_table(state, second)
+    btts = btts_picks_table(state, second)
+    assert list(draws.columns) == list(PICKS_COLUMNS) == list(btts.columns) and len(draws) == 5 and len(btts) == 12
+    second_labels = {f"{f.home_team} - {f.away_team}" for f in by_round[10]}
+    assert set(draws["Partita"]) <= second_labels and set(btts["Partita"]) <= second_labels
+    assert draws["Esito"].eq("X").all() and btts["Esito"].eq("GG").all() and draws["Quota Book"].notna().all()
+    assert len(draw_picks_table(state, None)) == 5 and set(draw_picks_table(state, None)["Partita"]) <= first_labels
+    assert len(btts_picks_table(state, third, n=12, girone=Girone.A)) == 10 and set(btts_picks_table(state, third, n=4)["Competizione"]) <= {"Girone A", "Girone B", "Girone C"}
+    assert len(draw_picks_table(state, third, n=3, girone=Girone.SB)) == 0
+    # the combined export of both lists
+    export = picks_export_frame(draws, btts, second)
+    assert list(export.columns) == list(PICKS_EXPORT_COLUMNS) and len(export) == 17
+    assert export["Lista"].tolist() == ["X"] * 5 + ["GG"] * 12 and export["Giornata"].eq(second.label).all()
+    payload = picks_csv_bytes(draws, btts, second)
+    parsed = pd.read_csv(io.BytesIO(payload))
+    assert list(parsed.columns) == list(PICKS_EXPORT_COLUMNS) and len(parsed) == 17 and parsed["Data"].iloc[0] == second.start.isoformat()
+    empty = picks_export_frame(draw_picks_table(state, third, n=0), btts_picks_table(state, third, n=0))
+    assert list(empty.columns) == list(PICKS_EXPORT_COLUMNS) and empty.empty
+    assert any("raggruppate in 3 giornate" in n for n in state.notes)
 
 
 def test_value_table_threshold_and_order(sim_state: PipelineState) -> None:
@@ -424,9 +568,36 @@ def test_app_renders_with_apptest(monkeypatch: pytest.MonkeyPatch) -> None:
     at = AppTest.from_file(str(APP_PATH), default_timeout=240)
     at.run()
     assert not at.exception, [e.value for e in at.exception]
-    assert [tab.label for tab in at.tabs] == ["Classifica Forza", "Match & Heatmap", "Opportunità di Valore", "Export"]
-    assert len(at.get("download_button")) >= 1
+    assert [tab.label for tab in at.tabs] == ["Classifica Forza", "Match & Heatmap", "Opportunità di Valore", "Selezioni di giornata", "Export", "Legenda"]
+    assert len(at.get("download_button")) >= 3  # picks, value report, predictions
     assert any("Dati simulati" in i.value for i in at.sidebar.info)
+    # Selezioni di giornata: one matchday (the simulated league has one round), N controls, two picks tables, one CSV
+    matchday_box = at.selectbox(key="matchday")
+    assert len(matchday_box.options) == 1 and matchday_box.options[0].startswith("Giornata del 18 ott 2026 · Girone A g.9")
+    assert at.session_state["matchday"] == "2026-10-18"
+    assert at.number_input(key="n_draws").value == 5 and at.number_input(key="n_btts").value == 12
+    picks_tables = [d.value for d in at.dataframe if list(d.value.columns) == list(PICKS_COLUMNS)]
+    assert [len(t) for t in picks_tables] == [5, 12]
+    assert picks_tables[0]["Esito"].eq("X").all() and picks_tables[1]["Esito"].eq("GG").all()
+    assert any("Le 5 partite più probabili da X (tutte le competizioni)" in m.value for m in at.markdown)
+    assert any("Le 12 partite più probabili da GG (tutte le competizioni)" in m.value for m in at.markdown)
+    assert any("solo per probabilità" in c.value for c in at.caption)
+    assert any(b.label == "Scarica le due liste (CSV)" for b in at.get("download_button"))
+    # Legenda: the glossary and the worked example on the first value row
+    assert any(m.value.startswith("## Legenda: come leggere i numeri") for m in at.markdown)
+    assert any(e.label == "Come leggere una riga del pannello valore" for e in at.expander)
+    assert any("Kelly pieno" in m.value and "**Stake**" in m.value and "Esempio costruito" not in m.value for m in at.markdown)
+    assert_example_is_the_panel_row(at)
+    # the N controls resize the lists
+    at.number_input(key="n_draws").set_value(3).run()
+    assert not at.exception, [e.value for e in at.exception]
+    picks_tables = [d.value for d in at.dataframe if list(d.value.columns) == list(PICKS_COLUMNS)]
+    assert [len(t) for t in picks_tables] == [3, 12]
+    assert any("Le 3 partite più probabili da X" in m.value for m in at.markdown)
+    # the value panel's "every matchday" switch
+    at.checkbox(key="value_all_matchdays").check().run()
+    assert not at.exception, [e.value for e in at.exception]
+    assert any(c.value.startswith("Tutte le partite in programma") for c in at.caption)
     # the badge and the subtitle state the perimeter: season, teams, current-season vs historical matches
     perimeter = "Perimetro: Serie C 2026/27 Gironi A/B/C + Serie B (80 squadre) · 320 partite stagione corrente · 3040 partite storiche (2024/25-2025/26)"
     assert any(perimeter in i.value for i in at.sidebar.info)
@@ -444,6 +615,71 @@ def test_app_renders_with_apptest(monkeypatch: pytest.MonkeyPatch) -> None:
     assert not at.exception, [e.value for e in at.exception]
     assert len(at.selectbox(key="fixture").options) == 10 and all(o.startswith("[SB]") for o in at.selectbox(key="fixture").options)
     assert any("vista: Serie B" in c.value for c in at.caption)
+
+
+def test_app_matchday_selector_drives_match_value_and_picks_tabs(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """With a season-long fixture list the three matchday-aware tabs show the next matchday and follow the selector."""
+    from streamlit.testing.v1 import AppTest
+
+    import src.dashboard.state as state_module
+
+    processed, odds_dir, by_round = multi_round_processed_dir(tmp_path, seed=23)
+    original = state_module.build_state
+
+    def processed_build_state(**kwargs):
+        return original(processed_dir=processed, odds_dir=odds_dir, **kwargs)
+
+    monkeypatch.setattr(state_module, "build_state", processed_build_state)
+    monkeypatch.delenv("SERIEC_FORCE_SIMULATE", raising=False)
+    monkeypatch.delenv("SERIEC_SIM_ROUNDS", raising=False)
+    monkeypatch.setenv("SERIEC_SEED", "23")  # a cache key no other test uses
+    at = AppTest.from_file(str(APP_PATH), default_timeout=240)
+    at.run()
+    assert not at.exception, [e.value for e in at.exception]
+    assert any("Dati reali" in s.value for s in at.sidebar.success)
+    box = at.selectbox(key="matchday")
+    assert len(box.options) == 3 and all(o.startswith("Giornata ") for o in box.options)
+    assert "Serie B g.9" in box.options[0] and "Serie B" not in box.options[2]
+    first_key = by_round[9][0].date.isoformat()
+    assert at.session_state["matchday"] == first_key
+    assert len(at.selectbox(key="fixture").options) == 40, "the next matchday, not the 110 fixtures of the season"
+    value_tables = [d.value for d in at.dataframe if list(d.value.columns) == list(VALUE_COLUMNS)]
+    first_labels = {f"{f.home_team} - {f.away_team}" for f in by_round[9]}
+    assert value_tables and set(value_tables[0]["Partita"]) <= first_labels
+    picks_tables = [d.value for d in at.dataframe if list(d.value.columns) == list(PICKS_COLUMNS)]
+    assert [len(t) for t in picks_tables] == [5, 12] and all(set(t["Partita"]) <= first_labels for t in picks_tables)
+    assert any("la giornata si cambia nel tab" in c.value and "(3 in programma)" in c.value for c in at.caption)
+    # the Legenda example is a row of the panel shown (next matchday), not the best EV of the whole season
+    assert_example_is_the_panel_row(at)
+    fields, _text = worked_example_shown(at)
+    assert fields["partita"] in first_labels
+
+    # choose the third matchday: Match & Heatmap, the value panel and the picks follow
+    box.select(box.options[2]).run()
+    assert not at.exception, [e.value for e in at.exception]
+    third_key = by_round[11][0].date.isoformat()
+    assert at.session_state["matchday"] == third_key
+    third_labels = {f"{f.home_team} - {f.away_team}" for f in by_round[11]}
+    assert len(at.selectbox(key="fixture").options) == 30 and not any("[SB]" in o for o in at.selectbox(key="fixture").options)
+    value_tables = [d.value for d in at.dataframe if list(d.value.columns) == list(VALUE_COLUMNS)]
+    assert value_tables and set(value_tables[0]["Partita"]) <= third_labels and not set(value_tables[0]["Competizione"]) & {"Serie B"}
+    picks_tables = [d.value for d in at.dataframe if list(d.value.columns) == list(PICKS_COLUMNS)]
+    assert [len(t) for t in picks_tables] == [5, 12] and all(set(t["Partita"]) <= third_labels for t in picks_tables)
+    # the sidebar competition filter still applies to Match & Heatmap within the selected matchday
+    at.selectbox(key="girone").select("Girone A").run()
+    assert not at.exception, [e.value for e in at.exception]
+    assert len(at.selectbox(key="fixture").options) == 10 and all(o.startswith("[A]") for o in at.selectbox(key="fixture").options)
+    assert at.session_state["matchday"] == third_key, "the matchday choice survives other interactions"
+    # ... and so does the Legenda example: third matchday, Girone A only
+    assert_example_is_the_panel_row(at)
+    fields, _text = worked_example_shown(at)
+    assert fields["partita"] in third_labels and fields["comp"] == "Girone A"
+    # the EV threshold at its maximum: whatever the panel shows, the example is consistent with it (synthetic with the
+    # 'no value row' reason when the panel is empty, never 'no quotes' since quotes exist)
+    at.slider(key="min_ev_pct").set_value(15.0).run()
+    assert not at.exception, [e.value for e in at.exception]
+    assert_example_is_the_panel_row(at)
+    assert not any(SYNTHETIC_REASON_NO_QUOTES in m.value for m in at.markdown)
 
 
 def free_port() -> int:
@@ -659,8 +895,9 @@ def test_app_resolves_today_on_every_run_and_survives_a_pipeline_error(monkeypat
     inside the cached state, so the calendar position never advanced while the server ran. The app now resolves
     today itself and passes it down; a ``ValueError`` from the data layer shows an error and falls back to the
     default season instead of crashing the page."""
-    import src.dashboard.state as state_module
     from streamlit.testing.v1 import AppTest
+
+    import src.dashboard.state as state_module
 
     original = state_module.build_state
     received: list[date | None] = []

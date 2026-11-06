@@ -382,6 +382,108 @@ scp data/processed/matches.csv data/processed/fixtures.csv utente@server:/percor
   comuni: `--history 0|1|2`, `--season`. Ogni output apre con il perimetro (`Perimetro: Serie C 2026/27 Gironi A/B/C +
   Serie B (80 squadre) · stagione corrente: N partite · storico: M partite 2024/25-2025/26`, derivato da
   `config/competitions.toml`) e la posizione nel calendario.
+- **Giornate** (`src/engine/picks.py`): con FootyStats il file delle partite in programma contiene *tutta* la stagione
+  residua (centinaia di partite con numero di giornata e data), perciò le partite sono raggruppate in «giornate» **per
+  calendario**: ogni turno di ogni competizione è ancorato alla data mediana delle sue partite (il giorno in cui se ne
+  gioca la maggior parte) e i turni delle varie competizioni ancorati nello stesso blocco della settimana calcistica
+  — fine settimana venerdì-lunedì oppure turno infrasettimanale martedì-giovedì (`week_block`) — formano una giornata,
+  etichettata con l'intervallo di date e i numeri di turno (`Giornata del 7-9 nov 2026 · Girone A g.14, Girone B
+  g.14, Girone C g.14, Serie B g.13`). Così la Serie B in sosta per le nazionali manca semplicemente da quella
+  giornata senza spostare gli accoppiamenti delle settimane seguenti, e due turni della stessa competizione nello
+  stesso blocco aprono due giornate. I recuperi (turni con meno della metà delle partite di un turno tipico, cioè
+  meno di 5 su 10, qualunque sia la data: anche il recupero infrasettimanale che precede il turno del fine settimana)
+  e le partite di un turno regolare oltre 7 giorni dalla sua data mediana sono aggregati alla giornata più vicina per
+  data. Il selettore di *Match & Heatmap*, il pannello valore (con la casella «Mostra tutte le giornate») e le
+  selezioni usano di default la **prossima** giornata; la scelta nel tab *Selezioni di giornata* vale per tutti e tre
+  i tab (`st.session_state["matchday"]`). Gli export CSV restano completi.
+- **Selezioni di giornata** (tab omonimo e sezione `8) SELEZIONI DI GIORNATA` della console): per la giornata scelta,
+  le **5 partite più probabili da X** e le **12 partite più probabili da GG** fra Serie B e Serie C gironi A/B/C,
+  ordinate solo per probabilità del modello, con quota fair, miglior quota book, bookmaker, EV e flag quando una
+  quota esiste, più una nota («lambda e mu vicini», «pochi gol attesi», «xG attese alte», «entrambi gli attacchi sopra
+  1.2 gol attesi»). Le dimensioni si cambiano con i controlli *N risultati X* / *N partite GG* (console: `--n-draws`,
+  `--n-btts`); un solo CSV scarica entrambe le liste (console: `<export>_selezioni.csv` accanto al report valore).
+- **Legenda** (tab omonimo, ultimo): il glossario qui sotto, generato da `src/dashboard/legend.py`
+  (`legend_markdown()`), con un esempio svolto («Come leggere una riga del pannello valore») su una riga del pannello
+  valore così come è filtrato in quel momento (giornata scelta o tutte, competizione della sidebar, soglia EV): la
+  prima riga senza flag `LONGSHOT` / `SUSPICIOUS_EDGE`, perché una quota lunga o un EV sospetto insegnano poco; senza
+  righe l'esempio è costruito e dice perché (nessuna quota, oppure nessuna selezione di valore con i filtri correnti).
+  La console rimanda a questa sezione (`Legenda: tab Legenda della dashboard oppure README`).
+
+<!-- Blocco generato da src/dashboard/legend.py (legend_markdown()): non modificare a mano, rigenerare con
+     python -c "from src.dashboard.legend import legend_markdown; print(legend_markdown())"
+     (tests/test_picks.py verifica che README e codice coincidano). -->
+<!-- legend:start -->
+## Legenda: come leggere i numeri
+
+Glossario di tutti i numeri mostrati da dashboard, console ed export, scritto per chi li usa per pianificare le scommesse. Le formule sono quelle del codice (`src/engine/model.py`, `src/engine/value.py`, `src/engine/picks.py`).
+
+### Parametri del modello (tab Classifica Forza)
+
+- **α (alfa) · Forza offensiva** — quanto una squadra segna più o meno della media della sua competizione, su scala logaritmica: 0 = attacco medio del girone, +0.3 ≈ 35% di gol in più (exp(0.3) = 1.35), −0.3 ≈ 26% in meno. È centrata per competizione (la somma degli α di un girone è zero): confronta gli α solo dentro la stessa competizione, un +0.2 in Serie B e un +0.2 nel girone C non misurano la stessa cosa.
+- **β (beta) · Solidità difensiva** — quanto una squadra fa segnare meno della media: più alto = subisce meno (β = +0.3 ≈ 26% di gol subiti in meno, β negativo = difesa che concede più della media). Entra nei gol attesi dell'avversario con il segno meno (λ = exp(α_casa − β_ospite + γ)).
+- **γ (gamma) · Vantaggio casa** — fattore campo stimato per ogni competizione (uno per girone, uno per la Serie B), non per squadra: i gol attesi della squadra di casa sono moltiplicati per exp(γ). γ = 0.25 ⇒ ×1.28, cioè circa il 28% di gol in più di quanti ne farebbe in campo neutro. Valori tipici 0.15-0.35.
+- **Indice Attacco / Indice Difesa** — exp(α) ed exp(β): gli stessi parametri in scala moltiplicativa, 1.00 = media del girone, 1.20 = +20%, 0.85 = −15%. Più comodi di α e β per farsi un'idea veloce.
+- **ρ (rho) · Correlazione bassi punteggi** — correzione di Dixon-Coles ai risultati 0-0, 1-0, 0-1 e 1-1. Con ρ negativo (tipico, tra −0.05 e −0.15) il modello prevede più 0-0 e 1-1 (e meno 1-0 / 0-1) di due Poisson indipendenti: i pareggi a basso punteggio salgono, con ρ = −0.10 la X guadagna circa 2-3 punti percentuali. ρ = 0 equivale a gol di casa e ospiti indipendenti. È unico per tutto il perimetro.
+- **ξ (xi) · Decadimento temporale** — peso delle partite nel tempo: ogni gara pesa exp(−ξ·giorni trascorsi). Con ξ = 0.0018 una partita di un anno fa vale circa il 52% di una di oggi, una di due anni fa il 27%: lo storico delle tre stagioni aiuta la stima ma conta sempre meno della stagione in corso. ξ = 0 (dati simulati) pesa tutto allo stesso modo.
+- **Prior gaussiana · Stima MAP** — a inizio stagione ci sono poche partite e la stima «pura» (massima verosimiglianza, MLE) esagera: una squadra con due vittorie 4-0 sembrerebbe imbattibile. La prior tira i parametri verso valori normali (α verso 0 e β verso la media del suo girone, entrambi con deviazione standard 0.30, γ verso 0.25 ± 0.15, ρ verso 0 ± 0.10) e la stima diventa «MAP» (massimo a posteriori). Si attiva da sola finché la competizione meno coperta ha meno di 15 partite giocate per squadra nella stagione corrente (con 20 squadre per girone: fino alla 14ª giornata inclusa); il badge della sidebar dice se è attiva. Con una stagione intera i dati dominano e MAP ≈ MLE.
+
+### Previsione della partita (tab Match & Heatmap)
+
+- **λ (lambda) · Gol attesi casa** — numero medio di gol che il modello si aspetta dalla squadra di casa: λ = exp(α_casa − β_ospite + γ). Un λ di 1.60 non vuol dire «segna 1 o 2 gol», ma che in media su molte partite così ne segnerebbe 1.6: la distribuzione dei singoli punteggi è nella matrice.
+- **μ (mu) · Gol attesi ospiti** — lo stesso per la squadra in trasferta: μ = exp(α_ospite − β_casa), senza fattore campo. λ + μ è il totale gol atteso della partita (sopra 2.8 = gara da Over, sotto 2.2 = gara chiusa).
+- **Matrice dei punteggi (heatmap)** — probabilità di ogni risultato esatto, gol casa sulle righe e gol ospiti sulle colonne, da 0 a 10 gol per squadra (la vista compatta accorpa la coda in «N+»). Le celle sommano al 100%: ogni mercato è solo una somma di celle (1 = celle sotto la diagonale, X = diagonale, Over 2.5 = celle con somma ≥ 3, GG = celle con riga ≥ 1 e colonna ≥ 1).
+- **Risultato più probabile** — la cella più alta della matrice, con la sua probabilità. Di norma vale il 10-14%: è il punteggio singolo più frequente, non «il risultato previsto». Un 1-1 al 12% convive con un 1 (vittoria casa) al 45%.
+- **Probabilità dei mercati · 1X2, Over/Under, GG/NG** — per ogni mercato gli esiti sono esaustivi e si escludono a vicenda, quindi sommano al 100% (1 + X + 2, Over 2.5 + Under 2.5, GG + NG). Over 1.5 / 2.5 / 3.5 contano i gol totali (strettamente più di 1, 2, 3); GG = «entrambe le squadre segnano», NG = almeno una resta a zero.
+
+### Quote e valore (tab Opportunità di Valore)
+
+- **Quota fair** — 1 / probabilità del modello: la quota a cui la scommessa sarebbe alla pari nel lungo periodo. P = 40% ⇒ fair 2.50. Se il bookmaker paga più della fair la selezione ha valore, se paga meno no.
+- **Quota book** — la quota decimale del bookmaker (colonna Bookmaker = da dove viene: FootyStats, SimBook del simulatore o il valore della colonna bookmaker del CSV in data/odds). Con più book sulla stessa selezione si usa la quota più alta.
+- **Probabilità implicita e de-vig** — 1 / quota è quello che il book «dice» di credere, ma le implicite di un mercato sommano a più del 100% (es. 105%): il 5% in eccesso è l'allibramento (vig, margine). Il de-vig lo rimuove riproporzionando le implicite in modo che sommino al 100% (metodo proporzionale di default; power e Shin disponibili). Serve a confrontare il modello con l'opinione del book depurata dal margine.
+- **EV (%) · Valore atteso** — EV = P_modello × Quota book − 1. Esempio: 40% × 2.70 − 1 = +8%: per ogni euro puntato ci si aspetta di guadagnare in media 8 centesimi **nel lungo periodo**, su molte scommesse simili; sulla singola partita si vince o si perde. EV negativo = scommessa in perdita attesa anche se vince stavolta.
+- **Edge** — P_modello − P_implicita de-viggata: di quanti punti percentuali il modello è più ottimista del bookmaker su quell'esito. Misura il disaccordo; l'EV misura quanto rende. Un edge grande con quota bassa vale poco; un edge piccolo su quota alta può valere molto.
+- **Soglia EV (3,5%)** — sotto questa soglia la selezione non è considerata di valore: l'EV calcolato ha un errore (quello del modello) e un margine di sicurezza evita di puntare su differenze che sono solo rumore. Il cursore nella sidebar la cambia; alzarla riduce le puntate ma le rende più selettive.
+
+### Dimensionamento della puntata (colonna Stake)
+
+- **Kelly pieno · f* = (p·b − q) / b** — frazione del bankroll che massimizza la crescita a lungo termine, con p = P_modello, q = 1 − p e b = quota − 1 (vincita netta per 1 euro). Esempio: p = 40%, quota 2.70 ⇒ b = 1.70, f* = (0.40×1.70 − 0.60) / 1.70 = 4.7% del bankroll. Se p·b < q (EV negativo) f* è zero: non si punta.
+- **Kelly frazionario (1/8 o 1/4)** — si punta solo una frazione di f*, perché p è una stima: il Kelly pieno con una probabilità sbagliata porta a scommesse troppo grosse e a oscillazioni violente del bankroll. 1/8 (default) è prudente e adatto a un modello nuovo; 1/4 è già aggressivo. La frazione dimezza (o riduce) la varianza molto più di quanto riduca la crescita attesa.
+- **Stake (unità)** — la puntata consigliata in unità di bankroll: con bankroll 100 unità, 1 unità = 1% del capitale dedicato alle scommesse. Stake = f* × frazione di Kelly × bankroll, arrotondato a 0,1 unità. Nell'esempio sopra con 1/8 Kelly e 100 unità: 4.7% × 1/8 × 100 = 0,6 unità.
+- **Limite per puntata** — lo stake è comunque tappato a 3 unità (il 3% con il bankroll standard di 100 unità; il tappo resta 3 unità anche cambiando il bankroll nella sidebar): oltre, l'eventuale errore del modello costa troppo. Uno stake «3.0» dice che il Kelly avrebbe chiesto di più.
+- **Stake 0 unità** — la selezione o ha EV sotto soglia (nessun valore) o la puntata arrotondata scende sotto 0,1 unità: non vale la pena piazzarla. Il pannello valore mostra solo righe sopra soglia, ma l'export CSV completo elenca anche quelle a zero.
+
+### Flag (colonna Flag)
+
+- **VALUE** — EV ≥ soglia: la selezione è di valore; lo stake è di norma > 0 ma può arrotondare a 0 (sotto 0,1 unità) sulle quote molto alte, dove il Kelly frazionario chiede una puntata minuscola. È il flag che si cerca.
+- **REGRESSION_TRAP** — la selezione è Over o GG contro una squadra in «trappola di regressione»: nelle ultime 3 gare ha subito al massimo 1 gol (GA ≤ 1) ma gli avversari hanno prodotto almeno 3.5 xG cumulati (xGA ≥ 3.5). La difesa sta rendendo oltre il lecito e il mercato, che guarda i gol subiti, sottoprezza i gol contro di lei. Come usarla: l'Over e il GG contro quella squadra sono il lato giusto; i suoi Under / No Gol sono da evitare. Il flag è informativo: non cambia l'EV calcolato.
+- **TRAP:<squadra>** — accompagna REGRESSION_TRAP e dice quale squadra della partita è in trappola (possono essere entrambe).
+- **LONGSHOT** — quota book sopra 6: anche con EV positivo è una scommessa che perde la gran parte delle volte, con lunghe serie negative. Il Kelly frazionario la dimensiona già piccola; sapere che lo è aiuta a non demoralizzarsi (o a saltarla, se la varianza non piace).
+- **SUSPICIOUS_EDGE** — EV sopra il 25%: un vantaggio così grande sui bookmaker è quasi sempre un errore di dati o una quota stantia (partita rinviata, formazione nota al book e non al modello, quota pre-apertura, nome squadra sbagliato), non una miniera d'oro. Verifica la quota sul sito del book e la data della partita prima di puntare.
+
+### Selezioni di giornata (tab Selezioni di giornata)
+
+- **Giornata** — i turni delle quattro competizioni giocati nello stesso blocco della settimana calcistica: fine settimana (venerdì-lunedì) oppure turno infrasettimanale (martedì-giovedì). Ogni turno è ancorato alla data in cui si gioca la maggior parte delle sue partite, i numeri di giornata possono differire (Serie B alla 13ª, gironi di Serie C alla 14ª) e una competizione che in quel blocco non gioca (Serie B in sosta per le nazionali) semplicemente manca dall'etichetta. I recuperi di turni passati (poche partite con un numero di giornata vecchio) sono aggregati alla giornata più vicina per data.
+- **Le 5 partite più probabili da X** — fra tutte le partite della giornata di Serie B e Serie C gironi A, B e C, le cinque con la probabilità di pareggio più alta secondo il modello. Ordinate **solo per probabilità**, non per valore: una X al 33% a quota 2.90 (EV −4%) sta in lista anche se non conviene. Nota «lambda e mu vicini» = squadre equilibrate, «pochi gol attesi» = gara chiusa: entrambe spingono il pareggio.
+- **Le 12 partite più probabili da GG** — le dodici partite della giornata, sulle quattro competizioni, con la probabilità più alta che entrambe le squadre segnino. Stesso criterio: solo probabilità del modello. Nota «xG attese alte» = tanti gol attesi in totale, «entrambi gli attacchi sopra 1.2 gol attesi» = nessuna delle due dovrebbe restare a secco.
+- **«Più probabile» non è «conveniente»** — la probabilità dice quante volte l'esito accade, la quota dice quanto paga: un GG al 65% pagato 1.45 (fair 1.54) perde soldi nel lungo periodo, un GG al 55% pagato 2.00 (fair 1.82) li guadagna. Le colonne Quota Fair, Quota Book ed EV sono lì per questo: incrocia sempre la lista con la quota e con l'EV prima di puntare, e dà la precedenza alle righe che compaiono anche nel pannello valore.
+- **Nessuna quota in lista** — se Quota Book, Bookmaker ed EV sono vuoti nessun bookmaker nei dati quota quella selezione: la lista resta utile per sapere dove guardare, il prezzo va cercato a mano.
+
+### Dati e limiti
+
+- **Dati simulati vs reali** — il badge nella sidebar dice quale sta usando la dashboard. «Dati simulati» = lega sintetica generata dal programma per provare l'interfaccia (squadre vere, risultati inventati, quote del bookmaker fittizio SimBook): **non usarli per scommettere**. «Dati reali» = partite, calendario e quote raccolti da FootyStats in data/processed e data/odds.
+- **Storico di 3 stagioni** — il modello è stimato sulla stagione in corso più le due precedenti; le partite vecchie contano meno (ξ). Le squadre presenti solo nello storico (retrocesse, promosse, escluse) restano nella stima come avversarie ma non compaiono in classifica, previsioni e valore.
+- **Squadre storiche e perimetro** — il perimetro è il dizionario squadre della stagione (config/teams_<stagione>.json): le 80 squadre di Serie C A/B/C e Serie B. Una partita in programma con una squadra fuori perimetro o datata in un'altra stagione viene saltata e segnalata in «Dettagli pipeline».
+- **Copertura minima** — sotto le 15 partite giocate per squadra nella competizione meno coperta la prior resta attiva; sotto le 5-6 le stime sono comunque fragili e gli EV vanno letti con sospetto (le quote dei book incorporano già informazioni che il modello non ha ancora visto).
+- **Prime giornate** — nelle prime 3-4 giornate il modello si regge quasi solo sullo storico e sulla prior: usalo per orientarti (gol attesi, squadre equilibrate), punta poco o niente sulle sole indicazioni di valore e aspetta che la copertura cresca. Il filtro REGRESSION_TRAP ha bisogno di 3 gare giocate per squadra.
+- **Quote e tempi** — le quote cambiano fino al calcio d'inizio: un EV calcolato su quote di ieri può non esistere più oggi. Confronta la quota presa con quella di chiusura (closing line): batterla stabilmente è il segnale più affidabile che il modello vede qualcosa.
+
+### Regole di buon senso
+
+- **Bankroll fisso e separato** — decidi all'inizio quanto dedicare alle scommesse, dividilo in 100 unità e dimensiona tutto in unità; non ricaricare a stagione in corso e non puntare mai più del tappo per selezione.
+- **Mai inseguire le perdite** — una serie negativa è normale anche con EV positivo (con quote intorno a 2.70 si perde il 60% delle volte); raddoppiare la puntata per rifarsi distrugge il vantaggio del Kelly frazionario.
+- **Campione minimo prima di fidarsi** — qualche decina di scommesse non dice nulla: servono almeno 200-300 selezioni registrate (quota presa, EV, esito) per distinguere la fortuna dal valore. Tieni un registro.
+- **Confronta con le quote di chiusura** — se le quote che prendi sono in media più alte di quelle di chiusura il modello anticipa il mercato; se sono più basse stai pagando troppo, qualunque cosa dica l'EV.
+<!-- legend:end -->
 
 # ⚙️ Stack Tecnologico
 

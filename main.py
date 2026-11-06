@@ -9,7 +9,8 @@ console:
 4. next-round predictions                  (score matrix -> 1X2, O/U, GG/NG, fair odds)
 5. de-vigged bookmaker odds, EV, Kelly     (src.engine.value.ValueEngine)
 6. REGRESSION_TRAP alerts                  (xGA vs goals conceded anomaly filter)
-7. CSV export of the value report
+8. picks of the matchday                   (src.engine.picks: top-N draws and both-teams-to-score, printed before 7)
+7. CSV export of the value report and of the picks (``<stem>_selezioni.csv``)
 
 Perimeter and history
 ---------------------
@@ -41,6 +42,7 @@ Examples::
     python main.py --mode full --as-of 2026-12-20 --history 1
     python main.py --processed data/processed/matches.csv --fixtures data/processed/fixtures.csv --odds data/odds
     python main.py --season 2026_27 --kelly 0.25 --min-ev 0.05 --export reports/value.csv
+    python main.py --n-draws 8 --n-btts 15        # longer matchday pick lists (section 8)
 """
 from __future__ import annotations
 
@@ -66,6 +68,7 @@ from src.common.schemas import (
 )
 from src.common.teams import DEFAULT_SEASON, TeamRegistry, list_seasons, load_registry
 from src.engine.model import DixonColesConfig, DixonColesEngine, FittedParams
+from src.engine.picks import DEFAULT_N_BTTS, DEFAULT_N_DRAWS, Matchday, Pick, btts_picks, draw_picks, matchdays, picks_frame
 from src.engine.value import KellyConfig, RegressionTrap, ValueEngine, ValueOpportunity, detect_regression_traps
 from src.simulation.generator import (
     SimulatedLeague,
@@ -218,10 +221,20 @@ from src.dashboard.state import (  # noqa: E402
     matches_per_team,
     other_season_reason,
     perimeter_matches,
+    picks_csv_bytes,
     prior_recommended,
     simulate_current_season,
     split_by_season,
 )
+
+#: Console pointer to the glossary, printed with the matchday picks.
+LEGEND_POINTER: Final[str] = "Legenda: tab Legenda della dashboard oppure README"
+
+
+def picks_export_path(export: Path) -> Path:
+    """``reports/value_report.csv`` -> ``reports/value_report_selezioni.csv`` (next to the value report)."""
+    export = Path(export)
+    return export.with_name(f"{export.stem}_selezioni.csv")
 
 
 def parameters_at_bounds(params: FittedParams, config: DixonColesConfig, *, tol: float = 1e-3) -> list[str]:
@@ -298,6 +311,10 @@ class PipelineOutput:
     ``current_matches``/``history_matches`` split it by the registry season;
     ``skipped_fixtures`` names the fixtures that were not predicted (dated in
     another season, teams outside the perimeter or unknown to the fit).
+    ``matchdays`` groups the predicted fixtures into "giornate"
+    (:func:`src.engine.picks.matchdays`); ``draw_picks``/``btts_picks`` are the
+    section-8 lists of the next matchday and ``picks_export_path`` their CSV
+    (``None`` without ``--export``).
     """
 
     matches: pd.DataFrame
@@ -317,6 +334,15 @@ class PipelineOutput:
     current_matches: pd.DataFrame = field(default_factory=empty_matches_frame)
     history_matches: pd.DataFrame = field(default_factory=empty_matches_frame)
     skipped_fixtures: list[str] = field(default_factory=list)
+    matchdays: list[Matchday] = field(default_factory=list)
+    draw_picks: list[Pick] = field(default_factory=list)
+    btts_picks: list[Pick] = field(default_factory=list)
+    picks_export_path: Path | None = None
+
+    @property
+    def next_matchday(self) -> Matchday | None:
+        """The first upcoming matchday, ``None`` without predicted fixtures."""
+        return self.matchdays[0] if self.matchdays else None
 
 
 def run_pipeline(
@@ -330,6 +356,8 @@ def run_pipeline(
     verbose: bool = True,
     registry: TeamRegistry | None = None,
     season: str | None = None,
+    n_draws: int = DEFAULT_N_DRAWS,
+    n_btts: int = DEFAULT_N_BTTS,
 ) -> PipelineOutput:
     """Fit -> predict -> value, printing each step when ``verbose``.
 
@@ -338,7 +366,9 @@ def run_pipeline(
     season (defaults to the registry's, else to the season of the latest match).
     Only fixtures dated in that season and between current teams are predicted;
     the others are listed as skipped. Without a registry every fitted team is
-    current, as in earlier releases.
+    current, as in earlier releases. ``n_draws``/``n_btts`` size the section-8
+    lists (most probable ``X`` and ``GG`` of the next matchday); with ``export``
+    they are also written to :func:`picks_export_path`.
     """
     matches = validate_matches_df(matches)
     say = print if verbose else (lambda *a, **k: None)
@@ -521,13 +551,41 @@ def run_pipeline(
     else:
         say("nessuna squadra in trappola di regressione nella finestra corrente.")
 
+    # 8. picks of the matchday (printed before the export, which writes them too) -----
+    if verbose:
+        _banner("8) SELEZIONI DI GIORNATA (solo probabilità del modello: la quota e l'EV dicono se il prezzo vale)")
+    giornate = matchdays(p.fixture for p in predictions)
+    next_day = giornate[0] if giornate else None
+    top_draws = draw_picks(predictions, n=n_draws, matchday=next_day, opportunities=opportunities) if next_day else []
+    top_btts = btts_picks(predictions, n=n_btts, matchday=next_day, opportunities=opportunities) if next_day else []
+    draws_frame, btts_frame = picks_frame(top_draws), picks_frame(top_btts)
+    if next_day is None:
+        say("nessuna partita in programma prevedibile: nessuna giornata da selezionare.")
+    else:
+        say(f"{next_day.label} · {next_day.n_fixtures} partite" + (f" · {len(giornate)} giornate in programma" if len(giornate) > 1 else ""))
+        say(f"\nle {len(top_draws)} partite più probabili da X (tutte le competizioni):")
+        say(draws_frame.to_string(index=False) if not draws_frame.empty else "nessuna partita.")
+        say(f"\nle {len(top_btts)} partite più probabili da GG (tutte le competizioni):")
+        say(btts_frame.to_string(index=False) if not btts_frame.empty else "nessuna partita.")
+    say(f"\n{LEGEND_POINTER}")
+    log.info(
+        "matchday picks",
+        extra={"matchday": None if next_day is None else next_day.key, "n_draws": len(top_draws), "n_btts": len(top_btts), "n_matchdays": len(giornate)},
+    )
+
     # 7. export ----------------------------------------------------------------
     export_path: Path | None = None
+    picks_path: Path | None = None
     if export is not None:
         if verbose:
             _banner("7) EXPORT")
         export_path = value_engine.export_csv(opportunities, Path(export))
         say(f"report CSV scritto in: {export_path}")
+        picks_path = picks_export_path(Path(export))
+        picks_path.parent.mkdir(parents=True, exist_ok=True)
+        picks_path.write_bytes(picks_csv_bytes(draws_frame, btts_frame, next_day))
+        log.info("matchday picks exported", extra={"path": str(picks_path), "rows": len(draws_frame) + len(btts_frame)})
+        say(f"selezioni di giornata scritte in: {picks_path}")
 
     return PipelineOutput(
         matches,
@@ -546,6 +604,10 @@ def run_pipeline(
         current_matches=current,
         history_matches=history,
         skipped_fixtures=skipped_season + skipped_outside + skipped,
+        matchdays=giornate,
+        draw_picks=top_draws,
+        btts_picks=top_btts,
+        picks_export_path=picks_path,
     )
 
 
@@ -640,8 +702,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--kelly", type=float, choices=[0.125, 0.25], default=0.125, help="Kelly fraction")
     p.add_argument("--bankroll", type=float, default=100.0, help="bankroll in units")
     p.add_argument("--min-ev", type=float, default=0.035, help="EV threshold (fraction)")
-    p.add_argument("--export", type=Path, default=ROOT / "reports" / "value_report.csv")
+    p.add_argument("--export", type=Path, default=ROOT / "reports" / "value_report.csv", help="value report CSV; the matchday picks go next to it as <stem>_selezioni.csv")
     p.add_argument("--no-export", action="store_true")
+    p.add_argument("--n-draws", type=int, default=DEFAULT_N_DRAWS, metavar="N", help=f"section 8: most probable draws (X) of the next matchday to list (default {DEFAULT_N_DRAWS})")
+    p.add_argument("--n-btts", type=int, default=DEFAULT_N_BTTS, metavar="N", help=f"section 8: most probable both-teams-to-score (GG) matches to list (default {DEFAULT_N_BTTS})")
     p.add_argument("--trap-team", default=None, help="team whose last 3 matches are rewritten to showcase REGRESSION_TRAP (simulated modes only; default: automatic)")
     p.add_argument("--log-level", default="WARNING")
     p.add_argument("--log-json", action="store_true")
@@ -668,6 +732,9 @@ def main(argv: Sequence[str] | None = None) -> PipelineOutput:
 
     if args.rounds is not None and args.rounds < 1:
         build_parser().error(f"--rounds {args.rounds}: servono almeno 1 giornata giocata")
+    for option, value in (("--n-draws", args.n_draws), ("--n-btts", args.n_btts)):
+        if value < 1:
+            build_parser().error(f"{option} {value}: serve almeno 1 partita")
     as_of: date = args.as_of if args.as_of is not None else date.today()
 
     league: SimulatedLeague | None = None
@@ -754,6 +821,8 @@ def main(argv: Sequence[str] | None = None) -> PipelineOutput:
         export=None if args.no_export else args.export,
         registry=registry,
         season=season_label,
+        n_draws=args.n_draws,
+        n_btts=args.n_btts,
     )
     out.notes = input_notes + sim_notes + out.notes
 

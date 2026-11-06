@@ -65,25 +65,42 @@ from src.common.logging_config import get_logger
 from src.common.schemas import Girone, Market, MatchPrediction
 from src.common.teams import DEFAULT_SEASON, list_seasons, season_file_stem
 from src.dashboard import container_width_kwargs
+from src.dashboard.legend import (
+    POOR_EXAMPLE_FLAGS,
+    SYNTHETIC_REASON_NO_QUOTES,
+    SYNTHETIC_REASON_NO_VALUE,
+    WorkedExample,
+    legend_markdown,
+    pick_example_row,
+    worked_example_markdown,
+)
 from src.dashboard.state import (
+    ALL_MATCHDAYS,
     DEFAULT_HISTORY_SEASONS,
     MAX_HISTORY_SEASONS,
     MIN_SIM_ROUNDS,
+    Matchday,
     PipelineState,
+    btts_picks_table,
     build_state,
+    draw_picks_table,
     export_csv_bytes,
+    find_matchday,
     fixtures_for,
     heatmap_figure,
     markets_table,
     no_odds_message,
     opportunities_table,
+    picks_csv_bytes,
     predictions_table,
     quotes_for,
     ranking_table,
     strength_figure,
     traps_table,
+    value_opportunities,
     value_table,
 )
+from src.engine.picks import DEFAULT_N_BTTS, DEFAULT_N_DRAWS
 
 log = get_logger(__name__)
 
@@ -103,6 +120,21 @@ HEATMAP_MIN_GOALS: Final[int] = 3
 FULL_WIDTH: Final[dict[str, dict[str, object]]] = {
     name: container_width_kwargs(getattr(st, name)) for name in ("button", "download_button", "dataframe", "plotly_chart")
 }
+#: ``st.session_state`` key holding the selected matchday's :attr:`Matchday.key`, shared by the Match, Value and Picks tabs.
+MATCHDAY_STATE_KEY: Final[str] = "matchday"
+#: ``st.session_state`` key of the value panel's "every matchday" checkbox, read again by the Legenda tab.
+VALUE_ALL_MATCHDAYS_KEY: Final[str] = "value_all_matchdays"
+#: Largest list size the picks tab accepts (a matchday never has more fixtures than this).
+MAX_PICKS: Final[int] = 60
+#: Tab labels, in order.
+TAB_LABELS: Final[tuple[str, ...]] = (
+    "Classifica Forza",
+    "Match & Heatmap",
+    "Opportunità di Valore",
+    "Selezioni di giornata",
+    "Export",
+    "Legenda",
+)
 
 
 # =============================================================================
@@ -230,6 +262,27 @@ def selected_girone(label: str) -> Girone | None:
     return None if label == "Tutti" else Girone.parse(label)
 
 
+def selected_matchday(state: PipelineState) -> Matchday | None:
+    """The matchday the three matchday-aware tabs agree on, read from (and written to) ``st.session_state``.
+
+    The *Selezioni di giornata* tab owns the ``Giornata`` selectbox (key
+    :data:`MATCHDAY_STATE_KEY`), but *Match & Heatmap* and *Opportunità di
+    Valore* are rendered before it in the same script run, so the choice is
+    read from the session state here, once, before any tab renders: a missing
+    or stale key (the state was recomputed and that matchday no longer exists)
+    is replaced by the next matchday's key, which also seeds the selectbox
+    without passing it an ``index``. ``None`` when the state has no matchday.
+    """
+    if not state.matchdays:
+        st.session_state.pop(MATCHDAY_STATE_KEY, None)
+        return None
+    chosen = find_matchday(state, st.session_state.get(MATCHDAY_STATE_KEY))
+    if chosen is None:
+        chosen = state.matchdays[0]
+        st.session_state[MATCHDAY_STATE_KEY] = chosen.key
+    return chosen
+
+
 # =============================================================================
 # Sidebar
 # =============================================================================
@@ -337,11 +390,12 @@ def heatmap_goals_control(full_goals: int) -> int:
     )
 
 
-def render_match_tab(state: PipelineState, girone: Girone | None) -> None:
+def render_match_tab(state: PipelineState, girone: Girone | None, matchday: Matchday | None) -> None:
     st.subheader("Partita e matrice dei punteggi")
-    preds = fixtures_for(state, girone)
+    preds = fixtures_for(state, girone, matchday=matchday)
     if not preds:
-        message = "Nessuna partita in programma per la competizione selezionata."
+        message = "Nessuna partita in programma per la competizione selezionata"
+        message += "." if matchday is None else f" nella {matchday.label}."
         if state.skipped_fixtures:
             message += (
                 f" {len(state.skipped_fixtures)} partite caricate sono state saltate perché di un'altra stagione o con squadre "
@@ -349,8 +403,14 @@ def render_match_tab(state: PipelineState, girone: Girone | None) -> None:
             )
         st.info(message)
         return
+    if matchday is not None:
+        st.caption(
+            f"{matchday.label} · {len(preds)} partite"
+            + (" (tutte le competizioni)" if girone is None else f" ({girone.short})")
+            + f" · la giornata si cambia nel tab *Selezioni di giornata* ({len(state.matchdays)} in programma)."
+        )
     labels = [f"[{p.fixture.girone.value}] {p.fixture.date.isoformat()} · {p.fixture.label}" for p in preds]
-    choice = st.selectbox("Partita del prossimo turno", labels, index=0, key="fixture")
+    choice = st.selectbox("Partita della giornata", labels, index=0, key="fixture")
     pred: MatchPrediction = preds[labels.index(choice)]
     hs, as_, p_top = pred.most_likely_score()
     p_over = pred.probabilities[Market.OVER_UNDER_25]["Over 2.5"]
@@ -388,11 +448,23 @@ def render_match_tab(state: PipelineState, girone: Girone | None) -> None:
         st.caption("Nessuna quota del bookmaker per questa partita: le colonne Quota Book ed EV restano vuote.")
 
 
-def render_value_tab(state: PipelineState, girone: Girone | None, min_ev: float) -> None:
+def render_value_tab(state: PipelineState, girone: Girone | None, min_ev: float, matchday: Matchday | None) -> None:
     st.subheader("Opportunità di valore")
     if not state.quotes:
         st.info(no_odds_message(state))
-    table = value_table(state, min_ev, girone)
+    show_all = False
+    if matchday is not None:
+        show_all = bool(
+            st.checkbox(
+                "Mostra tutte le giornate",
+                value=False,
+                key=VALUE_ALL_MATCHDAYS_KEY,
+                help="Di default il pannello mostra solo la giornata selezionata nel tab Selezioni di giornata.",
+            )
+        )
+        scope = "Tutte le partite in programma" if show_all else matchday.label
+        st.caption(f"{scope} · la giornata si cambia nel tab *Selezioni di giornata* ({len(state.matchdays)} in programma).")
+    table = value_table(state, min_ev, girone, matchday=ALL_MATCHDAYS if show_all else matchday)
     if table.empty:
         if state.quotes:
             st.info(f"Nessuna selezione con EV ≥ {min_ev:.1%} per il filtro corrente.")
@@ -438,6 +510,127 @@ def render_value_tab(state: PipelineState, girone: Girone | None, min_ev: float)
         st.caption(f"Selezioni Over/GG segnalate dal filtro: {flagged}")
     else:
         st.success("Nessuna squadra in trappola di regressione nella finestra corrente.", icon="✅")
+
+
+def render_picks_tab(state: PipelineState, matchday: Matchday | None) -> None:
+    """*Selezioni di giornata*: the matchday selector and the top-N draw / both-teams-to-score lists."""
+    st.subheader("Selezioni di giornata")
+    if matchday is None or not state.matchdays:
+        message = "Nessuna partita in programma: nessuna giornata da selezionare."
+        if state.skipped_fixtures:
+            message += f" {len(state.skipped_fixtures)} partite caricate sono state saltate (dettagli in *Dettagli pipeline*)."
+        st.info(message)
+        return
+    keys = [m.key for m in state.matchdays]
+    labels = {m.key: m.label for m in state.matchdays}
+    c_day, c_draws, c_btts = st.columns([3, 1, 1])
+    with c_day:
+        chosen_key = st.selectbox(
+            "Giornata",
+            keys,
+            format_func=lambda k: labels.get(k, k),
+            key=MATCHDAY_STATE_KEY,
+            help="I turni delle competizioni giocati nello stesso blocco della settimana (fine settimana ven-lun o infrasettimanale mar-gio), con i recuperi aggregati alla giornata più vicina; vale anche per Match & Heatmap e Opportunità di Valore.",
+        )
+    with c_draws:
+        n_draws = int(st.number_input("N risultati X", min_value=1, max_value=MAX_PICKS, value=DEFAULT_N_DRAWS, step=1, key="n_draws"))
+    with c_btts:
+        n_btts = int(st.number_input("N partite GG", min_value=1, max_value=MAX_PICKS, value=DEFAULT_N_BTTS, step=1, key="n_btts"))
+    chosen = find_matchday(state, str(chosen_key)) or matchday
+    st.caption(
+        f"{chosen.label} · {chosen.n_fixtures} partite · {chosen.start.strftime('%d/%m/%Y')}"
+        + (f" - {chosen.end.strftime('%d/%m/%Y')}" if chosen.end != chosen.start else "")
+        + ". Le liste considerano tutte le competizioni, qualunque sia il filtro della sidebar."
+    )
+    column_config = {
+        "#": st.column_config.NumberColumn("#", width="small", format="%d"),
+        "Competizione": st.column_config.TextColumn("Competizione", width="small"),
+        "Data": st.column_config.DateColumn("Data", format="DD/MM/YYYY"),
+        "P. Modello (%)": st.column_config.NumberColumn("P. Modello (%)", format="%.1f %%"),
+        "Quota Fair": st.column_config.NumberColumn("Quota Fair", format="%.2f"),
+        "Quota Book": st.column_config.NumberColumn("Quota Book", format="%.2f"),
+        "EV (%)": st.column_config.NumberColumn("EV (%)", format="%+.2f %%"),
+        "Flag": st.column_config.TextColumn("Flag", help="VALUE = EV sopra soglia; REGRESSION_TRAP = GG contro una difesa in sovra-rendimento; LONGSHOT = quota > 6; SUSPICIOUS_EDGE = EV > 25%."),
+        "Nota": st.column_config.TextColumn("Nota", help="Indizio del modello: gol attesi vicini / pochi gol attesi per la X, xG attese alte / entrambi gli attacchi sopra 1.2 per il GG."),
+    }
+    draws = draw_picks_table(state, chosen, n=n_draws)
+    btts = btts_picks_table(state, chosen, n=n_btts)
+
+    st.markdown(f"**Le {len(draws)} partite più probabili da X (tutte le competizioni)**")
+    if draws.empty:
+        st.info("Nessuna partita prevista nella giornata selezionata.")
+    else:
+        st.dataframe(draws, hide_index=True, **FULL_WIDTH["dataframe"], column_config=column_config, key="picks_draws")
+    st.caption(
+        "Ordinate solo per probabilità di pareggio del modello, non per valore: Quota Fair = 1/P; Quota Book ed EV "
+        "dicono se il prezzo del bookmaker vale la puntata (EV > 0 = quota sopra la fair). Vuote quando nessun book quota la X."
+    )
+
+    st.markdown(f"**Le {len(btts)} partite più probabili da GG (tutte le competizioni)**")
+    if btts.empty:
+        st.info("Nessuna partita prevista nella giornata selezionata.")
+    else:
+        st.dataframe(btts, hide_index=True, **FULL_WIDTH["dataframe"], column_config=column_config, key="picks_btts")
+    st.caption(
+        "Ordinate solo per probabilità che entrambe segnino, non per valore: un GG molto probabile pagato sotto la "
+        "quota fair perde nel lungo periodo. Incrocia sempre con Quota Book ed EV; REGRESSION_TRAP segnala il GG "
+        "contro una difesa in sovra-rendimento."
+    )
+    st.download_button(
+        "Scarica le due liste (CSV)",
+        data=picks_csv_bytes(draws, btts, chosen),
+        file_name=f"selezioni_{chosen.key.replace('#', '_')}.csv",
+        mime="text/csv",
+        key="dl_picks",
+        help="Un solo CSV: colonna Lista = X oppure GG, poi le colonne delle tabelle.",
+        **FULL_WIDTH["download_button"],
+    )
+
+
+def value_scope_text(girone: Girone | None, matchday: Matchday | None, show_all: bool) -> str:
+    """``'Giornata del 7-9 nov 2026 · ..., Girone A'``: the value panel's current scope, for captions."""
+    days = "tutte le partite in programma" if show_all or matchday is None else matchday.label
+    return f"{days}, {'tutte le competizioni' if girone is None else girone.short}"
+
+
+def render_legend_tab(
+    state: PipelineState,
+    girone: Girone | None,
+    min_ev: float,
+    matchday: Matchday | None,
+    kelly_fraction: float,
+    bankroll: float,
+) -> None:
+    """*Legenda*: the glossary (``legend_markdown``) plus a worked example on a row of the value panel as shown.
+
+    The example row comes from the same filtered list the *Opportunità di
+    Valore* tab displays (selected matchday or every matchday, sidebar
+    competition, EV threshold): the first row without ``LONGSHOT`` /
+    ``SUSPICIOUS_EDGE`` (:func:`pick_example_row`). Without such a row the
+    example is synthetic and its header says why (no quotes at all, or no value
+    row with the current filters).
+    """
+    st.markdown(legend_markdown())
+    show_all = bool(st.session_state.get(VALUE_ALL_MATCHDAYS_KEY, False))
+    rows = value_opportunities(state, min_ev, girone, matchday=ALL_MATCHDAYS if show_all else matchday)
+    chosen = pick_example_row(rows)
+    scope = value_scope_text(girone, matchday, show_all)
+    with st.expander("Come leggere una riga del pannello valore", expanded=False):
+        if chosen is None:
+            reason = SYNTHETIC_REASON_NO_QUOTES if not state.quotes else f"{SYNTHETIC_REASON_NO_VALUE} ({scope}, soglia EV {min_ev:.1%})"
+            example = WorkedExample.synthetic(kelly_fraction=kelly_fraction, bankroll_units=bankroll, reason=reason)
+            st.caption(f"Nessuna riga nel pannello Opportunità di Valore con i filtri correnti ({scope}, soglia EV {min_ev:.1%}): esempio costruito.")
+        else:
+            example = WorkedExample.from_opportunity(chosen, bankroll_units=bankroll)
+            position = rows.index(chosen) + 1
+            if position == 1 and POOR_EXAMPLE_FLAGS.isdisjoint(chosen.flags):
+                which = "la prima riga"
+            elif position == 1:
+                which = "la prima riga (tutte le righe sono LONGSHOT o SUSPICIOUS_EDGE: leggile con la cautela che la legenda consiglia)"
+            else:
+                which = f"la riga {position} di {len(rows)}, la prima senza flag LONGSHOT / SUSPICIOUS_EDGE (quote lunghe o EV sospetti insegnano poco)"
+            st.caption(f"Esempio preso dal pannello Opportunità di Valore con i filtri correnti ({scope}, soglia EV {min_ev:.1%}): {which}.")
+        st.markdown(worked_example_markdown(example))
 
 
 def render_export_tab(state: PipelineState) -> None:
@@ -533,15 +726,20 @@ def main() -> None:
         st.markdown("\n".join(f"- {note}" for note in state.notes))
         st.caption(f"Stato calcolato alle {state.built_at.astimezone().strftime('%d/%m/%Y %H:%M:%S')} (fonte: {state.source}).")
 
-    tab_rank, tab_match, tab_value, tab_export = st.tabs(["Classifica Forza", "Match & Heatmap", "Opportunità di Valore", "Export"])
+    matchday = selected_matchday(state)  # before any tab renders, so the three matchday-aware tabs agree
+    tab_rank, tab_match, tab_value, tab_picks, tab_export, tab_legend = st.tabs(list(TAB_LABELS))
     with tab_rank:
         render_ranking_tab(state, girone)
     with tab_match:
-        render_match_tab(state, girone)
+        render_match_tab(state, girone, matchday)
     with tab_value:
-        render_value_tab(state, girone, min_ev)
+        render_value_tab(state, girone, min_ev, matchday)
+    with tab_picks:
+        render_picks_tab(state, matchday)
     with tab_export:
         render_export_tab(state)
+    with tab_legend:
+        render_legend_tab(state, girone, min_ev, matchday, kelly_fraction, bankroll)
 
 
 main()

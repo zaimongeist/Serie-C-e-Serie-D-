@@ -63,6 +63,17 @@ from src.common.schemas import (
 )
 from src.common.teams import DEFAULT_SEASON, TeamRegistry, load_registry
 from src.engine.model import DixonColesConfig, DixonColesEngine, FittedParams
+from src.engine.picks import (
+    DEFAULT_N_BTTS,
+    DEFAULT_N_DRAWS,
+    PICKS_COLUMNS,
+    Matchday,
+    Pick,
+    btts_picks,
+    draw_picks,
+    matchdays,
+    picks_frame,
+)
 from src.engine.value import (
     KellyConfig,
     RegressionTrap,
@@ -82,49 +93,68 @@ from src.simulation.generator import (
 )
 
 __all__ = [
+    "ALL_MATCHDAYS",
     "DEFAULT_HISTORY_SEASONS",
     "MARKETS_COLUMNS",
     "MARKET_LABELS",
     "MAX_HISTORY_SEASONS",
     "MIN_SIM_ROUNDS",
     "ODDS_COLUMNS",
-    "PRIOR_THRESHOLD_MATCHES",
+    "PICKS_EXPORT_COLUMNS",
     "PRIOR_MIN_MATCHES_PER_TEAM",
-    "CoverageReport",
-    "coverage_report",
-    "matches_per_team",
-    "perimeter_matches",
-    "prior_recommended",
+    "PRIOR_THRESHOLD_MATCHES",
     "RANKING_COLUMNS",
     "TRAPS_COLUMNS",
     "VALUE_COLUMNS",
+    "CoverageReport",
+    "MatchdaySelector",
     "PipelineState",
     "Source",
+    "btts_picks_table",
     "build_state",
     "competition_label",
+    "coverage_report",
+    "draw_picks_table",
     "export_csv_bytes",
+    "find_matchday",
     "fixtures_for",
     "heatmap_figure",
     "history_label",
     "load_odds_quotes",
     "markets_table",
+    "matchday_predictions",
+    "matches_per_team",
     "max_sim_rounds",
     "no_odds_message",
     "opportunities_table",
     "other_season_reason",
+    "perimeter_matches",
+    "picks_csv_bytes",
+    "picks_export_frame",
     "predictions_table",
+    "prior_recommended",
     "quotes_for",
     "ranking_table",
+    "resolve_matchday",
     "simulate_current_season",
     "split_by_season",
     "strength_figure",
     "traps_table",
+    "value_opportunities",
     "value_table",
 ]
 
 log = get_logger(__name__)
 
 Source = Literal["processed", "simulated"]
+
+#: Selector value meaning "every matchday" for :func:`fixtures_for`, :func:`value_table` and
+#: :func:`matchday_predictions`; ``None`` means "the next matchday" and a :class:`Matchday` that one.
+ALL_MATCHDAYS: Final = "all"
+MatchdaySelector = Matchday | Literal["all"] | None
+
+#: Columns of :func:`picks_export_frame`: ``Lista`` (``'X'`` / ``'GG'``) and ``Giornata`` in front of :data:`PICKS_COLUMNS`.
+PICKS_EXPORT_COLUMNS: Final[tuple[str, ...]] = ("Lista", "Giornata", *PICKS_COLUMNS)
 
 #: ``use_prior=None`` switches the Gaussian (MAP) prior on while the least-covered
 #: girone has fewer than this many played matches per team (same rule as ``main.py``).
@@ -231,7 +261,11 @@ class PipelineState:
     historical or unknown teams). ``coverage`` is the per-competition
     current-season coverage the ``use_prior=None`` rule looked at
     (:class:`CoverageReport`, with the registry competitions it ignored because
-    they have no match in the data).
+    they have no match in the data). ``matchdays`` groups the *predicted*
+    fixtures into "giornate" (:func:`src.engine.picks.matchdays`): with a real
+    provider the fixture list is the whole remaining season, so the match
+    selector, the value panel and the picks default to ``matchdays[0]``, the
+    next one (:attr:`next_matchday`).
     """
 
     matches: pd.DataFrame
@@ -251,6 +285,12 @@ class PipelineState:
     history_matches: pd.DataFrame = field(default_factory=empty_matches_frame)
     skipped_fixtures: list[str] = field(default_factory=list)
     coverage: "CoverageReport | None" = None
+    matchdays: list[Matchday] = field(default_factory=list)
+
+    @property
+    def next_matchday(self) -> Matchday | None:
+        """The first upcoming matchday (``matchdays[0]``), ``None`` without predicted fixtures."""
+        return self.matchdays[0] if self.matchdays else None
 
     @property
     def n_matches(self) -> int:
@@ -955,6 +995,18 @@ def build_state(
         f"Kelly x{kelly_fraction:g} su {bankroll_units:g} unità, {len(traps)} squadre in trappola di regressione "
         f"(stagione {season_label}), {n_trap_flags} selezioni Over/GG segnalate."
     )
+    giornate = matchdays(p.fixture for p in predictions)
+    if giornate:
+        first = giornate[0]
+        notes.append(
+            f"Partite in programma raggruppate in {len(giornate)} {'giornata' if len(giornate) == 1 else 'giornate'}; "
+            f"la prossima è {first.label} ({first.n_fixtures} partite): selettore partite, pannello valore e selezioni "
+            "di giornata la usano come default."
+        )
+    log.info(
+        "matchdays grouped",
+        extra={"n_matchdays": len(giornate), "n_predicted": len(predictions), "next": giornate[0].key if giornate else None},
+    )
     notes.append(f"Pipeline completata in {time.perf_counter() - started:.2f} s.")
     return PipelineState(
         matches=matches,
@@ -974,6 +1026,7 @@ def build_state(
         history_matches=history,
         skipped_fixtures=skipped_season + skipped_historical + skipped_unknown,
         coverage=coverage,
+        matchdays=giornate,
     )
 
 
@@ -1010,10 +1063,65 @@ def ranking_table(state: PipelineState, girone: Girone | None) -> pd.DataFrame:
     return frame[list(RANKING_COLUMNS)].reset_index(drop=True)
 
 
-def fixtures_for(state: PipelineState, girone: Girone | None) -> list[MatchPrediction]:
-    """Predictions of the upcoming fixtures (optionally one girone), sorted by date then label."""
+def find_matchday(state: PipelineState, key: str | None) -> Matchday | None:
+    """The matchday of ``state`` with that :attr:`Matchday.key`, ``None`` when unknown (or ``key`` is ``None``)."""
+    if key is None:
+        return None
+    return next((m for m in state.matchdays if m.key == key), None)
+
+
+def resolve_matchday(state: PipelineState, matchday: MatchdaySelector | str = None) -> Matchday | None:
+    """Turn a selector into a :class:`Matchday` (or ``None`` meaning "no restriction").
+
+    ``None`` -> the next matchday (``None`` when the state has none, which then
+    means every prediction, i.e. none); :data:`ALL_MATCHDAYS` -> ``None`` (no
+    restriction); a :class:`Matchday` -> itself; a key string -> the matchday
+    with that key, falling back to the next one when the key is stale.
+    """
+    if matchday is ALL_MATCHDAYS or (isinstance(matchday, str) and matchday == ALL_MATCHDAYS):
+        return None
+    if matchday is None:
+        return state.next_matchday
+    if isinstance(matchday, Matchday):
+        return matchday
+    found = find_matchday(state, str(matchday))
+    if found is None:
+        log.debug("unknown matchday key, using the next matchday", extra={"key": str(matchday)})
+        return state.next_matchday
+    return found
+
+
+def _restrict(state: PipelineState, matchday: MatchdaySelector) -> list[MatchPrediction]:
+    """Predictions of the selected matchday (every prediction for :data:`ALL_MATCHDAYS`).
+
+    With ``None`` and no matchday in the state (no predicted fixture) there is
+    nothing to show, so the result is empty, consistent with the selectors.
+    """
+    if matchday is ALL_MATCHDAYS or (isinstance(matchday, str) and matchday == ALL_MATCHDAYS):
+        return list(state.predictions)
+    chosen = resolve_matchday(state, matchday)
+    if chosen is None:
+        return []
+    return [p for p in state.predictions if chosen.contains(p)]
+
+
+def matchday_predictions(state: PipelineState, matchday: MatchdaySelector = None) -> list[MatchPrediction]:
+    """Predictions of one matchday (the next by default, all with :data:`ALL_MATCHDAYS`), sorted by date, competition, label."""
+    preds = _restrict(state, matchday)
+    order = list(Girone)
+    return sorted(preds, key=lambda p: (p.fixture.date, order.index(p.fixture.girone), p.fixture.label, p.fixture.match_id))
+
+
+def fixtures_for(state: PipelineState, girone: Girone | None, matchday: MatchdaySelector = None) -> list[MatchPrediction]:
+    """Predictions of the upcoming fixtures (optionally one girone), sorted by date then label.
+
+    ``matchday`` defaults to the **next** matchday, so with a season-long fixture
+    list the match selector shows one "giornata" instead of hundreds of
+    fixtures; pass a :class:`Matchday` to pick another one or
+    :data:`ALL_MATCHDAYS` for every predicted fixture (the exports do).
+    """
     g = _as_girone(girone)
-    preds = [p for p in state.predictions if g is None or p.fixture.girone == g]
+    preds = [p for p in _restrict(state, matchday) if g is None or p.fixture.girone == g]
     return sorted(preds, key=lambda p: (p.fixture.date, p.fixture.label))
 
 
@@ -1253,9 +1361,41 @@ def markets_table(prediction: MatchPrediction, quotes: list[OddsQuote]) -> pd.Da
     return frame
 
 
-def value_table(state: PipelineState, min_ev: float, girone: Girone | None = None) -> pd.DataFrame:
-    """Selections with ``ev >= min_ev`` (optionally one competition), EV descending, Italian labels."""
+def value_opportunities(
+    state: PipelineState,
+    min_ev: float,
+    girone: Girone | None = None,
+    matchday: MatchdaySelector = None,
+) -> list[ValueOpportunity]:
+    """The rows of the value panel as objects: ``ev >= min_ev``, one competition when given, one matchday.
+
+    Exactly the selection and the order of :func:`value_table` (EV descending,
+    then match label, market and selection), so a caller that needs the panel's
+    first row -- the worked example of the *Legenda* tab -- reads it from here
+    instead of re-filtering ``state.opportunities``. ``matchday`` defaults to
+    the next matchday like :func:`fixtures_for`; :data:`ALL_MATCHDAYS` lifts the
+    restriction.
+    """
     g = _as_girone(girone)
+    allowed = {p.fixture.match_id for p in _restrict(state, matchday)}
+    rows = [o for o in state.opportunities if o.ev >= min_ev and (g is None or o.girone == g) and o.match_id in allowed]
+    # the table sorts on the EV rounded to 2 decimals in percent; do the same so the two orders agree
+    rows.sort(key=lambda o: (-round(o.ev * 100.0, 2), f"{o.home_team} - {o.away_team}", MARKET_LABELS[o.market], o.selection))
+    return rows
+
+
+def value_table(
+    state: PipelineState,
+    min_ev: float,
+    girone: Girone | None = None,
+    matchday: MatchdaySelector = None,
+) -> pd.DataFrame:
+    """Selections with ``ev >= min_ev`` (optionally one competition), EV descending, Italian labels.
+
+    Like :func:`fixtures_for`, ``matchday`` defaults to the next matchday; pass
+    :data:`ALL_MATCHDAYS` to list the value selections of the whole fixture list.
+    The rows are those of :func:`value_opportunities`, in the same order.
+    """
     rows = [
         {
             "Data": pd.Timestamp(o.date),
@@ -1271,8 +1411,7 @@ def value_table(state: PipelineState, min_ev: float, girone: Girone | None = Non
             "Stake (unità)": round(o.stake_units, 1),
             "Flag": " | ".join(o.flags),
         }
-        for o in state.opportunities
-        if o.ev >= min_ev and (g is None or o.girone == g)
+        for o in value_opportunities(state, min_ev, girone, matchday)
     ]
     frame = pd.DataFrame(rows, columns=list(VALUE_COLUMNS))
     frame = frame.assign(Data=pd.to_datetime(frame["Data"]).astype("datetime64[ns]"))
@@ -1321,7 +1460,7 @@ def predictions_table(state: PipelineState) -> pd.DataFrame:
     (``p_1, p_x, p_2, p_over_1.5, ...``).
     """
     rows: list[dict[str, object]] = []
-    for p in fixtures_for(state, None):
+    for p in fixtures_for(state, None, matchday=ALL_MATCHDAYS):
         fx = p.fixture
         hs, as_, p_top = p.most_likely_score()
         row: dict[str, object] = {
@@ -1356,6 +1495,76 @@ def predictions_table(state: PipelineState) -> pd.DataFrame:
 def opportunities_table(state: PipelineState) -> pd.DataFrame:
     """The full :meth:`ValueEngine.to_frame` of every evaluated selection (value or not)."""
     return ValueEngine().to_frame(state.opportunities)
+
+
+# =============================================================================
+# Picks of the matchday
+# =============================================================================
+def _picks(
+    state: PipelineState,
+    matchday: MatchdaySelector,
+    girone: Girone | None,
+    *,
+    draws: bool,
+    n: int,
+) -> list[Pick]:
+    """Shared body of :func:`draw_picks_table` / :func:`btts_picks_table`."""
+    g = _as_girone(girone)
+    preds = _restrict(state, matchday)
+    if g is not None:
+        preds = [p for p in preds if p.fixture.girone == g]
+    chooser = draw_picks if draws else btts_picks
+    return chooser(preds, n=n, matchday=None, opportunities=state.opportunities)
+
+
+def draw_picks_table(
+    state: PipelineState,
+    matchday: MatchdaySelector = None,
+    n: int = DEFAULT_N_DRAWS,
+    girone: Girone | None = None,
+) -> pd.DataFrame:
+    """The ``n`` most probable draws (``X``) of the matchday as a :func:`picks_frame` (Italian columns).
+
+    ``matchday`` defaults to the next one (:data:`ALL_MATCHDAYS` for the whole
+    fixture list); ``girone`` optionally restricts the candidates to one
+    competition, the default being all four, as the user asked.
+    """
+    return picks_frame(_picks(state, matchday, girone, draws=True, n=n))
+
+
+def btts_picks_table(
+    state: PipelineState,
+    matchday: MatchdaySelector = None,
+    n: int = DEFAULT_N_BTTS,
+    girone: Girone | None = None,
+) -> pd.DataFrame:
+    """The ``n`` most probable both-teams-to-score matches (``GG``) of the matchday, see :func:`draw_picks_table`."""
+    return picks_frame(_picks(state, matchday, girone, draws=False, n=n))
+
+
+def picks_export_frame(draws: pd.DataFrame, btts: pd.DataFrame, matchday: Matchday | None = None) -> pd.DataFrame:
+    """One frame for both lists: ``Lista`` (``'X'`` / ``'GG'``) and ``Giornata`` (the matchday label) in front of the picks columns.
+
+    ``draws``/``btts`` are :func:`picks_frame` frames (the tables shown on
+    screen); the result has exactly :data:`PICKS_EXPORT_COLUMNS` also when both
+    are empty.
+    """
+    label = "" if matchday is None else matchday.label
+    parts: list[pd.DataFrame] = []
+    for name, frame in (("X", draws), ("GG", btts)):
+        if frame.empty:
+            continue
+        parts.append(frame.assign(Lista=name, Giornata=label)[list(PICKS_EXPORT_COLUMNS)])
+    if not parts:
+        empty = picks_frame([]).assign(Lista=pd.Series(dtype="string"), Giornata=pd.Series(dtype="string"))
+        return empty[list(PICKS_EXPORT_COLUMNS)]
+    out = pd.concat(parts, ignore_index=True)
+    return out.assign(Lista=out["Lista"].astype("string"), Giornata=out["Giornata"].astype("string"))
+
+
+def picks_csv_bytes(draws: pd.DataFrame, btts: pd.DataFrame, matchday: Matchday | None = None) -> bytes:
+    """CSV bytes (see :func:`export_csv_bytes`) of :func:`picks_export_frame`, for the download button and the console export."""
+    return export_csv_bytes(picks_export_frame(draws, btts, matchday))
 
 
 def export_csv_bytes(frame: pd.DataFrame) -> bytes:
