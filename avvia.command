@@ -38,7 +38,7 @@ if [ "${1:-}" != "--solo-dashboard" ]; then
     echo ">> Nessuna chiave FootyStats trovata."
     echo "   Incolla qui la chiave API di FootyStats e premi Invio (oppure premi solo Invio per usare SofaScore)."
     read -r -p "   Chiave: " FS_KEY
-    FS_KEY="$(printf '%s' "$FS_KEY" | tr -d '[:space:]"'"'"')"
+    FS_KEY="$(printf '%s' "$FS_KEY" | tr -d ' \t\r\n"' | tr -d "'")"
     if [ -n "$FS_KEY" ]; then
       printf 'FOOTYSTATS_API_KEY=%s\n' "$FS_KEY" > .env
       echo "   Chiave salvata nel file .env (resta solo su questo computer)."
