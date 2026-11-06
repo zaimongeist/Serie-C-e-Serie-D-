@@ -149,7 +149,7 @@ LEGEND: Final[tuple[LegendSection, ...]] = (
         ),
     ),
     LegendSection(
-        "Previsione della partita (tab Match & Heatmap)",
+        "Previsione della partita (tab Giornata)",
         (
             _e(
                 "λ (lambda) · Gol attesi casa",
@@ -179,6 +179,94 @@ LEGEND: Final[tuple[LegendSection, ...]] = (
                 "per ogni mercato gli esiti sono esaustivi e si escludono a vicenda, quindi sommano al 100% (1 + X + 2, "
                 "Over 2.5 + Under 2.5, GG + NG). Over 1.5 / 2.5 / 3.5 contano i gol totali (strettamente più di 1, 2, 3); "
                 "GG = «entrambe le squadre segnano», NG = almeno una resta a zero.",
+            ),
+        ),
+    ),
+    LegendSection(
+        "Tabella giornata e risultati",
+        (
+            _e(
+                "Tabella giornata (tab Giornata)",
+                "una riga per ogni partita della giornata scelta (tutte le competizioni o quella della sidebar): forza delle "
+                "due squadre (α, β), forma recente, gol attesi del modello, risultato più probabile, probabilità e quote fair "
+                "dei mercati, miglior quota book per esito, EV migliore e flag. Tutto il turno si legge in un colpo d'occhio; "
+                "cliccando una riga (o scegliendo la gara nel menù «Partita») sotto compaiono la matrice dei punteggi e i "
+                "mercati di quella partita. «Scarica tabella giornata (CSV)» ha le stesse colonne più match_id.",
+            ),
+            _e(
+                "Forma (Casa / Ospiti)",
+                "gli esiti delle ultime 5 partite giocate dalla squadra nella stagione corrente, casa e trasferta insieme, "
+                "dalla più recente alla più vecchia: V vittoria, N pareggio (nullo), P sconfitta. «V-V-N-P-N» = ha vinto le "
+                "ultime due. Meno di 5 lettere = ha giocato meno di 5 partite; vuota = nessuna partita giocata.",
+            ),
+            _e(
+                "Pt (5)",
+                "punti raccolti nelle stesse ultime 5 partite (3 per vittoria, 1 per pareggio): da 0 a 15; il numero fra "
+                "parentesi nel nome della colonna è la finestra. Non è la classifica: misura il momento di forma, che il "
+                "modello non usa direttamente (α e β pesano tutta la stagione, più lo storico).",
+            ),
+            _e(
+                "GF/GS (5)",
+                "gol fatti / gol subiti nelle ultime 5 partite: «9/4» = 9 segnati e 4 subiti. Confrontalo con λ e μ: una "
+                "squadra che segna molto più di quanto il modello si aspetti sta sovra-performando (o il modello la "
+                "sottovaluta), una che subisce poco con tanti xG contro è candidata alla trappola di regressione.",
+            ),
+            _e(
+                "xG F/S (3)",
+                "expected goals prodotti / concessi nelle ultime 3 partite: «4.1/2.6» = 4.1 xG creati e 2.6 subiti; «-» "
+                "quando il dato manca anche in una sola delle tre gare. La finestra di 3 è la stessa del filtro "
+                "REGRESSION_TRAP: xG subiti alti con pochi gol subiti (GF/GS) = difesa in sovra-rendimento.",
+            ),
+            _e(
+                "Tot. att.",
+                "λ + μ, i gol totali attesi della partita secondo il modello: sopra 2.8 gara da Over, sotto 2.2 gara "
+                "chiusa. È la stessa somma che guida le probabilità Over/Under e GG delle colonne accanto.",
+            ),
+            _e(
+                "Ris. prob.",
+                "il risultato esatto più probabile con la sua probabilità, «1-0 (14%)»: la cella più alta della matrice "
+                "dei punteggi, di norma fra il 10 e il 14%. Non è «il pronostico»: un 1-1 al 13% convive con una vittoria "
+                "casa al 45%.",
+            ),
+            _e(
+                "P1 / PX / P2, O1.5 / O2.5 / O3.5, GG (%) · Fair · Book",
+                "le probabilità del modello per vittoria casa, pareggio, vittoria ospite, Over 1.5 / 2.5 / 3.5 gol totali ed "
+                "entrambe a segno; Fair 1 / X / 2 / O2.5 / GG le quote fair corrispondenti (1/P); Book 1 / X / 2 / O2.5 / GG "
+                "la miglior quota fra i bookmaker presenti nei dati per quell'esito (vuota se nessuno lo quota).",
+            ),
+            _e(
+                "EV max (%) · Miglior EV",
+                "il valore atteso più alto fra tutte le selezioni quotate della partita (ogni mercato, ogni bookmaker) e la "
+                "selezione che lo realizza: «X @3.40» = il pareggio alla quota 3.40. È il punto da cui partire per quella "
+                "partita; il dettaglio (bookmaker, edge, stake) è nel pannello Opportunità di Valore. Vuoti senza quote.",
+            ),
+            _e(
+                "Flag (tabella giornata)",
+                "l'unione dei flag di tutte le selezioni quotate della partita (VALUE, LONGSHOT, SUSPICIOUS_EDGE: vedi la "
+                "sezione Flag) più REGRESSION_TRAP e TRAP:<squadra> quando una delle due squadre è in trappola di "
+                "regressione, anche senza quote: il segnale sulla difesa vale a prescindere dal prezzo.",
+            ),
+            _e(
+                "Tabella risultati (tab Risultati)",
+                "una riga per ogni partita già giocata della stagione e della competizione scelte, filtrabile per squadra "
+                "(il menù offre chi ha giocato quella stagione in quella competizione: nelle stagioni passate anche le squadre "
+                "non più nel perimetro, mai una squadra senza partite): risultato, esito 1X2, tiri, tiri in porta "
+                "e angoli casa/ospiti («12/7», «-» se il dato manca), xG di entrambe, più la lettura del modello (λ, μ, P "
+                "esito, Sorpresa). Le colonne si ordinano cliccando l'intestazione; «Scarica risultati (CSV)» la esporta.",
+            ),
+            _e(
+                "P esito (%)",
+                "la probabilità che il modello assegna all'esito 1X2 effettivamente avvenuto, calcolata con λ e μ di quella "
+                "partita (la stessa matrice dei punteggi). Attenzione: il modello è stimato su tutte le partite giocate, "
+                "compresa quella stessa, quindi è una lettura a posteriori, non una previsione fatta prima del calcio "
+                "d'inizio; serve a vedere quali risultati il modello spiega e quali no.",
+            ),
+            _e(
+                "Sorpresa",
+                "«sorpresa» quando P esito è sotto il 20% (un esito che il modello riteneva improbabile), «atteso» sopra il "
+                "50% (l'esito che il modello indicava come favorito), vuoto nel mezzo. Molte sorprese di fila per una "
+                "squadra = qualcosa che il modello non vede (infortuni, cambio allenatore, calendario) oppure semplice "
+                "varianza: è un invito a guardare, non un segnale di scommessa.",
             ),
         ),
     ),
@@ -428,7 +516,7 @@ def legend_markdown() -> str:
         (
             "Glossario di tutti i numeri mostrati da dashboard, console ed export, scritto per chi li usa per pianificare "
             "le scommesse. Le formule sono quelle del codice (`src/engine/model.py`, `src/engine/value.py`, "
-            "`src/engine/picks.py`)."
+            "`src/engine/picks.py`, `src/engine/tables.py`)."
         ),
     ]
     for section in LEGEND:

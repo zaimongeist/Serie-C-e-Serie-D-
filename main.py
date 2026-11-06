@@ -6,11 +6,13 @@ console:
 1. dataset summary per season              (src.simulation.generator or harvested CSV)
 2. Dixon-Coles fit                         (src.engine.model.DixonColesEngine)
 3. strength ranking per girone             (alpha / beta / gamma, current teams only)
-4. next-round predictions                  (score matrix -> 1X2, O/U, GG/NG, fair odds)
+4. next-matchday table                     (src.engine.tables.matchday_table: one row per fixture with form,
+                                           rates, probabilities, fair and book odds, EV max and flags)
 5. de-vigged bookmaker odds, EV, Kelly     (src.engine.value.ValueEngine)
 6. REGRESSION_TRAP alerts                  (xGA vs goals conceded anomaly filter)
 8. picks of the matchday                   (src.engine.picks: top-N draws and both-teams-to-score, printed before 7)
-7. CSV export of the value report and of the picks (``<stem>_selezioni.csv``)
+7. CSV export of the value report, of the picks (``<stem>_selezioni.csv``), of the matchday table
+   (``<stem>_giornata.csv``) and of the played results (``<stem>_risultati.csv``)
 
 Perimeter and history
 ---------------------
@@ -59,7 +61,6 @@ from src.common.logging_config import configure_logging, get_logger
 from src.common.paths import ROOT
 from src.common.schemas import (
     Fixture,
-    Market,
     MatchPrediction,
     OddsQuote,
     empty_matches_frame,
@@ -69,6 +70,7 @@ from src.common.schemas import (
 from src.common.teams import DEFAULT_SEASON, TeamRegistry, list_seasons, load_registry
 from src.engine.model import DixonColesConfig, DixonColesEngine, FittedParams
 from src.engine.picks import DEFAULT_N_BTTS, DEFAULT_N_DRAWS, Matchday, Pick, btts_picks, draw_picks, matchdays, picks_frame
+from src.engine.tables import matchday_table, results_table
 from src.engine.value import KellyConfig, RegressionTrap, ValueEngine, ValueOpportunity, detect_regression_traps
 from src.simulation.generator import (
     SimulatedLeague,
@@ -217,6 +219,7 @@ from src.dashboard.state import (  # noqa: E402
     PRIOR_MIN_MATCHES_PER_TEAM,
     CoverageReport,
     coverage_report,
+    export_csv_bytes,
     history_label,
     matches_per_team,
     other_season_reason,
@@ -231,10 +234,77 @@ from src.dashboard.state import (  # noqa: E402
 LEGEND_POINTER: Final[str] = "Legenda: tab Legenda della dashboard oppure README"
 
 
+#: Columns of the matchday table printed by section 4 (the full table goes to ``<stem>_giornata.csv``).
+CONSOLE_MATCHDAY_COLUMNS: Final[tuple[str, ...]] = (
+    "Competizione",
+    "Data",
+    "Casa",
+    "Ospiti",
+    "λ",
+    "μ",
+    "P1 (%)",
+    "PX (%)",
+    "P2 (%)",
+    "O2.5 (%)",
+    "GG (%)",
+    "Fair X",
+    "Book X",
+    "EV max (%)",
+    "Flag",
+)
+#: One-line reading guide of the compact table, printed under it.
+MATCHDAY_CONSOLE_LEGEND: Final[str] = (
+    "colonne: λ/μ gol attesi casa/ospiti · P1 PX P2 O2.5 GG probabilità % del modello · Fair X quota fair del pareggio · "
+    "Book X miglior quota book della X · EV max miglior valore atteso % fra le selezioni quotate · Flag unione dei flag "
+    "della partita (tabella completa con forma, α/β, tutte le quote e match_id nel CSV <export>_giornata.csv)"
+)
+
+
 def picks_export_path(export: Path) -> Path:
     """``reports/value_report.csv`` -> ``reports/value_report_selezioni.csv`` (next to the value report)."""
     export = Path(export)
     return export.with_name(f"{export.stem}_selezioni.csv")
+
+
+def matchday_export_path(export: Path) -> Path:
+    """``reports/value_report.csv`` -> ``reports/value_report_giornata.csv`` (the matchday table of section 4)."""
+    export = Path(export)
+    return export.with_name(f"{export.stem}_giornata.csv")
+
+
+def results_export_path(export: Path) -> Path:
+    """``reports/value_report.csv`` -> ``reports/value_report_risultati.csv`` (the played matches of the current season)."""
+    export = Path(export)
+    return export.with_name(f"{export.stem}_risultati.csv")
+
+
+def format_matchday_console(frame: pd.DataFrame, columns: Sequence[str] = CONSOLE_MATCHDAY_COLUMNS) -> str:
+    """Compact text view of a :func:`~src.engine.tables.matchday_table` frame for the console.
+
+    Only ``columns`` are shown (:data:`CONSOLE_MATCHDAY_COLUMNS` by default);
+    percentages with one decimal, odds and rates with two, the EV with its sign,
+    ``-`` for a missing value (an unquoted selection). ``'nessuna partita.'`` for
+    an empty frame.
+    """
+    if frame.empty:
+        return "nessuna partita."
+    view = frame[list(columns)].copy()
+    if "Data" in view.columns:
+        view["Data"] = pd.to_datetime(view["Data"]).dt.strftime("%Y-%m-%d")
+
+    def pct(value: float) -> str:
+        return "-" if pd.isna(value) else f"{value:.1f}"
+
+    def odds(value: float) -> str:
+        return "-" if pd.isna(value) else f"{value:.2f}"
+
+    def signed(value: float) -> str:
+        return "-" if pd.isna(value) else f"{value:+.2f}"
+
+    formatters = {c: pct for c in view.columns if c.endswith("(%)") and not c.startswith("EV")}
+    formatters.update({c: odds for c in view.columns if c in ("λ", "μ", "Tot. att.") or c.startswith(("Fair ", "Book "))})
+    formatters.update({c: signed for c in view.columns if c.startswith("EV")})
+    return view.to_string(index=False, formatters=formatters, na_rep="-")
 
 
 def parameters_at_bounds(params: FittedParams, config: DixonColesConfig, *, tol: float = 1e-3) -> list[str]:
@@ -314,7 +384,11 @@ class PipelineOutput:
     ``matchdays`` groups the predicted fixtures into "giornate"
     (:func:`src.engine.picks.matchdays`); ``draw_picks``/``btts_picks`` are the
     section-8 lists of the next matchday and ``picks_export_path`` their CSV
-    (``None`` without ``--export``).
+    (``None`` without ``--export``). ``matchday_frame`` is the section-4 table of
+    the next matchday (:func:`src.engine.tables.matchday_table`, every column)
+    and ``results_frame`` the played matches of the current season with the
+    model's reading (:func:`src.engine.tables.results_table`); with ``--export``
+    they are written to ``matchday_export_path`` / ``results_export_path``.
     """
 
     matches: pd.DataFrame
@@ -338,6 +412,10 @@ class PipelineOutput:
     draw_picks: list[Pick] = field(default_factory=list)
     btts_picks: list[Pick] = field(default_factory=list)
     picks_export_path: Path | None = None
+    matchday_frame: pd.DataFrame = field(default_factory=pd.DataFrame)
+    results_frame: pd.DataFrame = field(default_factory=pd.DataFrame)
+    matchday_export_path: Path | None = None
+    results_export_path: Path | None = None
 
     @property
     def next_matchday(self) -> Matchday | None:
@@ -368,7 +446,11 @@ def run_pipeline(
     the others are listed as skipped. Without a registry every fitted team is
     current, as in earlier releases. ``n_draws``/``n_btts`` size the section-8
     lists (most probable ``X`` and ``GG`` of the next matchday); with ``export``
-    they are also written to :func:`picks_export_path`.
+    they are also written to :func:`picks_export_path`. Section 4 prints the
+    next matchday as one table (:func:`format_matchday_console`) instead of one
+    line per fixture; with ``export`` the full table and the played results of
+    the current season go to :func:`matchday_export_path` /
+    :func:`results_export_path`.
     """
     matches = validate_matches_df(matches)
     say = print if verbose else (lambda *a, **k: None)
@@ -494,26 +576,7 @@ def run_pipeline(
         notes.append(f"{len(skipped_outside)} partite in programma saltate (squadre fuori dal perimetro {label}): {', '.join(skipped_outside[:5])}" + (" ..." if len(skipped_outside) > 5 else "") + ".")
     if skipped:
         notes.append(f"{len(skipped)} partite in programma saltate (squadre non presenti nello storico): {', '.join(skipped[:5])}" + (" ..." if len(skipped) > 5 else "") + ".")
-    for p in predictions:
-        fx = p.fixture
-        hs, as_, ps = p.most_likely_score()
-        p1x2 = p.probabilities[Market.MATCH_ODDS]
-        pou = p.probabilities[Market.OVER_UNDER_25]
-        pgg = p.probabilities[Market.BTTS]
-        fo = p.fair_odds
-        say(
-            f"[{fx.girone.value}] {fx.date} {fx.home_team} - {fx.away_team}: "
-            f"lambda={p.home_rate:.2f} mu={p.away_rate:.2f} | "
-            f"1={p1x2['1']:.1%} X={p1x2['X']:.1%} 2={p1x2['2']:.1%} "
-            f"(fair {fo[Market.MATCH_ODDS]['1']:.2f}/{fo[Market.MATCH_ODDS]['X']:.2f}/{fo[Market.MATCH_ODDS]['2']:.2f}) | "
-            f"O2.5={pou['Over 2.5']:.1%} GG={pgg['GG']:.1%} | risultato più probabile {hs}-{as_} ({ps:.1%})"
-        )
-    if not predictions:
-        say("nessuna partita in programma nel dataset." if not (skipped or skipped_outside or skipped_season) else "nessuna partita in programma prevedibile.")
-
-    # 5-6. value + traps -------------------------------------------------------
-    if verbose:
-        _banner("5) QUOTE BOOKMAKER DE-VIGGATE, EV E KELLY FRAZIONARIO")
+    # the value engine runs here (its Book / EV / Flag columns belong to the matchday table); section 5 prints it
     trap_frame = current if len(current) else matches
     traps = [
         t
@@ -526,6 +589,28 @@ def run_pipeline(
         if params.is_current(t.team)
     ]
     opportunities = value_engine.evaluate(predictions, quotes, matches=trap_frame, traps=traps)
+    giornate = matchdays(p.fixture for p in predictions)
+    next_day = giornate[0] if giornate else None
+    matchday_frame = matchday_table(predictions, params=params, matches=trap_frame, opportunities=opportunities, traps=traps, matchday=next_day)
+    if next_day is None:
+        say("nessuna partita in programma nel dataset." if not (skipped or skipped_outside or skipped_season) else "nessuna partita in programma prevedibile.")
+    else:
+        others = len(predictions) - len(matchday_frame)
+        say(
+            f"{next_day.label} · {len(matchday_frame)} partite"
+            + (f" · altre {others} partite nelle {len(giornate) - 1} giornate successive (solo nel CSV delle previsioni)" if others else "")
+        )
+        say(format_matchday_console(matchday_frame))
+        say(MATCHDAY_CONSOLE_LEGEND)
+    results_frame = results_table(matches, engine=engine, season=label)
+    log.info(
+        "matchday table",
+        extra={"matchday": None if next_day is None else next_day.key, "n_rows": len(matchday_frame), "n_results": len(results_frame)},
+    )
+
+    # 5-6. value + traps -------------------------------------------------------
+    if verbose:
+        _banner("5) QUOTE BOOKMAKER DE-VIGGATE, EV E KELLY FRAZIONARIO")
     frame = value_engine.to_frame(opportunities)
     value = value_engine.value_bets(opportunities)
     say(f"quote valutate: {len(opportunities)}   soglia EV: {value_engine.min_ev:+.1%}   Kelly frazionario: x{value_engine.kelly.fraction}   bankroll: {value_engine.kelly.bankroll_units:.0f} unità")
@@ -554,8 +639,6 @@ def run_pipeline(
     # 8. picks of the matchday (printed before the export, which writes them too) -----
     if verbose:
         _banner("8) SELEZIONI DI GIORNATA (solo probabilità del modello: la quota e l'EV dicono se il prezzo vale)")
-    giornate = matchdays(p.fixture for p in predictions)
-    next_day = giornate[0] if giornate else None
     top_draws = draw_picks(predictions, n=n_draws, matchday=next_day, opportunities=opportunities) if next_day else []
     top_btts = btts_picks(predictions, n=n_btts, matchday=next_day, opportunities=opportunities) if next_day else []
     draws_frame, btts_frame = picks_frame(top_draws), picks_frame(top_btts)
@@ -576,6 +659,8 @@ def run_pipeline(
     # 7. export ----------------------------------------------------------------
     export_path: Path | None = None
     picks_path: Path | None = None
+    matchday_path: Path | None = None
+    results_path: Path | None = None
     if export is not None:
         if verbose:
             _banner("7) EXPORT")
@@ -586,6 +671,14 @@ def run_pipeline(
         picks_path.write_bytes(picks_csv_bytes(draws_frame, btts_frame, next_day))
         log.info("matchday picks exported", extra={"path": str(picks_path), "rows": len(draws_frame) + len(btts_frame)})
         say(f"selezioni di giornata scritte in: {picks_path}")
+        matchday_path = matchday_export_path(Path(export))
+        matchday_path.write_bytes(export_csv_bytes(matchday_frame))
+        log.info("matchday table exported", extra={"path": str(matchday_path), "rows": len(matchday_frame)})
+        say(f"tabella giornata scritta in: {matchday_path}")
+        results_path = results_export_path(Path(export))
+        results_path.write_bytes(export_csv_bytes(results_frame))
+        log.info("results table exported", extra={"path": str(results_path), "rows": len(results_frame)})
+        say(f"risultati giocati scritti in: {results_path}")
 
     return PipelineOutput(
         matches,
@@ -608,6 +701,10 @@ def run_pipeline(
         draw_picks=top_draws,
         btts_picks=top_btts,
         picks_export_path=picks_path,
+        matchday_frame=matchday_frame,
+        results_frame=results_frame,
+        matchday_export_path=matchday_path,
+        results_export_path=results_path,
     )
 
 

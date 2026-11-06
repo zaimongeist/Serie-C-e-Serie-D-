@@ -7,7 +7,9 @@ dashboard can be unit-tested without a browser:
   predict -> value) and returns an immutable-by-convention
   :class:`PipelineState` snapshot;
 * the ``*_table`` helpers turn that snapshot into ``pandas`` frames with
-  Italian column labels, ready for ``st.dataframe``;
+  Italian column labels, ready for ``st.dataframe`` (:func:`matchday_table_for`
+  is the whole matchday in one table, :func:`results_table_for` the played
+  matches, both from :mod:`src.engine.tables`);
 * :func:`heatmap_figure` builds the score-matrix Plotly figure (whole matrix
   by default, or a compact view whose last row/column aggregate the tail);
 * :func:`export_csv_bytes` serialises any frame for ``st.download_button``.
@@ -74,6 +76,14 @@ from src.engine.picks import (
     matchdays,
     picks_frame,
 )
+from src.engine.tables import (
+    MATCHDAY_COLUMNS,
+    RESULTS_COLUMNS,
+    RESULTS_MODEL_COLUMNS,
+    matchday_table,
+    results_table,
+    team_matches,
+)
 from src.engine.value import (
     KellyConfig,
     RegressionTrap,
@@ -97,6 +107,8 @@ __all__ = [
     "DEFAULT_HISTORY_SEASONS",
     "MARKETS_COLUMNS",
     "MARKET_LABELS",
+    "MATCHDAY_COLUMNS",
+    "MATCHDAY_TABLE_KEY_PREFIX",
     "MAX_HISTORY_SEASONS",
     "MIN_SIM_ROUNDS",
     "ODDS_COLUMNS",
@@ -104,6 +116,8 @@ __all__ = [
     "PRIOR_MIN_MATCHES_PER_TEAM",
     "PRIOR_THRESHOLD_MATCHES",
     "RANKING_COLUMNS",
+    "RESULTS_COLUMNS",
+    "RESULTS_MODEL_COLUMNS",
     "TRAPS_COLUMNS",
     "VALUE_COLUMNS",
     "CoverageReport",
@@ -114,15 +128,20 @@ __all__ = [
     "build_state",
     "competition_label",
     "coverage_report",
+    "current_teams",
     "draw_picks_table",
     "export_csv_bytes",
     "find_matchday",
+    "fixture_label",
     "fixtures_for",
     "heatmap_figure",
     "history_label",
     "load_odds_quotes",
     "markets_table",
+    "matchday_csv_bytes",
     "matchday_predictions",
+    "matchday_table_for",
+    "matchday_table_key",
     "matches_per_team",
     "max_sim_rounds",
     "no_odds_message",
@@ -136,6 +155,11 @@ __all__ = [
     "quotes_for",
     "ranking_table",
     "resolve_matchday",
+    "results_csv_bytes",
+    "results_table_for",
+    "results_team_options",
+    "seasons_available",
+    "selected_row_match_id",
     "simulate_current_season",
     "split_by_season",
     "strength_figure",
@@ -286,6 +310,21 @@ class PipelineState:
     skipped_fixtures: list[str] = field(default_factory=list)
     coverage: "CoverageReport | None" = None
     matchdays: list[Matchday] = field(default_factory=list)
+    #: Lazily built per-team long frame of the current-season matches (see :meth:`team_matches_frame`).
+    _team_matches: pd.DataFrame | None = field(default=None, init=False, repr=False, compare=False)
+
+    def team_matches_frame(self) -> pd.DataFrame:
+        """Per-team long frame of the **current-season** matches (:func:`src.engine.tables.team_matches`), built once.
+
+        One row per team and played match, the base of every form column of
+        :func:`matchday_table_for`: the form of a team is its last matches of
+        the season the table describes, so the frame is derived from
+        :attr:`current_matches` and cached on the state (``dataclasses.replace``
+        starts a fresh cache). Not part of the equality of the snapshot.
+        """
+        if self._team_matches is None:
+            self._team_matches = team_matches(self.current_matches)
+        return self._team_matches
 
     @property
     def next_matchday(self) -> Matchday | None:
@@ -847,7 +886,7 @@ def build_state(
         opportunities simply stay empty. Fixtures dated in another season than
         the registry's (a stale ``fixtures.csv`` of last season), with a
         historical team or with a team unknown to the fit are skipped with a
-        note instead of raising, so Match & Heatmap and the value panel only
+        note instead of raising, so the Giornata tab and the value panel only
         ever show current-season matches between current teams; traps are
         detected on the current-season matches of current teams only.
     Validation
@@ -1128,6 +1167,177 @@ def fixtures_for(state: PipelineState, girone: Girone | None, matchday: Matchday
 def quotes_for(state: PipelineState, match_id: str) -> list[OddsQuote]:
     """Every bookmaker quote of one fixture."""
     return [q for q in state.quotes if q.match_id == match_id]
+
+
+# =============================================================================
+# Matchday table and played results
+# =============================================================================
+def matchday_table_for(
+    state: PipelineState,
+    matchday: MatchdaySelector = None,
+    girone: Girone | None = None,
+) -> pd.DataFrame:
+    """The whole matchday as one table (:func:`src.engine.tables.matchday_table`), one row per predicted fixture.
+
+    ``matchday`` follows the selector semantics of :func:`fixtures_for` (the
+    next matchday by default, :data:`ALL_MATCHDAYS` for every predicted
+    fixture), ``girone`` keeps one competition. Strengths come from
+    ``state.params``, the form columns from the current-season matches
+    (:meth:`PipelineState.team_matches_frame`, built once per state), the
+    ``Book`` / ``EV max`` / ``Flag`` columns from ``state.opportunities`` and
+    ``state.traps``. Columns exactly :data:`MATCHDAY_COLUMNS`, ``match_id`` last.
+    """
+    preds = _restrict(state, matchday)
+    return matchday_table(
+        preds,
+        params=state.params,
+        matches=state.current_matches,
+        opportunities=state.opportunities,
+        traps=state.traps,
+        girone=_as_girone(girone),
+        long=state.team_matches_frame(),
+    )
+
+
+#: Prefix of the ``st.dataframe`` widget key of the *Giornata* table (see :func:`matchday_table_key`).
+MATCHDAY_TABLE_KEY_PREFIX: Final[str] = "matchday_table"
+
+
+def matchday_table_key(matchday: Matchday | None, girone: Girone | None = None) -> str:
+    """``st.session_state`` key of the *Giornata* table widget, scoped to the matchday and competition it shows.
+
+    Streamlit derives a ``st.dataframe`` element id from its ``key`` and
+    selection mode only, not from the data, so a row selection made on one
+    table would survive a change of matchday or sidebar competition and be
+    mapped onto the new table (a fixture the user never clicked). Scoping the
+    key -- ``'matchday_table_2026-10-18_A'``, ``'matchday_table_tutte_all'`` for
+    every predicted fixture of every competition -- makes each scope its own
+    widget, which starts without a selection. The prefix is
+    :data:`MATCHDAY_TABLE_KEY_PREFIX`, so a test can still find the table by
+    ``key.startswith(...)``.
+    """
+    scope_matchday = "tutte" if matchday is None else str(matchday.key)
+    scope_girone = "all" if girone is None else str(_as_girone(girone).value)
+    return f"{MATCHDAY_TABLE_KEY_PREFIX}_{scope_matchday}_{scope_girone}"
+
+
+def fixture_label(prediction: MatchPrediction) -> str:
+    """``'[A] 2026-11-08 · Home - Away'``: the entry of the dashboard's *Partita* selectbox for one prediction."""
+    fx = prediction.fixture
+    return f"[{fx.girone.value}] {fx.date.isoformat()} · {fx.label}"
+
+
+def selected_row_match_id(event: object, table: pd.DataFrame) -> str | None:
+    """``match_id`` of the row selected in a ``st.dataframe`` rendered with ``selection_mode='single-row'``.
+
+    ``event`` is what ``st.dataframe(..., on_select="rerun")`` returns: its
+    ``selection.rows`` holds the positional index of the selected row of
+    ``table`` (a :func:`matchday_table_for` frame, whose last column is
+    ``match_id``). ``None`` when nothing is selected, when the position is out
+    of range (the table changed under the selection) or when ``table`` has no
+    ``match_id`` column. Pure, so the mapping is unit-tested without a browser.
+    """
+    selection = getattr(event, "selection", None)
+    rows = getattr(selection, "rows", None) if selection is not None else None
+    if not rows or "match_id" not in table.columns:
+        return None
+    try:
+        position = int(list(rows)[0])
+    except (TypeError, ValueError):
+        return None
+    if not 0 <= position < len(table):
+        return None
+    return str(table["match_id"].iloc[position])
+
+
+def matchday_csv_bytes(state: PipelineState, matchday: MatchdaySelector = None, girone: Girone | None = None) -> bytes:
+    """CSV bytes (see :func:`export_csv_bytes`) of :func:`matchday_table_for`, for the download button and the console export."""
+    return export_csv_bytes(matchday_table_for(state, matchday, girone))
+
+
+def seasons_available(state: PipelineState) -> list[str]:
+    """Season labels present in ``state.matches``: the registry season first, then the others most recent first.
+
+    The registry season is listed even when it has no match yet (the season has
+    not started), so the *Risultati* selector always offers the current season.
+    """
+    present = sorted(set(pd.to_datetime(state.matches["date"]).map(season_of)), reverse=True) if len(state.matches) else []
+    current = str(state.season_label).replace("_", "/")
+    if current:
+        return [current, *[s for s in present if s != current]]
+    return present
+
+
+def current_teams(state: PipelineState, girone: Girone | None = None) -> list[str]:
+    """Sorted current teams of the perimeter (one competition when ``girone`` is given).
+
+    From the registry when the state has one (every team of the dictionary,
+    with or without matches), otherwise the fitted current teams.
+    """
+    g = _as_girone(girone)
+    if state.registry is not None:
+        names = state.registry.teams(g) if g is not None else state.registry.canonical_names
+        return sorted(str(t) for t in names)
+    by_girone = state.params.current_teams_by_girone()
+    names = by_girone.get(g, ()) if g is not None else [t for teams in by_girone.values() for t in teams]
+    return sorted(str(t) for t in names)
+
+
+def results_team_options(state: PipelineState, girone: Girone | None = None, season: str | None = None) -> list[str]:
+    """Teams selectable in the *Risultati* tab for one season and competition: every option has at least one row.
+
+    The options are the clubs that **played** that season in that competition
+    (home or away in ``state.matches``, filtered exactly like
+    :func:`results_table_for` does: by the season of the match date and by the
+    competition the match was played in), historical teams included. The
+    registry teams of the competition (:func:`current_teams`) are added only
+    for the current season (``state.season_label``), where a team may not have
+    played yet, or when the season has no match at all. A current team that
+    played a past season elsewhere (promoted or relegated since) is therefore
+    *not* offered under its present competition for that season, where it would
+    have an empty table. Sorted, without duplicates.
+    """
+    g = _as_girone(girone)
+    label = str(state.season_label if season is None else season).replace("_", "/")
+    current_label = str(state.season_label).replace("_", "/")
+    names: set[str] = set()
+    if len(state.matches) and label:
+        frame = state.matches
+        mask = (pd.to_datetime(frame["date"]).map(season_of) == label).to_numpy(dtype=bool)
+        if g is not None:
+            mask = mask & (frame["girone"] == g.value).to_numpy(dtype=bool)  # a new array: to_numpy() may be read-only
+        subset = frame.loc[mask]
+        names |= set(subset["home_team"].astype(str)) | set(subset["away_team"].astype(str))
+    if not names or label == current_label:
+        names |= set(current_teams(state, g))
+    return sorted(names)
+
+
+def results_table_for(
+    state: PipelineState,
+    girone: Girone | None = None,
+    team: str | None = None,
+    season: str | None = None,
+) -> pd.DataFrame:
+    """Played matches of one season (the registry season by default) with the model's reading of each.
+
+    :func:`src.engine.tables.results_table` on ``state.matches`` (every season
+    the fit saw, so a past season can be chosen) with ``state.engine``:
+    columns :data:`RESULTS_MODEL_COLUMNS`. ``girone`` keeps one competition,
+    ``team`` the matches of one team (home or away, historical teams included).
+    """
+    label = str(state.season_label if season is None else season).replace("_", "/") or None
+    return results_table(state.matches, engine=state.engine, season=label, girone=_as_girone(girone), team=team)
+
+
+def results_csv_bytes(
+    state: PipelineState,
+    girone: Girone | None = None,
+    team: str | None = None,
+    season: str | None = None,
+) -> bytes:
+    """CSV bytes (see :func:`export_csv_bytes`) of :func:`results_table_for`, for the download button and the console export."""
+    return export_csv_bytes(results_table_for(state, girone, team, season))
 
 
 def no_odds_message(state: PipelineState) -> str:

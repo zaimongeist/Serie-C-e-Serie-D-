@@ -358,9 +358,25 @@ scp data/processed/matches.csv data/processed/fixtures.csv utente@server:/percor
 - **Quote**: ogni CSV in `data/odds/` è un bookmaker come gli altri, compreso quello scritto dall'harvester FootyStats
   (`bookmaker = FootyStats`, quote pre-match 1X2 / Over-Under / GG-NG): la colonna *Bookmaker* del pannello valore dice
   da dove viene ogni quota.
-- **Match & Heatmap / Opportunità di Valore**: solo partite in programma della stagione corrente fra squadre
+- **Giornata** (`src/engine/tables.py`, `matchday_table`): tutta la giornata in **una tabella**, una riga per partita
+  della giornata scelta e della competizione della sidebar, così il turno si legge in un colpo d'occhio invece di
+  aprire le partite una per una da un menù: forza delle due squadre (α/β), forma delle ultime 5 gare della stagione
+  (`V-P-N-V-V`, punti, gol fatti/subiti), xG prodotti/concessi nelle ultime 3, λ, μ, totale atteso, risultato più
+  probabile, probabilità 1X2 / Over 1.5-2.5-3.5 / GG, quote fair, miglior quota book per esito, EV massimo con la
+  selezione che lo realizza (`X @3.40`) e l'unione dei flag (`REGRESSION_TRAP` / `TRAP:<squadra>` anche senza quote).
+  Cliccando una riga (`st.dataframe`, `selection_mode="single-row"`) si apre sotto il dettaglio della partita —
+  metriche, matrice dei punteggi, mercati — con il menù *Partita* come alternativa sincronizzata; «Scarica tabella
+  giornata (CSV)» esporta la tabella completa (più `match_id`).
+- **Risultati** (`results_table`): una riga per partita giocata della stagione scelta (default quella corrente; il
+  selettore *Stagione* apre lo storico) e della competizione della sidebar, filtrabile per squadra (il menù *Squadra*
+  offre le squadre che hanno giocato quella stagione in quella competizione: nelle stagioni passate anche quelle non
+  più nel perimetro, mai una squadra senza partite): risultato, esito 1X2, tiri / tiri in porta / angoli casa-ospiti
+  (`12/7`), xG di entrambe, più λ, μ, **P esito** (la probabilità che il modello assegna all'esito avvenuto: lettura a
+  posteriori, il modello è stimato anche su quella partita) e **Sorpresa** («sorpresa» sotto il 20%, «atteso» sopra il
+  50%). Colonne ordinabili dall'intestazione, «Scarica risultati (CSV)».
+- **Giornata / Opportunità di Valore**: solo partite in programma della stagione corrente fra squadre
   correnti; le partite datate in un'altra stagione (fixtures stantii dell'anno scorso), con una squadra storica o
-  sconosciuta allo storico sono elencate come saltate in *Dettagli pipeline* (e il tab Match lo segnala quando non
+  sconosciuta allo storico sono elencate come saltate in *Dettagli pipeline* (e il tab Giornata lo segnala quando non
   resta nulla da mostrare).
 - **Fallback simulato** (nessun `data/processed/matches.csv`, o `SERIEC_FORCE_SIMULATE=1`): lega della stagione del
   dizionario sul suo calendario reale (2026/27: via dal 23/08/2026, una giornata a settimana di domenica; con
@@ -381,7 +397,11 @@ scp data/processed/matches.csv data/processed/fixtures.csv utente@server:/percor
   stagione (prime 20 partite = giornate 1-3, 4ª giornata da prevedere) e lo dichiara in testa all'output. Opzioni
   comuni: `--history 0|1|2`, `--season`. Ogni output apre con il perimetro (`Perimetro: Serie C 2026/27 Gironi A/B/C +
   Serie B (80 squadre) · stagione corrente: N partite · storico: M partite 2024/25-2025/26`, derivato da
-  `config/competitions.toml`) e la posizione nel calendario.
+  `config/competitions.toml`) e la posizione nel calendario. La sezione `4) PREVISIONI PROSSIMO TURNO` stampa la
+  prossima giornata come **tabella compatta** (competizione, data, squadre, λ, μ, P1/PX/P2, O2.5, GG, Fair X, Book X,
+  EV max, Flag) invece di una riga di testo per partita; con `--export` scrive anche la tabella completa in
+  `<export>_giornata.csv` e i risultati giocati della stagione corrente (con P esito e Sorpresa) in
+  `<export>_risultati.csv`, accanto al report valore e alle selezioni.
 - **Giornate** (`src/engine/picks.py`): con FootyStats il file delle partite in programma contiene *tutta* la stagione
   residua (centinaia di partite con numero di giornata e data), perciò le partite sono raggruppate in «giornate» **per
   calendario**: ogni turno di ogni competizione è ancorato alla data mediana delle sue partite (il giorno in cui se ne
@@ -393,7 +413,7 @@ scp data/processed/matches.csv data/processed/fixtures.csv utente@server:/percor
   stesso blocco aprono due giornate. I recuperi (turni con meno della metà delle partite di un turno tipico, cioè
   meno di 5 su 10, qualunque sia la data: anche il recupero infrasettimanale che precede il turno del fine settimana)
   e le partite di un turno regolare oltre 7 giorni dalla sua data mediana sono aggregati alla giornata più vicina per
-  data. Il selettore di *Match & Heatmap*, il pannello valore (con la casella «Mostra tutte le giornate») e le
+  data. La tabella del tab *Giornata*, il pannello valore (con la casella «Mostra tutte le giornate») e le
   selezioni usano di default la **prossima** giornata; la scelta nel tab *Selezioni di giornata* vale per tutti e tre
   i tab (`st.session_state["matchday"]`). Gli export CSV restano completi.
 - **Selezioni di giornata** (tab omonimo e sezione `8) SELEZIONI DI GIORNATA` della console): per la giornata scelta,
@@ -415,7 +435,7 @@ scp data/processed/matches.csv data/processed/fixtures.csv utente@server:/percor
 <!-- legend:start -->
 ## Legenda: come leggere i numeri
 
-Glossario di tutti i numeri mostrati da dashboard, console ed export, scritto per chi li usa per pianificare le scommesse. Le formule sono quelle del codice (`src/engine/model.py`, `src/engine/value.py`, `src/engine/picks.py`).
+Glossario di tutti i numeri mostrati da dashboard, console ed export, scritto per chi li usa per pianificare le scommesse. Le formule sono quelle del codice (`src/engine/model.py`, `src/engine/value.py`, `src/engine/picks.py`, `src/engine/tables.py`).
 
 ### Parametri del modello (tab Classifica Forza)
 
@@ -427,13 +447,29 @@ Glossario di tutti i numeri mostrati da dashboard, console ed export, scritto pe
 - **ξ (xi) · Decadimento temporale** — peso delle partite nel tempo: ogni gara pesa exp(−ξ·giorni trascorsi). Con ξ = 0.0018 una partita di un anno fa vale circa il 52% di una di oggi, una di due anni fa il 27%: lo storico delle tre stagioni aiuta la stima ma conta sempre meno della stagione in corso. ξ = 0 (dati simulati) pesa tutto allo stesso modo.
 - **Prior gaussiana · Stima MAP** — a inizio stagione ci sono poche partite e la stima «pura» (massima verosimiglianza, MLE) esagera: una squadra con due vittorie 4-0 sembrerebbe imbattibile. La prior tira i parametri verso valori normali (α verso 0 e β verso la media del suo girone, entrambi con deviazione standard 0.30, γ verso 0.25 ± 0.15, ρ verso 0 ± 0.10) e la stima diventa «MAP» (massimo a posteriori). Si attiva da sola finché la competizione meno coperta ha meno di 15 partite giocate per squadra nella stagione corrente (con 20 squadre per girone: fino alla 14ª giornata inclusa); il badge della sidebar dice se è attiva. Con una stagione intera i dati dominano e MAP ≈ MLE.
 
-### Previsione della partita (tab Match & Heatmap)
+### Previsione della partita (tab Giornata)
 
 - **λ (lambda) · Gol attesi casa** — numero medio di gol che il modello si aspetta dalla squadra di casa: λ = exp(α_casa − β_ospite + γ). Un λ di 1.60 non vuol dire «segna 1 o 2 gol», ma che in media su molte partite così ne segnerebbe 1.6: la distribuzione dei singoli punteggi è nella matrice.
 - **μ (mu) · Gol attesi ospiti** — lo stesso per la squadra in trasferta: μ = exp(α_ospite − β_casa), senza fattore campo. λ + μ è il totale gol atteso della partita (sopra 2.8 = gara da Over, sotto 2.2 = gara chiusa).
 - **Matrice dei punteggi (heatmap)** — probabilità di ogni risultato esatto, gol casa sulle righe e gol ospiti sulle colonne, da 0 a 10 gol per squadra (la vista compatta accorpa la coda in «N+»). Le celle sommano al 100%: ogni mercato è solo una somma di celle (1 = celle sotto la diagonale, X = diagonale, Over 2.5 = celle con somma ≥ 3, GG = celle con riga ≥ 1 e colonna ≥ 1).
 - **Risultato più probabile** — la cella più alta della matrice, con la sua probabilità. Di norma vale il 10-14%: è il punteggio singolo più frequente, non «il risultato previsto». Un 1-1 al 12% convive con un 1 (vittoria casa) al 45%.
 - **Probabilità dei mercati · 1X2, Over/Under, GG/NG** — per ogni mercato gli esiti sono esaustivi e si escludono a vicenda, quindi sommano al 100% (1 + X + 2, Over 2.5 + Under 2.5, GG + NG). Over 1.5 / 2.5 / 3.5 contano i gol totali (strettamente più di 1, 2, 3); GG = «entrambe le squadre segnano», NG = almeno una resta a zero.
+
+### Tabella giornata e risultati
+
+- **Tabella giornata (tab Giornata)** — una riga per ogni partita della giornata scelta (tutte le competizioni o quella della sidebar): forza delle due squadre (α, β), forma recente, gol attesi del modello, risultato più probabile, probabilità e quote fair dei mercati, miglior quota book per esito, EV migliore e flag. Tutto il turno si legge in un colpo d'occhio; cliccando una riga (o scegliendo la gara nel menù «Partita») sotto compaiono la matrice dei punteggi e i mercati di quella partita. «Scarica tabella giornata (CSV)» ha le stesse colonne più match_id.
+- **Forma (Casa / Ospiti)** — gli esiti delle ultime 5 partite giocate dalla squadra nella stagione corrente, casa e trasferta insieme, dalla più recente alla più vecchia: V vittoria, N pareggio (nullo), P sconfitta. «V-V-N-P-N» = ha vinto le ultime due. Meno di 5 lettere = ha giocato meno di 5 partite; vuota = nessuna partita giocata.
+- **Pt (5)** — punti raccolti nelle stesse ultime 5 partite (3 per vittoria, 1 per pareggio): da 0 a 15; il numero fra parentesi nel nome della colonna è la finestra. Non è la classifica: misura il momento di forma, che il modello non usa direttamente (α e β pesano tutta la stagione, più lo storico).
+- **GF/GS (5)** — gol fatti / gol subiti nelle ultime 5 partite: «9/4» = 9 segnati e 4 subiti. Confrontalo con λ e μ: una squadra che segna molto più di quanto il modello si aspetti sta sovra-performando (o il modello la sottovaluta), una che subisce poco con tanti xG contro è candidata alla trappola di regressione.
+- **xG F/S (3)** — expected goals prodotti / concessi nelle ultime 3 partite: «4.1/2.6» = 4.1 xG creati e 2.6 subiti; «-» quando il dato manca anche in una sola delle tre gare. La finestra di 3 è la stessa del filtro REGRESSION_TRAP: xG subiti alti con pochi gol subiti (GF/GS) = difesa in sovra-rendimento.
+- **Tot. att.** — λ + μ, i gol totali attesi della partita secondo il modello: sopra 2.8 gara da Over, sotto 2.2 gara chiusa. È la stessa somma che guida le probabilità Over/Under e GG delle colonne accanto.
+- **Ris. prob.** — il risultato esatto più probabile con la sua probabilità, «1-0 (14%)»: la cella più alta della matrice dei punteggi, di norma fra il 10 e il 14%. Non è «il pronostico»: un 1-1 al 13% convive con una vittoria casa al 45%.
+- **P1 / PX / P2, O1.5 / O2.5 / O3.5, GG (%) · Fair · Book** — le probabilità del modello per vittoria casa, pareggio, vittoria ospite, Over 1.5 / 2.5 / 3.5 gol totali ed entrambe a segno; Fair 1 / X / 2 / O2.5 / GG le quote fair corrispondenti (1/P); Book 1 / X / 2 / O2.5 / GG la miglior quota fra i bookmaker presenti nei dati per quell'esito (vuota se nessuno lo quota).
+- **EV max (%) · Miglior EV** — il valore atteso più alto fra tutte le selezioni quotate della partita (ogni mercato, ogni bookmaker) e la selezione che lo realizza: «X @3.40» = il pareggio alla quota 3.40. È il punto da cui partire per quella partita; il dettaglio (bookmaker, edge, stake) è nel pannello Opportunità di Valore. Vuoti senza quote.
+- **Flag (tabella giornata)** — l'unione dei flag di tutte le selezioni quotate della partita (VALUE, LONGSHOT, SUSPICIOUS_EDGE: vedi la sezione Flag) più REGRESSION_TRAP e TRAP:<squadra> quando una delle due squadre è in trappola di regressione, anche senza quote: il segnale sulla difesa vale a prescindere dal prezzo.
+- **Tabella risultati (tab Risultati)** — una riga per ogni partita già giocata della stagione e della competizione scelte, filtrabile per squadra (il menù offre chi ha giocato quella stagione in quella competizione: nelle stagioni passate anche le squadre non più nel perimetro, mai una squadra senza partite): risultato, esito 1X2, tiri, tiri in porta e angoli casa/ospiti («12/7», «-» se il dato manca), xG di entrambe, più la lettura del modello (λ, μ, P esito, Sorpresa). Le colonne si ordinano cliccando l'intestazione; «Scarica risultati (CSV)» la esporta.
+- **P esito (%)** — la probabilità che il modello assegna all'esito 1X2 effettivamente avvenuto, calcolata con λ e μ di quella partita (la stessa matrice dei punteggi). Attenzione: il modello è stimato su tutte le partite giocate, compresa quella stessa, quindi è una lettura a posteriori, non una previsione fatta prima del calcio d'inizio; serve a vedere quali risultati il modello spiega e quali no.
+- **Sorpresa** — «sorpresa» quando P esito è sotto il 20% (un esito che il modello riteneva improbabile), «atteso» sopra il 50% (l'esito che il modello indicava come favorito), vuoto nel mezzo. Molte sorprese di fila per una squadra = qualcosa che il modello non vede (infortuni, cambio allenatore, calendario) oppure semplice varianza: è un invito a guardare, non un segnale di scommessa.
 
 ### Quote e valore (tab Opportunità di Valore)
 

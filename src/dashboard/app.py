@@ -51,6 +51,7 @@ from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Final
 
+
 # -- bootstrap: make ``src.*`` importable when launched as ``streamlit run src/dashboard/app.py``
 _REPO_ROOT: Final[Path] = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
@@ -77,6 +78,7 @@ from src.dashboard.legend import (
 from src.dashboard.state import (
     ALL_MATCHDAYS,
     DEFAULT_HISTORY_SEASONS,
+    MATCHDAY_TABLE_KEY_PREFIX,
     MAX_HISTORY_SEASONS,
     MIN_SIM_ROUNDS,
     Matchday,
@@ -86,21 +88,29 @@ from src.dashboard.state import (
     draw_picks_table,
     export_csv_bytes,
     find_matchday,
+    fixture_label,
     fixtures_for,
     heatmap_figure,
     markets_table,
+    matchday_table_for,
+    matchday_table_key,
     no_odds_message,
     opportunities_table,
     picks_csv_bytes,
     predictions_table,
     quotes_for,
     ranking_table,
+    results_table_for,
+    results_team_options,
+    seasons_available,
+    selected_row_match_id,
     strength_figure,
     traps_table,
     value_opportunities,
     value_table,
 )
 from src.engine.picks import DEFAULT_N_BTTS, DEFAULT_N_DRAWS
+from src.engine.tables import DEFAULT_FORM_N, DEFAULT_XG_N
 
 log = get_logger(__name__)
 
@@ -126,10 +136,26 @@ MATCHDAY_STATE_KEY: Final[str] = "matchday"
 VALUE_ALL_MATCHDAYS_KEY: Final[str] = "value_all_matchdays"
 #: Largest list size the picks tab accepts (a matchday never has more fixtures than this).
 MAX_PICKS: Final[int] = 60
+#: ``st.session_state`` keys of the *Giornata* tab: the prefix of the matchday table widget key (the full key is
+#: scoped to the matchday and competition shown, :func:`matchday_table_key`, so a row selection never outlives
+#: the table it was made on), the *Partita* selectbox and the ``(table key, match_id)`` of the last table row
+#: applied to that selectbox (so a later manual choice is not overridden).
+MATCHDAY_TABLE_KEY: Final[str] = MATCHDAY_TABLE_KEY_PREFIX
+FIXTURE_STATE_KEY: Final[str] = "fixture"
+APPLIED_ROW_STATE_KEY: Final[str] = "matchday_table_row"
+#: ``st.session_state`` keys of the *Risultati* tab filters and table.
+RESULTS_TEAM_KEY: Final[str] = "results_team"
+RESULTS_SEASON_KEY: Final[str] = "results_season"
+RESULTS_TABLE_KEY: Final[str] = "results_table"
+#: Option of the *Squadra* filter meaning every team.
+ALL_TEAMS_LABEL: Final[str] = "Tutte"
+#: Height (pixels) of the matchday and results tables: about 17 rows, a whole Serie C round of a girone and more.
+TABLE_HEIGHT: Final[int] = 600
 #: Tab labels, in order.
 TAB_LABELS: Final[tuple[str, ...]] = (
     "Classifica Forza",
-    "Match & Heatmap",
+    "Giornata",
+    "Risultati",
     "Opportunità di Valore",
     "Selezioni di giornata",
     "Export",
@@ -266,7 +292,7 @@ def selected_matchday(state: PipelineState) -> Matchday | None:
     """The matchday the three matchday-aware tabs agree on, read from (and written to) ``st.session_state``.
 
     The *Selezioni di giornata* tab owns the ``Giornata`` selectbox (key
-    :data:`MATCHDAY_STATE_KEY`), but *Match & Heatmap* and *Opportunità di
+    :data:`MATCHDAY_STATE_KEY`), but *Giornata* and *Opportunità di
     Valore* are rendered before it in the same script run, so the choice is
     read from the session state here, once, before any tab renders: a missing
     or stale key (the state was recomputed and that matchday no longer exists)
@@ -390,8 +416,88 @@ def heatmap_goals_control(full_goals: int) -> int:
     )
 
 
+def matchday_column_config() -> dict[str, object]:
+    """``column_config`` of the matchday table: number formats, tooltips, the key columns pinned on the left."""
+    cc = st.column_config
+    form_n, xg_n = DEFAULT_FORM_N, DEFAULT_XG_N
+    config: dict[str, object] = {
+        "Competizione": cc.TextColumn("Competizione", width="small", pinned=True),
+        "Data": cc.DateColumn("Data", format="DD/MM/YYYY", width="small"),
+        "Giornata": cc.NumberColumn("Giornata", format="%d", width="small", help="Numero di turno della competizione."),
+        "Casa": cc.TextColumn("Casa", pinned=True),
+        "Ospiti": cc.TextColumn("Ospiti", pinned=True),
+        "Tot. att.": cc.NumberColumn("Tot. att.", format="%.2f", help="λ + μ: gol totali attesi della partita."),
+        "Ris. prob.": cc.TextColumn("Ris. prob.", help="Risultato esatto più probabile e sua probabilità (la cella più alta della matrice)."),
+        "EV max (%)": cc.NumberColumn("EV max (%)", format="%+.2f %%", help="Miglior valore atteso fra tutte le selezioni quotate della partita; vuoto senza quote."),
+        "Miglior EV": cc.TextColumn("Miglior EV", help="La selezione con l'EV più alto e la sua quota, es. X @3.40."),
+        "Flag": cc.TextColumn(
+            "Flag",
+            help="Unione dei flag delle selezioni quotate (VALUE, LONGSHOT, SUSPICIOUS_EDGE) più REGRESSION_TRAP / TRAP:<squadra> quando una squadra è in trappola di regressione, anche senza quote.",
+        ),
+    }
+    for side in ("Casa", "Ospiti"):
+        config[f"α {side}"] = cc.NumberColumn(f"α {side}", format="%+.2f", help="Forza offensiva (0 = media della competizione).")
+        config[f"β {side}"] = cc.NumberColumn(f"β {side}", format="%+.2f", help="Solidità difensiva (più alto = subisce meno).")
+        config[f"Forma {side}"] = cc.TextColumn(
+            f"Forma {side}", help=f"Ultime {form_n} gare della stagione, dalla più recente: V vittoria, N pareggio (nullo), P sconfitta."
+        )
+        config[f"Pt {side} ({form_n})"] = cc.NumberColumn(f"Pt {side} ({form_n})", format="%d", help=f"Punti nelle ultime {form_n} gare (massimo {3 * form_n}).")
+        config[f"GF/GS {side} ({form_n})"] = cc.TextColumn(f"GF/GS {side} ({form_n})", help=f"Gol fatti / subiti nelle ultime {form_n} gare.")
+        config[f"xG F/S {side} ({xg_n})"] = cc.TextColumn(
+            f"xG F/S {side} ({xg_n})", help=f"xG prodotti / concessi nelle ultime {xg_n} gare ('-' quando un dato manca)."
+        )
+    config["λ"] = cc.NumberColumn("λ", format="%.2f", help="Gol attesi della squadra di casa.")
+    config["μ"] = cc.NumberColumn("μ", format="%.2f", help="Gol attesi della squadra ospite.")
+    for column in ("P1 (%)", "PX (%)", "P2 (%)", "O1.5 (%)", "O2.5 (%)", "O3.5 (%)", "GG (%)"):
+        config[column] = cc.NumberColumn(column, format="%.1f %%")
+    for column in ("Fair 1", "Fair X", "Fair 2", "Fair O2.5", "Fair GG"):
+        config[column] = cc.NumberColumn(column, format="%.2f", help="Quota fair = 1 / probabilità del modello.")
+    for column in ("Book 1", "Book X", "Book 2", "Book O2.5", "Book GG"):
+        config[column] = cc.NumberColumn(column, format="%.2f", help="Miglior quota fra i bookmaker nei dati; vuota se nessuno quota l'esito.")
+    return config
+
+
+def results_column_config() -> dict[str, object]:
+    """``column_config`` of the results table."""
+    cc = st.column_config
+    return {
+        "Competizione": cc.TextColumn("Competizione", width="small", pinned=True),
+        "Data": cc.DateColumn("Data", format="DD/MM/YYYY", width="small"),
+        "Giornata": cc.NumberColumn("Giornata", format="%d", width="small"),
+        "Casa": cc.TextColumn("Casa", pinned=True),
+        "Ospiti": cc.TextColumn("Ospiti", pinned=True),
+        "Risultato": cc.TextColumn("Risultato", width="small", help="Gol casa-gol ospiti."),
+        "Esito": cc.TextColumn("Esito", width="small", help="1 vittoria casa, X pareggio, 2 vittoria ospiti."),
+        "Tiri C/O": cc.TextColumn("Tiri C/O", help="Tiri totali casa / ospiti ('-' quando il dato manca)."),
+        "In porta C/O": cc.TextColumn("In porta C/O", help="Tiri in porta casa / ospiti."),
+        "Angoli C/O": cc.TextColumn("Angoli C/O", help="Calci d'angolo casa / ospiti."),
+        "xG Casa": cc.NumberColumn("xG Casa", format="%.2f"),
+        "xG Ospiti": cc.NumberColumn("xG Ospiti", format="%.2f"),
+        "λ": cc.NumberColumn("λ", format="%.2f", help="Gol attesi casa secondo il modello stimato a fine campione."),
+        "μ": cc.NumberColumn("μ", format="%.2f", help="Gol attesi ospiti secondo il modello stimato a fine campione."),
+        "P esito (%)": cc.NumberColumn("P esito (%)", format="%.1f %%", help="Probabilità che il modello assegna all'esito 1X2 avvenuto (lettura a posteriori)."),
+        "Sorpresa": cc.TextColumn("Sorpresa", width="small", help="sorpresa = P esito sotto il 20%; atteso = P esito sopra il 50%."),
+    }
+
+
 def render_match_tab(state: PipelineState, girone: Girone | None, matchday: Matchday | None) -> None:
-    st.subheader("Partita e matrice dei punteggi")
+    """*Giornata*: the whole matchday as one table, then the detail of the selected fixture.
+
+    The table (:func:`matchday_table_for`) has one row per fixture of the
+    selected matchday and sidebar competition. Clicking a row
+    (``selection_mode='single-row'``, ``on_select='rerun'``) selects that fixture:
+    the *Partita* selectbox (key :data:`FIXTURE_STATE_KEY`) follows the click and
+    stays available as the fallback; a choice made in the selectbox afterwards
+    is kept until the next click (:data:`APPLIED_ROW_STATE_KEY`). The widget key
+    is scoped to the matchday and competition (:func:`matchday_table_key`):
+    Streamlit keeps a selection per widget key regardless of the data, so a
+    fixed key would carry the clicked row position onto the table of another
+    competition or matchday and silently open a fixture never clicked; a new
+    scope is a new widget, without a selection, and the detail falls back to
+    the first fixture. Below the table: the metrics row, the score-matrix
+    heatmap and the markets table of the selected fixture, as before.
+    """
+    st.subheader("Giornata: tutte le partite in tabella")
     preds = fixtures_for(state, girone, matchday=matchday)
     if not preds:
         message = "Nessuna partita in programma per la competizione selezionata"
@@ -403,14 +509,56 @@ def render_match_tab(state: PipelineState, girone: Girone | None, matchday: Matc
             )
         st.info(message)
         return
-    if matchday is not None:
-        st.caption(
-            f"{matchday.label} · {len(preds)} partite"
-            + (" (tutte le competizioni)" if girone is None else f" ({girone.short})")
-            + f" · la giornata si cambia nel tab *Selezioni di giornata* ({len(state.matchdays)} in programma)."
-        )
-    labels = [f"[{p.fixture.girone.value}] {p.fixture.date.isoformat()} · {p.fixture.label}" for p in preds]
-    choice = st.selectbox("Partita della giornata", labels, index=0, key="fixture")
+    table = matchday_table_for(state, matchday, girone)
+    scope = "tutte le competizioni" if girone is None else girone.short
+    st.caption(
+        (f"{matchday.label} · " if matchday is not None else "")
+        + f"{len(table)} partite ({scope}) · una riga per partita: forza (α/β), forma delle ultime {DEFAULT_FORM_N} gare, "
+        f"xG delle ultime {DEFAULT_XG_N}, gol attesi, probabilità, quote fair, miglior quota book, EV massimo e flag. "
+        "Clicca una riga per aprire la partita qui sotto"
+        + (f"; la giornata si cambia nel tab *Selezioni di giornata* ({len(state.matchdays)} in programma)." if matchday is not None else ".")
+    )
+    table_key = matchday_table_key(matchday, girone)
+    event = st.dataframe(
+        table,
+        hide_index=True,
+        height=TABLE_HEIGHT,
+        key=table_key,
+        on_select="rerun",
+        selection_mode="single-row",
+        column_order=[c for c in table.columns if c != "match_id"],
+        column_config=matchday_column_config(),
+        **FULL_WIDTH["dataframe"],
+    )
+    stem = "tutte" if matchday is None else matchday.key.replace("#", "_")
+    st.download_button(
+        "Scarica tabella giornata (CSV)",
+        data=export_csv_bytes(table),
+        file_name=f"giornata_{stem}{'' if girone is None else '_' + girone.value}.csv",
+        mime="text/csv",
+        key="dl_matchday",
+        help="Tutte le colonne della tabella più match_id.",
+        **FULL_WIDTH["download_button"],
+    )
+    labels = [fixture_label(p) for p in preds]
+    label_by_id = {p.fixture.match_id: label for p, label in zip(preds, labels)}
+    clicked = selected_row_match_id(event, table)
+    applied = (table_key, clicked)  # the scope travels with the applied row: a selection of another table is never reused
+    if clicked is None:
+        st.session_state.pop(APPLIED_ROW_STATE_KEY, None)
+    elif clicked in label_by_id and st.session_state.get(APPLIED_ROW_STATE_KEY) != applied:
+        # a new click: the selectbox follows the table (a later manual choice in the selectbox is then respected)
+        st.session_state[APPLIED_ROW_STATE_KEY] = applied
+        st.session_state[FIXTURE_STATE_KEY] = label_by_id[clicked]
+    if st.session_state.get(FIXTURE_STATE_KEY) not in labels:
+        st.session_state.pop(FIXTURE_STATE_KEY, None)  # stale choice (another competition or matchday): back to the first fixture
+    st.markdown("**Dettaglio partita**")
+    choice = st.selectbox(
+        "Partita",
+        labels,
+        key=FIXTURE_STATE_KEY,
+        help="La partita aperta qui sotto: segue la riga cliccata nella tabella, oppure si sceglie da questo menù.",
+    )
     pred: MatchPrediction = preds[labels.index(choice)]
     hs, as_, p_top = pred.most_likely_score()
     p_over = pred.probabilities[Market.OVER_UNDER_25]["Over 2.5"]
@@ -446,6 +594,79 @@ def render_match_tab(state: PipelineState, girone: Girone | None, matchday: Matc
     )
     if not quotes:
         st.caption("Nessuna quota del bookmaker per questa partita: le colonne Quota Book ed EV restano vuote.")
+
+
+def render_results_tab(state: PipelineState, girone: Girone | None) -> None:
+    """*Risultati*: the played matches of one season, competition (sidebar) and team, with the model's reading of each.
+
+    The season selectbox (key :data:`RESULTS_SEASON_KEY`) offers the registry
+    season first and the history seasons after it; the team selectbox (key
+    :data:`RESULTS_TEAM_KEY`) offers *Tutte* plus the teams of the sidebar
+    competition in that season (:func:`results_team_options`). The table is
+    :func:`results_table_for`, sortable by clicking a header, with a CSV download.
+    """
+    st.subheader("Risultati: partite giocate")
+    seasons = seasons_available(state)
+    if not seasons or state.matches.empty:
+        st.info("Nessuna partita giocata nei dati.")
+        return
+    c_team, c_season = st.columns([3, 1])
+    with c_season:
+        if st.session_state.get(RESULTS_SEASON_KEY) not in seasons:
+            st.session_state.pop(RESULTS_SEASON_KEY, None)
+        season = str(
+            st.selectbox(
+                "Stagione",
+                seasons,
+                key=RESULTS_SEASON_KEY,
+                help="La stagione corrente per prima; le precedenti sono lo storico su cui il modello è stimato.",
+            )
+        )
+    team_options = [ALL_TEAMS_LABEL, *results_team_options(state, girone, season)]
+    with c_team:
+        if st.session_state.get(RESULTS_TEAM_KEY) not in team_options:
+            st.session_state.pop(RESULTS_TEAM_KEY, None)
+        team_label = str(
+            st.selectbox(
+                "Squadra",
+                team_options,
+                key=RESULTS_TEAM_KEY,
+                help=(
+                    "Le squadre che hanno giocato la stagione scelta nella competizione della sidebar (Tutte = ogni partita): "
+                    "nelle stagioni passate anche quelle non più nel perimetro, e non le attuali che allora giocavano altrove."
+                ),
+            )
+        )
+    team = None if team_label == ALL_TEAMS_LABEL else team_label
+    table = results_table_for(state, girone=girone, team=team, season=season)
+    scope = ", ".join(part for part in (season, "tutte le competizioni" if girone is None else girone.short, team or "") if part)
+    if table.empty:
+        st.info(f"Nessuna partita giocata per {scope}.")
+        return
+    st.caption(f"{len(table)} partite giocate · {scope} · dalla più recente; clicca l'intestazione di una colonna per ordinare.")
+    st.dataframe(
+        table,
+        hide_index=True,
+        height=TABLE_HEIGHT,
+        key=RESULTS_TABLE_KEY,
+        column_order=[c for c in table.columns if c != "match_id"],
+        column_config=results_column_config(),
+        **FULL_WIDTH["dataframe"],
+    )
+    st.caption(
+        "P esito (%) = probabilità che il modello assegna all'esito 1X2 realmente avvenuto, con λ e μ di quella partita "
+        "(la stessa matrice dei punteggi del tab Giornata). Il modello è stimato su tutte le partite giocate, compresa questa: "
+        "è una lettura a posteriori, non una previsione. Sorpresa = «sorpresa» sotto il 20%, «atteso» sopra il 50%, vuoto nel mezzo."
+    )
+    st.download_button(
+        "Scarica risultati (CSV)",
+        data=export_csv_bytes(table),
+        file_name=f"risultati_{season.replace('/', '_')}{'' if girone is None else '_' + girone.value}{'' if team is None else '_' + team.replace(' ', '_')}.csv",
+        mime="text/csv",
+        key="dl_results",
+        help="Tutte le colonne della tabella più match_id.",
+        **FULL_WIDTH["download_button"],
+    )
 
 
 def render_value_tab(state: PipelineState, girone: Girone | None, min_ev: float, matchday: Matchday | None) -> None:
@@ -530,7 +751,7 @@ def render_picks_tab(state: PipelineState, matchday: Matchday | None) -> None:
             keys,
             format_func=lambda k: labels.get(k, k),
             key=MATCHDAY_STATE_KEY,
-            help="I turni delle competizioni giocati nello stesso blocco della settimana (fine settimana ven-lun o infrasettimanale mar-gio), con i recuperi aggregati alla giornata più vicina; vale anche per Match & Heatmap e Opportunità di Valore.",
+            help="I turni delle competizioni giocati nello stesso blocco della settimana (fine settimana ven-lun o infrasettimanale mar-gio), con i recuperi aggregati alla giornata più vicina; vale anche per Giornata e Opportunità di Valore.",
         )
     with c_draws:
         n_draws = int(st.number_input("N risultati X", min_value=1, max_value=MAX_PICKS, value=DEFAULT_N_DRAWS, step=1, key="n_draws"))
@@ -727,11 +948,13 @@ def main() -> None:
         st.caption(f"Stato calcolato alle {state.built_at.astimezone().strftime('%d/%m/%Y %H:%M:%S')} (fonte: {state.source}).")
 
     matchday = selected_matchday(state)  # before any tab renders, so the three matchday-aware tabs agree
-    tab_rank, tab_match, tab_value, tab_picks, tab_export, tab_legend = st.tabs(list(TAB_LABELS))
+    tab_rank, tab_match, tab_results, tab_value, tab_picks, tab_export, tab_legend = st.tabs(list(TAB_LABELS))
     with tab_rank:
         render_ranking_tab(state, girone)
     with tab_match:
         render_match_tab(state, girone, matchday)
+    with tab_results:
+        render_results_tab(state, girone)
     with tab_value:
         render_value_tab(state, girone, min_ev, matchday)
     with tab_picks:

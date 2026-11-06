@@ -447,7 +447,7 @@ def test_legend_covers_the_terms_a_bettor_needs() -> None:
     terms = legend_terms()
     text = legend_markdown()
     assert text.startswith(f"## {LEGEND_TITLE}\n") and text.endswith("\n")
-    assert len(LEGEND) == 8 and all(isinstance(s, LegendSection) and all(isinstance(e, LegendEntry) for e in s.entries) for s in LEGEND)
+    assert len(LEGEND) == 9 and all(isinstance(s, LegendSection) and all(isinstance(e, LegendEntry) for e in s.entries) for s in LEGEND)
     titles = [s.title for s in LEGEND]
     assert titles[0].startswith("Parametri del modello") and titles[-1] == "Regole di buon senso"
     for needle in (

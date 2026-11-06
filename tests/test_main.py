@@ -9,6 +9,7 @@ import pytest
 
 import main as pipeline
 from src.common.schemas import MATCH_COLUMNS, Market, OddsQuote
+from src.engine.tables import MATCHDAY_COLUMNS, RESULTS_MODEL_COLUMNS
 from src.engine.value import ValueOpportunity
 from src.simulation.generator import simulate_league
 
@@ -53,6 +54,41 @@ def test_mini_mode_runs_end_to_end(tmp_path: Path, capsys: pytest.CaptureFixture
     assert list(picks.columns)[:3] == ["Lista", "Giornata", "#"] and picks["Lista"].tolist() == ["X"] * 5 + ["GG"] * 7
     assert picks["Giornata"].eq(out.next_matchday.label).all() and {"Partita", "P. Modello (%)", "Quota Fair", "Quota Book", "EV (%)", "Flag", "Nota"} <= set(picks.columns)
     assert f"selezioni di giornata scritte in: {out.picks_export_path}" in captured
+    # section 4 prints the next matchday as one compact table (no more one line per fixture) ...
+    section4 = captured.split("4) PREVISIONI PROSSIMO TURNO")[1].split("5) QUOTE BOOKMAKER")[0]
+    assert out.next_matchday.label in section4 and "lambda=" not in section4
+    header = next(line for line in section4.splitlines() if "EV max (%)" in line)
+    for column in pipeline.CONSOLE_MATCHDAY_COLUMNS:
+        assert column in header, column
+    assert pipeline.MATCHDAY_CONSOLE_LEGEND in section4
+    assert len(section4.strip().splitlines()) >= 1 + 1 + 7, "label, header and one line per fixture"
+    assert list(out.matchday_frame.columns) == list(MATCHDAY_COLUMNS) and len(out.matchday_frame) == 7
+    assert set(out.matchday_frame["match_id"]) == {p.match_id for p in out.predictions}
+    assert list(out.results_frame.columns) == list(RESULTS_MODEL_COLUMNS) and len(out.results_frame) == len(out.current_matches) == 20
+    assert out.results_frame["P esito (%)"].between(0.0, 100.0).all()
+    # ... and --export writes the full table and the played results next to the report
+    assert out.matchday_export_path == tmp_path / "value_giornata.csv" == pipeline.matchday_export_path(export) and out.matchday_export_path.exists()
+    assert out.results_export_path == tmp_path / "value_risultati.csv" == pipeline.results_export_path(export) and out.results_export_path.exists()
+    giornata = pd.read_csv(out.matchday_export_path)
+    assert list(giornata.columns) == list(MATCHDAY_COLUMNS) and len(giornata) == 7 and giornata["Forma Casa"].notna().all()
+    risultati = pd.read_csv(out.results_export_path)
+    assert list(risultati.columns) == list(RESULTS_MODEL_COLUMNS) and len(risultati) == 20 and set(risultati["Esito"]) <= {"1", "X", "2"}
+    assert f"tabella giornata scritta in: {out.matchday_export_path}" in captured and f"risultati giocati scritti in: {out.results_export_path}" in captured
+
+
+def test_format_matchday_console_is_compact_and_handles_missing_prices(tmp_path: Path) -> None:
+    out = pipeline.main(["--mode", "mini", "--no-export", "--log-level", "ERROR"])
+    assert out.matchday_export_path is None and out.results_export_path is None
+    text = pipeline.format_matchday_console(out.matchday_frame)
+    lines = text.splitlines()
+    assert len(lines) == 1 + len(out.matchday_frame) == 8 and all(c in lines[0] for c in pipeline.CONSOLE_MATCHDAY_COLUMNS)
+    assert "α Casa" not in lines[0] and "match_id" not in lines[0], "the console shows the compact subset only"
+    assert out.matchday_frame["Data"].iloc[0].strftime("%Y-%m-%d") in lines[1]
+    unquoted = out.matchday_frame.copy()
+    unquoted.loc[0, ["Book X", "EV max (%)"]] = float("nan")
+    first = pipeline.format_matchday_console(unquoted).splitlines()[1]
+    assert first.split().count("-") >= 2, first  # Book X and EV max of an unquoted fixture read '-'
+    assert pipeline.format_matchday_console(out.matchday_frame.iloc[0:0]) == "nessuna partita."
 
 
 def test_pick_list_sizes_are_flags(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:

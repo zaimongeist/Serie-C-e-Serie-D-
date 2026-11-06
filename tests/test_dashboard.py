@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import base64
 import dataclasses
+import functools
 import inspect
 import io
 import json
@@ -16,6 +17,7 @@ import urllib.error
 import urllib.request
 from datetime import date
 from pathlib import Path
+from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -25,28 +27,37 @@ import plotly.graph_objects as go
 import plotly.io as pio
 import pytest
 
-from src.common.schemas import SELECTIONS, Fixture, Girone, Market, OddsQuote
+from src.common.schemas import SELECTIONS, Fixture, Girone, Market, OddsQuote, season_of
 from src.dashboard.legend import POOR_EXAMPLE_FLAGS, SYNTHETIC_REASON_NO_QUOTES, SYNTHETIC_REASON_NO_VALUE, pick_example_row
 from src.dashboard import LEGACY_FULL_WIDTH, MODERN_FULL_WIDTH, container_width_kwargs
+from src.dashboard.legend import legend_terms
 from src.dashboard.state import (
     ALL_MATCHDAYS,
     MARKETS_COLUMNS,
+    MATCHDAY_COLUMNS,
+    MATCHDAY_TABLE_KEY_PREFIX,
     MIN_SIM_ROUNDS,
     PICKS_EXPORT_COLUMNS,
     RANKING_COLUMNS,
+    RESULTS_MODEL_COLUMNS,
     TRAPS_COLUMNS,
     VALUE_COLUMNS,
     PipelineState,
     btts_picks_table,
     build_state,
+    current_teams,
     draw_picks_table,
     export_csv_bytes,
     find_matchday,
+    fixture_label,
     fixtures_for,
     heatmap_figure,
     load_odds_quotes,
     markets_table,
+    matchday_csv_bytes,
     matchday_predictions,
+    matchday_table_for,
+    matchday_table_key,
     max_sim_rounds,
     no_odds_message,
     opportunities_table,
@@ -56,12 +67,19 @@ from src.dashboard.state import (
     quotes_for,
     ranking_table,
     resolve_matchday,
+    results_csv_bytes,
+    results_table_for,
+    results_team_options,
+    seasons_available,
+    selected_row_match_id,
     strength_figure,
     traps_table,
     value_opportunities,
     value_table,
 )
+from src.common.teams import load_registry
 from src.engine.picks import PICKS_COLUMNS
+from src.engine.tables import team_form
 from src.ingestion.harvester import save_fixtures, save_processed
 from src.simulation.generator import simulate_league, simulate_mini_dataset
 
@@ -103,6 +121,25 @@ def rendered_heatmap(at: AppTest) -> tuple[np.ndarray, dict]:
     (trace,) = spec["data"]
     assert trace["type"] == "heatmap"
     return plotly_array(trace["z"]).astype(float), spec["layout"]
+
+
+def matchday_table_element(at: AppTest):  # noqa: ANN201 - streamlit.testing element type is private
+    """The *Giornata* table element: the one ``st.dataframe`` whose key starts with :data:`MATCHDAY_TABLE_KEY_PREFIX` (the key is scoped per matchday and competition)."""
+    tables = [d for d in at.dataframe if d.key is not None and str(d.key).startswith(MATCHDAY_TABLE_KEY_PREFIX)]
+    assert len(tables) == 1, [d.key for d in at.dataframe]
+    return tables[0]
+
+
+def matchday_table_shown(at: AppTest) -> pd.DataFrame:
+    """The *Giornata* table as rendered."""
+    return matchday_table_element(at).value
+
+
+def results_table_shown(at: AppTest) -> pd.DataFrame:
+    """The *Risultati* table as rendered (found by its columns: a plain ``st.dataframe`` is not a widget, so AppTest has no key for it)."""
+    tables = [d.value for d in at.dataframe if list(d.value.columns) == list(RESULTS_MODEL_COLUMNS)]
+    assert len(tables) == 1, [list(d.value.columns)[:3] for d in at.dataframe]
+    return tables[0]
 
 
 EXAMPLE_HEADER = re.compile(r"^\*\*(?P<partita>.+?)\*\* \((?P<comp>[^)]+)\) · mercato (?P<mercato>.+?), esito \*\*(?P<esito>[^*]+)\*\* · quota (?P<quota>[0-9.]+) di (?P<book>.+)$")
@@ -559,6 +596,147 @@ def test_export_csv_bytes_roundtrip(sim_state: PipelineState) -> None:
     assert parsed["Data"].iloc[0] == table["Data"].iloc[0].strftime("%Y-%m-%d")
 
 
+def test_matchday_table_for_and_results_table_for(sim_state: PipelineState) -> None:
+    """The two tables the Giornata and Risultati tabs show, from the state."""
+    table = matchday_table_for(sim_state)
+    assert list(table.columns) == list(MATCHDAY_COLUMNS) and len(table) == 40 == len(fixtures_for(sim_state, None))
+    assert set(table["match_id"]) == {p.fixture.match_id for p in sim_state.predictions}
+    assert table["EV max (%)"].notna().all(), "the synthetic bookmaker quotes every fixture"
+    trap_teams = {t.team for t in sim_state.traps}
+    trapped_rows = table[table["Casa"].isin(trap_teams) | table["Ospiti"].isin(trap_teams)]
+    assert len(trapped_rows) > 0 and trapped_rows["Flag"].str.contains("REGRESSION_TRAP | TRAP:", regex=False).all()
+    assert not table[~table.index.isin(trapped_rows.index)]["Flag"].str.contains("TRAP", regex=False).any()
+    only_sb = matchday_table_for(sim_state, None, Girone.SB)
+    assert len(only_sb) == 10 and only_sb["Competizione"].eq("Serie B").all()
+    assert matchday_table_for(sim_state, ALL_MATCHDAYS).equals(table) and matchday_table_for(sim_state, sim_state.next_matchday).equals(table)
+    # the form columns come from the current season only (15 rounds -> five results for every team) and are cached per state
+    assert table["Forma Casa"].str.count("-").eq(4).all() and table["Forma Ospiti"].str.count("-").eq(4).all()
+    first = table.iloc[0]
+    assert first["Forma Casa"] == team_form(sim_state.current_matches, first["Casa"]).results_last_n
+    assert first["Pt Casa (5)"] == team_form(sim_state.current_matches, first["Casa"]).points_last_n
+    frame = sim_state.team_matches_frame()
+    assert frame is sim_state.team_matches_frame() and len(frame) == 2 * sim_state.n_current_matches
+    assert dataclasses.replace(sim_state, quotes=[])._team_matches is None, "a copy of the state starts a fresh cache"
+    parsed = pd.read_csv(io.BytesIO(matchday_csv_bytes(sim_state)))
+    assert list(parsed.columns) == list(MATCHDAY_COLUMNS) and len(parsed) == 40 and parsed["Data"].iloc[0] == table["Data"].iloc[0].strftime("%Y-%m-%d")
+    assert len(pd.read_csv(io.BytesIO(matchday_csv_bytes(sim_state, None, Girone.C)))) == 10
+    # results: the current season by default, any season of the history on request, one competition, one team
+    results = results_table_for(sim_state)
+    assert list(results.columns) == list(RESULTS_MODEL_COLUMNS) and len(results) == sim_state.n_current_matches == 600
+    assert results["Data"].is_monotonic_decreasing and results["P esito (%)"].between(0.0, 100.0).all()
+    assert seasons_available(sim_state) == ["2026/27", "2025/26", "2024/25"]
+    past = results_table_for(sim_state, season="2024/25")
+    assert len(past) == 1520 and past["P esito (%)"].notna().all() and len(results_table_for(sim_state, season="2025_26")) == 1520
+    assert len(results_table_for(sim_state, girone=Girone.B)) == 150 and len(results_table_for(sim_state, girone="Serie B", season="2024/25")) == 380
+    team = sim_state.registry.teams(Girone.A)[0]
+    mine = results_table_for(sim_state, team=team)
+    assert len(mine) == 15 and ((mine["Casa"] == team) | (mine["Ospiti"] == team)).all()
+    assert current_teams(sim_state) == sorted(sim_state.registry.canonical_names) and len(current_teams(sim_state)) == 80
+    assert current_teams(sim_state, Girone.A) == sorted(sim_state.registry.teams(Girone.A)) == results_team_options(sim_state, Girone.A)
+    historical = set(sim_state.params.historical_teams)
+    options_past = results_team_options(sim_state, None, "2025/26")
+    past_rows = results_table_for(sim_state, season="2025/26")
+    # a past season offers exactly the clubs that played it (historical ones included), not the current registry
+    assert set(options_past) == set(past_rows["Casa"].astype(str)) | set(past_rows["Ospiti"].astype(str))
+    assert set(options_past) & historical and set(options_past) - set(current_teams(sim_state)) <= historical
+    assert set(current_teams(sim_state)) - set(options_past), "a club new to the perimeter has no 2025/26 row and is not offered"
+    hist = next(t for t in options_past if t in historical)
+    rows = results_table_for(sim_state, team=hist, season="2025/26")
+    assert len(rows) > 0 and ((rows["Casa"] == hist) | (rows["Ospiti"] == hist)).all() and rows["λ"].notna().all()
+    assert results_table_for(sim_state, team=hist).empty, "not in the current season"
+    parsed = pd.read_csv(io.BytesIO(results_csv_bytes(sim_state, team=team)))
+    assert len(parsed) == 15 and list(parsed.columns) == list(RESULTS_MODEL_COLUMNS)
+
+
+def test_fixture_label_and_selected_row_match_id(sim_state: PipelineState) -> None:
+    """The pure helpers behind the Giornata tab's row selection."""
+    pred = sim_state.predictions[0]
+    assert fixture_label(pred) == f"[{pred.fixture.girone.value}] {pred.fixture.date.isoformat()} · {pred.fixture.home_team} - {pred.fixture.away_team}"
+    table = matchday_table_for(sim_state)
+    event = SimpleNamespace(selection=SimpleNamespace(rows=[2]))
+    assert selected_row_match_id(event, table) == table["match_id"].iloc[2]
+    assert selected_row_match_id(SimpleNamespace(selection=SimpleNamespace(rows=[])), table) is None
+    assert selected_row_match_id(SimpleNamespace(selection=SimpleNamespace(rows=None)), table) is None
+    assert selected_row_match_id(None, table) is None
+    assert selected_row_match_id(SimpleNamespace(selection=SimpleNamespace(rows=[99])), table) is None, "the table changed under the selection"
+    assert selected_row_match_id(SimpleNamespace(selection=SimpleNamespace(rows=[-1])), table) is None
+    assert selected_row_match_id(event, table.drop(columns="match_id")) is None
+    assert selected_row_match_id(event, table.iloc[0:0]) is None
+
+
+def test_matchday_table_key_is_scoped_to_matchday_and_competition(sim_state: PipelineState) -> None:
+    """Regression: the Giornata table widget key changes with the matchday and the sidebar competition.
+
+    Streamlit keeps a ``st.dataframe`` row selection per widget key, whatever
+    the data: with one fixed key a click on row 3 of *Tutti* survived a switch
+    to *Serie B* and silently opened row 3 of the Serie B table. A scoped key is
+    a fresh widget per scope, so the selection dies with its table.
+    """
+    md = sim_state.next_matchday
+    assert md is not None
+    keys = {
+        matchday_table_key(None, None),
+        matchday_table_key(md, None),
+        *(matchday_table_key(None, g) for g in Girone),
+        *(matchday_table_key(md, g) for g in Girone),
+    }
+    assert len(keys) == 2 + 2 * len(Girone), "every (matchday, competition) pair is its own widget"
+    assert all(k.startswith(MATCHDAY_TABLE_KEY_PREFIX + "_") for k in keys)
+    assert matchday_table_key(None, None) == f"{MATCHDAY_TABLE_KEY_PREFIX}_tutte_all"
+    assert matchday_table_key(md, Girone.SB) == f"{MATCHDAY_TABLE_KEY_PREFIX}_{md.key}_SB" == matchday_table_key(md, "Serie B")
+    assert matchday_table_key(md, "A") == matchday_table_key(md, Girone.A) != matchday_table_key(md, Girone.B)
+    # Streamlit recovers the user key from the element id by splitting on the first two hyphens only, so a key
+    # holding the ISO date of the matchday ('2026-10-18') round-trips untouched
+    from streamlit.runtime.state.common import user_key_from_element_id
+
+    key = matchday_table_key(md, Girone.A)
+    assert "-" in key and user_key_from_element_id(f"$$ID-0123456789abcdef-{key}") == key
+
+
+def test_results_team_options_offer_only_teams_with_rows(sim_state: PipelineState) -> None:
+    """Regression: for a past season the *Squadra* filter offers the clubs that played it in that competition.
+
+    The options used to start from the registry (every current team under its
+    present competition), while the table filters on the competition the match
+    was played in: a club promoted or relegated since was offered under its new
+    competition for a season it played elsewhere, and its table was empty.
+    """
+    registry = sim_state.registry
+    assert registry is not None
+    for season in seasons_available(sim_state):
+        for g in (None, *Girone):
+            table = results_table_for(sim_state, girone=g, season=season)
+            with_rows = set(table["Casa"].astype(str)) | set(table["Ospiti"].astype(str))
+            options = results_team_options(sim_state, g, season)
+            assert options == sorted(set(options)) and options, (season, g)
+            if season == "2026/27":
+                # the current season also offers the registry teams of the competition, played or not
+                assert set(options) == with_rows | set(current_teams(sim_state, g)), (season, g)
+            else:
+                assert set(options) == with_rows, (season, g)
+            for team in options:
+                assert team in with_rows or season == "2026/27", (season, g, team)
+    # a current team that played a past season in another competition (promoted/relegated in the simulated history)
+    past = "2025/26"
+    frame = sim_state.matches
+    in_past = frame.loc[(pd.to_datetime(frame["date"]).map(season_of) == past).to_numpy(dtype=bool)]
+    then_girone = dict(zip(in_past["home_team"].astype(str), in_past["girone"].astype(str)))
+    moved = sorted(
+        (team, Girone.parse(then_girone[team]), registry.girone_of(team))
+        for team in registry.canonical_names
+        if team in then_girone and Girone.parse(then_girone[team]) != registry.girone_of(team)
+    )
+    assert moved, "the simulated history has clubs that changed competition"
+    team, then_g, now_g = moved[0]
+    assert team in results_team_options(sim_state, then_g, past) and team in results_team_options(sim_state, None, past)
+    assert team not in results_team_options(sim_state, now_g, past), "offered under its registry competition it would have no row"
+    assert results_table_for(sim_state, girone=now_g, team=team, season=past).empty
+    assert not results_table_for(sim_state, girone=then_g, team=team, season=past).empty
+    assert team in results_team_options(sim_state, now_g), "the current season still offers every registry team"
+    # a season no match belongs to falls back to the registry teams, so the selectbox is never empty
+    assert results_team_options(sim_state, Girone.B, "2019/20") == sorted(registry.teams(Girone.B))
+
+
 # ----------------------------------------------------------------------------- Streamlit UI
 def test_app_renders_with_apptest(monkeypatch: pytest.MonkeyPatch) -> None:
     from streamlit.testing.v1 import AppTest
@@ -568,8 +746,24 @@ def test_app_renders_with_apptest(monkeypatch: pytest.MonkeyPatch) -> None:
     at = AppTest.from_file(str(APP_PATH), default_timeout=240)
     at.run()
     assert not at.exception, [e.value for e in at.exception]
-    assert [tab.label for tab in at.tabs] == ["Classifica Forza", "Match & Heatmap", "Opportunità di Valore", "Selezioni di giornata", "Export", "Legenda"]
-    assert len(at.get("download_button")) >= 3  # picks, value report, predictions
+    assert [tab.label for tab in at.tabs] == ["Classifica Forza", "Giornata", "Risultati", "Opportunità di Valore", "Selezioni di giornata", "Export", "Legenda"]
+    assert len(at.get("download_button")) >= 5  # matchday table, results, picks, value report, predictions
+    assert {"Scarica tabella giornata (CSV)", "Scarica risultati (CSV)", "Scarica le due liste (CSV)"} <= {b.label for b in at.get("download_button")}
+    # Giornata: the whole matchday in one table (one row per fixture, match_id last) and the Partita fallback in sync
+    matchday_table = matchday_table_shown(at)
+    assert list(matchday_table.columns) == list(MATCHDAY_COLUMNS) and len(matchday_table) == 40
+    fixture_box = at.selectbox(key="fixture")
+    assert fixture_box.label == "Partita" and len(fixture_box.options) == 40
+    assert {o.split(" · ")[1].split(" - ")[0] for o in fixture_box.options} == set(matchday_table["Casa"])
+    assert any("Clicca una riga per aprire la partita" in c.value for c in at.caption)
+    # Risultati: season (current first) and team filters, the played matches of the current season with the model's reading
+    season_box = at.selectbox(key="results_season")
+    assert season_box.options == ["2026/27", "2025/26", "2024/25"] and season_box.value == "2026/27"
+    team_box = at.selectbox(key="results_team")
+    assert team_box.options[0] == "Tutte" and len(team_box.options) == 81 and team_box.value == "Tutte"
+    results = results_table_shown(at)
+    assert list(results.columns) == list(RESULTS_MODEL_COLUMNS) and len(results) == 320  # 8 rounds x 40 matches
+    assert any(c.value.startswith("P esito (%) = probabilità") and "Sorpresa" in c.value for c in at.caption)
     assert any("Dati simulati" in i.value for i in at.sidebar.info)
     # Selezioni di giornata: one matchday (the simulated league has one round), N controls, two picks tables, one CSV
     matchday_box = at.selectbox(key="matchday")
@@ -615,6 +809,147 @@ def test_app_renders_with_apptest(monkeypatch: pytest.MonkeyPatch) -> None:
     assert not at.exception, [e.value for e in at.exception]
     assert len(at.selectbox(key="fixture").options) == 10 and all(o.startswith("[SB]") for o in at.selectbox(key="fixture").options)
     assert any("vista: Serie B" in c.value for c in at.caption)
+    sb_table = matchday_table_shown(at)
+    assert len(sb_table) == 10 and set(sb_table["Competizione"]) == {"Serie B"}
+    assert at.selectbox(key="results_team").options == ["Tutte", *sorted(load_registry().teams(Girone.SB))]
+    assert len(results_table_shown(at)) == 80  # 8 rounds x 10 Serie B matches
+    # the Partita selectbox is the fallback to the row click: the detail (heatmap) follows it
+    fourth = at.selectbox(key="fixture").options[3]
+    at.selectbox(key="fixture").select(fourth).run()
+    assert not at.exception, [e.value for e in at.exception]
+    _z, layout = rendered_heatmap(at)
+    assert fourth.split(" · ")[1] in layout["title"]["text"]
+    assert any(m.label.startswith("λ casa") and m.value for m in at.metric)
+    # Risultati filters: one team -> its 8 matches, a past season with 'Tutte' -> the whole synthetic season, a historical team
+    team = at.selectbox(key="results_team").options[1]
+    at.selectbox(key="results_team").select(team).run()
+    assert not at.exception, [e.value for e in at.exception]
+    mine = results_table_shown(at)
+    assert len(mine) == 8 and ((mine["Casa"] == team) | (mine["Ospiti"] == team)).all() and set(mine["Competizione"]) == {"Serie B"}
+    assert any(b.label.startswith("Scarica risultati") for b in at.get("download_button"))
+    at.selectbox(key="results_season").select("2025/26")
+    at.selectbox(key="results_team").select("Tutte")
+    at.run()
+    assert not at.exception, [e.value for e in at.exception]
+    past = results_table_shown(at)
+    assert len(past) == 380 and set(past["Competizione"]) == {"Serie B"}  # one synthetic Serie B season
+    current_names = set(load_registry().canonical_names)
+    historical = [o for o in at.selectbox(key="results_team").options[1:] if o not in current_names]
+    assert historical, "a past season offers the clubs that played it and are no longer in the perimeter"
+    at.selectbox(key="results_team").select(historical[0]).run()
+    assert not at.exception, [e.value for e in at.exception]
+    theirs = results_table_shown(at)
+    assert len(theirs) == 38 and ((theirs["Casa"] == historical[0]) | (theirs["Ospiti"] == historical[0])).all()
+    # back to the current season: the historical team is no longer an option, the filter resets without an error
+    at.selectbox(key="results_season").select("2026/27").run()
+    assert not at.exception, [e.value for e in at.exception]
+    assert at.selectbox(key="results_team").value == "Tutte" and len(results_table_shown(at)) == 80
+
+
+def test_app_row_click_opens_the_fixture_and_dies_with_its_table(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The row-click path of the Giornata tab, driven in-process by wrapping ``streamlit.dataframe``.
+
+    ``AppTest`` cannot click a dataframe row, but it runs the script in-process:
+    a wrapper around ``streamlit.dataframe`` renders the real table and, for the
+    Giornata table, returns the selection Streamlit would (``selection.rows``),
+    bound to the widget key it was made on exactly like Streamlit's own widget
+    state. Checks: the *Partita* selectbox, the metrics and the heatmap follow
+    the clicked row; a later manual selectbox choice is kept while the click
+    stays; a selection made on one competition's table does not re-target the
+    detail when the sidebar competition changes (regression: with a fixed key
+    the stale row position was mapped onto the new table).
+    """
+    import streamlit
+    from streamlit.testing.v1 import AppTest
+
+    original = streamlit.dataframe
+    click: dict[str, object] = {"key": None, "rows": []}
+    calls: list[str | None] = []
+
+    @functools.wraps(original)  # keeps the signature, so container_width_kwargs still picks the right keyword
+    def fake_dataframe(data=None, *args, **kwargs):  # noqa: ANN001, ANN002, ANN003, ANN202
+        result = original(data, *args, **kwargs)
+        key = kwargs.get("key")
+        if key is not None and str(key).startswith(MATCHDAY_TABLE_KEY_PREFIX):
+            calls.append(str(key))
+            rows = list(click["rows"]) if key == click["key"] else []  # a selection belongs to the widget it was made on
+            return SimpleNamespace(selection=SimpleNamespace(rows=rows, columns=[]))
+        return result
+
+    monkeypatch.setattr(streamlit, "dataframe", fake_dataframe)
+    monkeypatch.setenv("SERIEC_FORCE_SIMULATE", "1")
+    monkeypatch.setenv("SERIEC_SIM_ROUNDS", "8")
+    at = AppTest.from_file(str(APP_PATH), default_timeout=240)
+    at.run()
+    assert not at.exception, [e.value for e in at.exception]
+    element = matchday_table_element(at)
+    table = element.value
+    assert calls and calls[-1] == element.key == f"{MATCHDAY_TABLE_KEY_PREFIX}_2026-10-18_all" and len(table) == 40
+    labels = at.selectbox(key="fixture").options
+    assert at.selectbox(key="fixture").value == labels[0] and "matchday_table_row" not in at.session_state
+    # the Forma tooltip uses the legend's wording for the letters (one glossary everywhere)
+    columns = json.loads(element.proto.columns)
+    wording = "V vittoria, N pareggio (nullo), P sconfitta"
+    assert wording in columns["Forma Casa"]["help"] and wording in columns["Forma Ospiti"]["help"]
+    assert wording in legend_terms()["Forma (Casa / Ospiti)"]
+
+    # 1) click row 3: selectbox, metrics and heatmap follow the clicked fixture
+    k = 3
+    click.update(key=element.key, rows=[k])
+    at.run()
+    assert not at.exception, [e.value for e in at.exception]
+    row = table.iloc[k]
+    partita = f"{row['Casa']} - {row['Ospiti']}"
+    chosen = at.selectbox(key="fixture").value
+    assert chosen.endswith(f" · {partita}") and chosen == labels[labels.index(chosen)]
+    assert at.session_state["fixture"] == chosen and at.session_state["matchday_table_row"] == (element.key, row["match_id"])
+    lam = next(m.value for m in at.metric if m.label.startswith("λ casa"))
+    mu = next(m.value for m in at.metric if m.label.startswith("μ ospiti"))
+    assert lam == f"{row['λ']:.2f}" and mu == f"{row['μ']:.2f}"
+    top = next(m for m in at.metric if m.label == "Risultato più probabile")
+    assert row["Ris. prob."].startswith(f"{top.value} (")
+    _z, layout = rendered_heatmap(at)
+    assert partita in layout["title"]["text"]
+    # 2) a later manual choice in the selectbox is respected while the click stays on row 3
+    other = labels[7]
+    assert other != chosen
+    at.selectbox(key="fixture").select(other).run()
+    assert not at.exception, [e.value for e in at.exception]
+    assert at.selectbox(key="fixture").value == other
+    _z, layout = rendered_heatmap(at)
+    assert other.split(" · ")[1] in layout["title"]["text"]
+    # 3) the sidebar competition changes: the Serie B table is another widget, without a selection, so the detail
+    #    falls back to the first Serie B fixture instead of row 3 of the new table (the regression)
+    at.selectbox(key="girone").select("Serie B").run()
+    assert not at.exception, [e.value for e in at.exception]
+    sb_element = matchday_table_element(at)
+    sb_table = sb_element.value
+    assert sb_element.key == f"{MATCHDAY_TABLE_KEY_PREFIX}_2026-10-18_SB" != element.key and len(sb_table) == 10
+    sb_labels = at.selectbox(key="fixture").options
+    assert len(sb_labels) == 10 and at.selectbox(key="fixture").value == sb_labels[0]
+    assert not at.selectbox(key="fixture").value.endswith(f" · {sb_table.iloc[k]['Casa']} - {sb_table.iloc[k]['Ospiti']}")
+    assert "matchday_table_row" not in at.session_state
+    _z, layout = rendered_heatmap(at)
+    assert sb_labels[0].split(" · ")[1] in layout["title"]["text"]
+    # 4) a click on the Serie B table works on its own key
+    click.update(key=sb_element.key, rows=[2])
+    at.run()
+    assert not at.exception, [e.value for e in at.exception]
+    sb_row = sb_table.iloc[2]
+    assert at.selectbox(key="fixture").value.endswith(f" · {sb_row['Casa']} - {sb_row['Ospiti']}")
+    assert at.session_state["matchday_table_row"] == (sb_element.key, sb_row["match_id"])
+    # 5) back to every competition: the old widget's selection is gone (Streamlit drops the state of a widget not
+    #    rendered), the Serie B choice is still a valid label of the wider list and is kept
+    at.selectbox(key="girone").select("Tutti").run()
+    assert not at.exception, [e.value for e in at.exception]
+    assert matchday_table_element(at).key == element.key and len(matchday_table_shown(at)) == 40
+    assert at.selectbox(key="fixture").value.endswith(f" · {sb_row['Casa']} - {sb_row['Ospiti']}")
+    assert "matchday_table_row" not in at.session_state
+    # 6) no selection at all: the Partita fallback keeps working
+    click.update(key=None, rows=[])
+    at.run()
+    assert not at.exception, [e.value for e in at.exception]
+    assert at.selectbox(key="fixture").value in at.selectbox(key="fixture").options and at.metric
 
 
 def test_app_matchday_selector_drives_match_value_and_picks_tabs(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -643,6 +978,7 @@ def test_app_matchday_selector_drives_match_value_and_picks_tabs(monkeypatch: py
     first_key = by_round[9][0].date.isoformat()
     assert at.session_state["matchday"] == first_key
     assert len(at.selectbox(key="fixture").options) == 40, "the next matchday, not the 110 fixtures of the season"
+    assert len(matchday_table_shown(at)) == 40
     value_tables = [d.value for d in at.dataframe if list(d.value.columns) == list(VALUE_COLUMNS)]
     first_labels = {f"{f.home_team} - {f.away_team}" for f in by_round[9]}
     assert value_tables and set(value_tables[0]["Partita"]) <= first_labels
@@ -654,21 +990,26 @@ def test_app_matchday_selector_drives_match_value_and_picks_tabs(monkeypatch: py
     fields, _text = worked_example_shown(at)
     assert fields["partita"] in first_labels
 
-    # choose the third matchday: Match & Heatmap, the value panel and the picks follow
+    # choose the third matchday: the Giornata table, the value panel and the picks follow
     box.select(box.options[2]).run()
     assert not at.exception, [e.value for e in at.exception]
     third_key = by_round[11][0].date.isoformat()
     assert at.session_state["matchday"] == third_key
     third_labels = {f"{f.home_team} - {f.away_team}" for f in by_round[11]}
     assert len(at.selectbox(key="fixture").options) == 30 and not any("[SB]" in o for o in at.selectbox(key="fixture").options)
+    third_table = matchday_table_shown(at)
+    assert len(third_table) == 30 and "Serie B" not in set(third_table["Competizione"])
+    assert set(third_table["match_id"]) == {f.match_id for f in by_round[11]}
+    assert set(third_table["Casa"].astype(str) + " - " + third_table["Ospiti"].astype(str)) == third_labels
     value_tables = [d.value for d in at.dataframe if list(d.value.columns) == list(VALUE_COLUMNS)]
     assert value_tables and set(value_tables[0]["Partita"]) <= third_labels and not set(value_tables[0]["Competizione"]) & {"Serie B"}
     picks_tables = [d.value for d in at.dataframe if list(d.value.columns) == list(PICKS_COLUMNS)]
     assert [len(t) for t in picks_tables] == [5, 12] and all(set(t["Partita"]) <= third_labels for t in picks_tables)
-    # the sidebar competition filter still applies to Match & Heatmap within the selected matchday
+    # the sidebar competition filter still applies to the Giornata tab within the selected matchday
     at.selectbox(key="girone").select("Girone A").run()
     assert not at.exception, [e.value for e in at.exception]
     assert len(at.selectbox(key="fixture").options) == 10 and all(o.startswith("[A]") for o in at.selectbox(key="fixture").options)
+    assert len(matchday_table_shown(at)) == 10
     assert at.session_state["matchday"] == third_key, "the matchday choice survives other interactions"
     # ... and so does the Legenda example: third matchday, Girone A only
     assert_example_is_the_panel_row(at)
