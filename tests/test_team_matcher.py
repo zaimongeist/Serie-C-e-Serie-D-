@@ -1,18 +1,34 @@
-"""Tests for :mod:`src.ingestion.team_matcher` (pure, offline)."""
+"""Tests for :mod:`src.ingestion.team_matcher` (pure, offline).
+
+The matching-logic tests run on the 2025/26 dictionary (``LEGACY_SEASON``): its
+spellings (``Vicenza``, ``Virtus Verona``, ...) are the ones the assertions were
+written for, and pinning the season keeps them independent of
+:data:`src.common.teams.DEFAULT_SEASON`. The historical-team tests use the
+current 2026/27 perimeter extended with the 2025/26 aliases.
+"""
 from __future__ import annotations
 
 import pandas as pd
 import pytest
 
 from src.common.schemas import Girone
-from src.common.teams import TeamRegistry, load_registry
+from src.common.teams import DEFAULT_SEASON, TeamRegistry, load_registry
 from src.ingestion import team_matcher as tm
 from src.ingestion.team_matcher import MatchResult, TeamMatcher
+
+LEGACY_SEASON = "2025_26"
+CURRENT_SEASON = "2026_27"
 
 
 @pytest.fixture(scope="module")
 def registry() -> TeamRegistry:
-    return load_registry()
+    return load_registry(LEGACY_SEASON)
+
+
+@pytest.fixture(scope="module")
+def history_matcher() -> TeamMatcher:
+    """Current perimeter (2026/27) plus the aliases of the older dictionaries."""
+    return TeamMatcher(load_registry(CURRENT_SEASON, with_history=True))
 
 
 @pytest.fixture
@@ -249,3 +265,82 @@ def test_token_subset_guard_on_difflib_fallback(monkeypatch: pytest.MonkeyPatch,
     assert fallback.match("Juventus").canonical is None
     assert fallback.match("Juve Next Gen").canonical == "Juventus Next Gen"
     assert tm.whole_string_score("gen next juventus", "juventus next gen") == 100  # token-sorted difflib path
+
+
+# ------------------------------------------------------- current vs historical teams
+def test_default_season_is_the_current_perimeter() -> None:
+    assert DEFAULT_SEASON == CURRENT_SEASON
+    plain = TeamMatcher(load_registry())
+    assert len(plain.current_names) == 60 and plain.historical_names == frozenset()
+    assert plain.match("Vicenza").canonical is None  # relegated: unknown without history
+    assert plain.match("Juventus U23").canonical == "Juventus Next Gen"  # alias kept in the 2026/27 file
+
+
+def test_historical_names_are_derived_from_the_registry(history_matcher: TeamMatcher) -> None:
+    assert len(history_matcher.current_names) == 60
+    assert {"Ternana", "Vicenza", "Pro Patria", "Triestina", "Rimini", "Virtus Verona", "Benevento"} <= history_matcher.historical_names
+    assert history_matcher.historical_names.isdisjoint(history_matcher.current_names)
+    assert history_matcher.is_historical("Ternana") and not history_matcher.is_current("Ternana")
+    assert history_matcher.is_current("Perugia") and not history_matcher.is_historical("Perugia")
+    assert not history_matcher.is_current("SPAL") and not history_matcher.is_historical("SPAL")
+    # A registry without the ``historical_names`` attribute still works: targets of the
+    # alias table that are not current teams are historical.
+    synthetic = TeamRegistry(
+        season="test",
+        teams_by_girone={Girone.A: ("Alpha", "Beta")},
+        aliases={"alpha": "Alpha", "beta": "Beta", "gamma": "Gamma", "gamma old": "Gamma"},
+    )
+    matcher = TeamMatcher(synthetic)
+    assert matcher.historical_names == frozenset({"Gamma"}) and matcher.current_names == frozenset({"Alpha", "Beta"})
+    assert matcher.match("Gamma Old").canonical == "Gamma" and matcher.match("gamma").method == "exact"
+
+
+def test_unrestricted_lookup_resolves_historical_teams(history_matcher: TeamMatcher) -> None:
+    result = history_matcher.match("Ternana Calcio")  # "Calcio" is a dropped suffix: exact hit on the old canonical
+    assert result.canonical == "Ternana" and result.method == "exact" and result.score == 100
+    assert history_matcher.match("Ternana").method == "exact"
+    via_alias = history_matcher.match("Lane Rossi Vicenza")
+    assert via_alias.canonical == "Vicenza" and via_alias.method == "alias" and via_alias.score == 100
+    assert history_matcher.match("L.R. Vicenza").canonical == "Vicenza"
+    assert history_matcher.match("Virtus Vecomp Verona").canonical == "Virtus Verona"
+    typo = history_matcher.match("Ternanna")
+    assert typo.canonical == "Ternana" and typo.method == "fuzzy" and typo.score < 100
+
+
+def test_restricted_lookup_only_returns_current_teams(history_matcher: TeamMatcher) -> None:
+    # Ternana played in girone B until 2025/26 but is not in the 2026/27 perimeter.
+    assert history_matcher.match("Ternana Calcio", Girone.B).canonical is None
+    assert history_matcher.match("Ternana", "B").canonical is None
+    assert history_matcher.match("Vicenza", Girone.A).canonical is None
+    # Current teams that moved girone follow the CURRENT registry.
+    assert history_matcher.match("Juventus U23", Girone.A).canonical == "Juventus Next Gen"
+    assert history_matcher.match("Juventus U23", Girone.B).canonical is None  # played in B in 2025/26
+    assert history_matcher.match("Juventus U23").canonical == "Juventus Next Gen"
+    assert history_matcher.match("Inter U23", Girone.C).canonical == "Inter U23"
+    assert history_matcher.match("Inter U23", Girone.A).canonical is None
+    assert history_matcher.match("Carpi FC", Girone.A).canonical == "Carpi" and history_matcher.match("Carpi FC", "B").canonical is None
+    assert history_matcher.match("Latina Calcio", Girone.B).canonical == "Latina"
+
+
+def test_historical_aliases_never_steal_current_spellings(history_matcher: TeamMatcher) -> None:
+    # Spellings shared by both dictionaries stay with the current team.
+    assert history_matcher.match("Brescia").canonical == "Union Brescia"
+    assert history_matcher.match("Samb", Girone.B).canonical == "Sambenedettese"
+    assert history_matcher.match("Altamura").canonical == "Team Altamura"
+    assert history_matcher.match("Juventus").canonical is None  # token-subset guard still holds
+
+
+def test_map_frame_with_girone_column_keeps_historical_names_raw(history_matcher: TeamMatcher) -> None:
+    df = pd.DataFrame(
+        {
+            "home_team": ["Ternana Calcio", "Juventus U23"],
+            "away_team": ["Perugia", "Ternana Calcio"],
+            "girone": ["B", "A"],
+        }
+    )
+    out, unmapped = history_matcher.map_frame(df)
+    assert out["home_team"].tolist() == ["Ternana Calcio", "Juventus Next Gen"]
+    assert out["away_team"].tolist() == ["Perugia", "Ternana Calcio"]
+    assert unmapped == {"Ternana Calcio": 2}
+    unrestricted, unmapped_all = history_matcher.map_frame(df.drop(columns="girone"))
+    assert unrestricted["home_team"].tolist() == ["Ternana", "Juventus Next Gen"] and unmapped_all == {}

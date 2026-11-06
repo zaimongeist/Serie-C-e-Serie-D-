@@ -56,6 +56,27 @@ and then range-checked: negative goals and rows with ``home_team == away_team``
 raise ``ValueError`` (the same rules :class:`src.common.schemas.MatchRecord`
 enforces), so sentinel values from harvested data can never corrupt a fit.
 
+Perimeter: current and historical teams
+---------------------------------------
+A fit may use several seasons of history (the time decay already down-weights
+old matches). When a :class:`src.common.teams.TeamRegistry` is passed to
+:meth:`DixonColesEngine.fit` (or :func:`build_team_index`) the registry defines
+the *perimeter*: every registry team is a **current team** and is assigned to
+its registry girone even if its past matches were played in another girone
+(Inter U23 moved from A to C, Juventus Next Gen from B to A, ...); every other
+team in the frame is a **historical team** (relegated, promoted, excluded): it
+stays in the likelihood as an opponent, so the strengths of the current teams
+are estimated against the right opposition, but it is excluded from
+:meth:`DixonColesEngine.ranking` by default and reported in
+``FittedParams.historical_teams``. The ``sum(alpha) == 0`` constraint is
+applied per *constraint group*: the registry girone for current teams, while a
+historical team joins the group of the girone it played most matches in (ties
+broken by letter order), exactly as a team without registry would. The home
+advantage ``gamma`` of a match is always the one of the girone the match was
+played in (the frame's ``girone`` column), never the team's current girone.
+Without a registry every fitted team is current (the behaviour of earlier
+releases is unchanged).
+
 The objective exposes an analytic gradient (:func:`negative_log_likelihood_grad`)
 which is passed to :func:`scipy.optimize.minimize`.
 """
@@ -84,6 +105,7 @@ from src.common.schemas import (
     MatchPrediction,
     validate_matches_df,
 )
+from src.common.teams import TeamRegistry
 
 __all__ = [
     "DixonColesConfig",
@@ -544,12 +566,17 @@ class TeamIndex:
     the girone, then B, then C). ``gironi`` are the gironi that appear in the
     match frame, in letter order; they index the home-advantage parameters when
     ``girone_specific_home`` is true (otherwise there is a single shared gamma).
+    ``teams_by_girone`` are the constraint groups of the ``sum(alpha) == 0``
+    identifiability constraint. ``historical`` lists the fitted teams that are
+    not part of the current perimeter (see :func:`build_team_index` with a
+    registry); it is empty when no registry was used.
     """
 
     teams: tuple[str, ...]
     teams_by_girone: dict[Girone, tuple[str, ...]]
     gironi: tuple[Girone, ...]
     girone_specific_home: bool = True
+    historical: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if len(set(self.teams)) != len(self.teams):
@@ -560,10 +587,24 @@ class TeamIndex:
         for g in self.teams_by_girone:
             if g not in self.gironi:
                 raise ValueError(f"girone {g.value} has teams but no matches")
+        unknown = sorted(set(self.historical) - set(self.teams))
+        if unknown:
+            raise ValueError(f"historical teams not in TeamIndex.teams: {unknown}")
+        object.__setattr__(self, "historical", tuple(str(t) for t in self.historical))
 
     @property
     def n_teams(self) -> int:
         return len(self.teams)
+
+    @property
+    def current_teams(self) -> tuple[str, ...]:
+        """Fitted teams that belong to the perimeter (every team without a registry)."""
+        gone = set(self.historical)
+        return tuple(t for t in self.teams if t not in gone)
+
+    def is_current(self, team: str) -> bool:
+        """True for a fitted team of the perimeter; False for historical or unknown teams."""
+        return team in self.teams and team not in set(self.historical)
 
     @property
     def n_gammas(self) -> int:
@@ -605,13 +646,21 @@ def build_team_index(
     *,
     girone_specific_home: bool = True,
     min_matches_per_team: int = 1,
+    registry: TeamRegistry | None = None,
 ) -> TeamIndex:
     """Build the :class:`TeamIndex` of a *validated* match frame.
 
-    A team appearing in more than one girone is assigned to the girone where it
-    played most matches (ties broken by letter order) and a warning is logged.
+    Without ``registry`` a team appearing in more than one girone is assigned to
+    the girone where it played most matches (ties broken by letter order) and a
+    warning is logged. With a ``registry`` every team of the registry (matched by
+    its canonical name) is a *current* team and is assigned to its **registry**
+    girone, whatever girone its matches were played in (a team that moved girone
+    between seasons is logged at INFO level, not warned about); every other team
+    is *historical*: it is still estimated, listed in ``TeamIndex.historical``
+    and placed in the constraint group of the girone it played most matches in.
     Teams with fewer than ``min_matches_per_team`` matches are still estimated
-    but reported in the log.
+    but reported in the log. Only teams that appear in ``matches`` are indexed:
+    a registry team without any match has no identifiable strength.
     """
     long = pd.concat(
         [
@@ -625,8 +674,31 @@ def build_team_index(
     best = counts.drop_duplicates(subset="team", keep="first")
     assignment: dict[str, Girone] = {str(t): Girone.parse(g) for t, g in zip(best["team"], best["girone"])}
 
+    current_set = set(registry.canonical_names) if registry is not None else set(assignment)
+    historical = tuple(sorted(t for t in assignment if t not in current_set))
+    if registry is not None:
+        moved: dict[str, dict[str, str]] = {}
+        for team in list(assignment):
+            if team in current_set:
+                registry_girone = registry.girone_of(team)
+                if assignment[team] is not registry_girone:
+                    moved[team] = {"played_in": assignment[team].value, "registry": registry_girone.value}
+                assignment[team] = registry_girone
+        if moved:
+            log.info(
+                "current teams assigned to their registry girone (matches played in another girone)",
+                extra={"season": registry.season_label, "teams": moved},
+            )
+        if historical:
+            log.info(
+                "historical teams (not in the registry) kept as opponents, excluded from the perimeter",
+                extra={"season": registry.season_label, "n_historical": len(historical), "teams": list(historical)},
+            )
+
     per_team_gironi = counts.groupby("team", observed=True).size()
     for team in per_team_gironi[per_team_gironi > 1].index:
+        if registry is not None and str(team) in current_set:
+            continue  # a current team is placed by the registry, not by where it played
         detail = {str(g): int(n) for g, n in zip(counts.loc[counts["team"] == team, "girone"], counts.loc[counts["team"] == team, "n"])}
         log.warning(
             "team appears in more than one girone; assigned to the majority girone",
@@ -648,7 +720,23 @@ def build_team_index(
             teams_by_girone[g] = members
     teams = tuple(t for g in Girone for t in teams_by_girone.get(g, ()))
     gironi = tuple(g for g in Girone if g.value in set(matches["girone"].astype(str)))
-    return TeamIndex(teams=teams, teams_by_girone=teams_by_girone, gironi=gironi, girone_specific_home=girone_specific_home)
+    if registry is not None:
+        # A current team whose matches were all played in another girone still needs a
+        # gamma for its registry girone only when it has matches *there*; the gamma
+        # index follows the match's girone, so no extra parameter is created here.
+        missing = [g.value for g in teams_by_girone if g not in gironi]
+        if missing:
+            raise ValueError(
+                f"registry gironi {missing} have current teams but no match was played in them: "
+                "the home advantage of those gironi cannot be estimated"
+            )
+    return TeamIndex(
+        teams=teams,
+        teams_by_girone=teams_by_girone,
+        gironi=gironi,
+        girone_specific_home=girone_specific_home,
+        historical=historical,
+    )
 
 
 def _reject_invalid_rows(df: pd.DataFrame) -> None:
@@ -690,21 +778,23 @@ def prepare_likelihood_data(
     l2_penalty_home: float = 0.0,
     home_prior: float = 0.0,
     l2_penalty_rho: float = 0.0,
+    registry: TeamRegistry | None = None,
 ) -> tuple[LikelihoodData, TeamIndex]:
     """Validate ``matches`` and convert them into :class:`LikelihoodData`.
 
     Returns the data together with the :class:`TeamIndex` used to position the
-    parameters (built from the frame unless ``team_index`` is given). The
-    reference date defaults to the most recent match date. ``ValueError`` is
-    raised for an empty frame, negative goals or ``home_team == away_team`` rows
-    (see :func:`_reject_invalid_rows`).
+    parameters (built from the frame unless ``team_index`` is given; ``registry``
+    is forwarded to :func:`build_team_index` to tell current teams from
+    historical ones). The reference date defaults to the most recent match date.
+    ``ValueError`` is raised for an empty frame, negative goals or
+    ``home_team == away_team`` rows (see :func:`_reject_invalid_rows`).
     """
     df = validate_matches_df(matches)
     if df.empty:
         raise ValueError("no valid matches to fit")
     _reject_invalid_rows(df)
     index = team_index or build_team_index(
-        df, girone_specific_home=girone_specific_home, min_matches_per_team=min_matches_per_team
+        df, girone_specific_home=girone_specific_home, min_matches_per_team=min_matches_per_team, registry=registry
     )
     ref = df["date"].max() if reference_date is None else pd.Timestamp(reference_date)
     positions = index.team_positions()
@@ -985,6 +1075,12 @@ class FittedParams:
     ``fit_warnings`` collects every data-quality note raised during the fit
     (collapsed weights, a reference date outside the sample); it is empty for a
     clean fit.
+
+    ``historical_teams`` are the fitted teams outside the perimeter of the
+    registry passed to :meth:`DixonColesEngine.fit` (empty without a registry);
+    :attr:`current_teams` are the others and :meth:`is_current` tells them apart.
+    ``teams_by_girone`` holds every fitted team (current and historical) in its
+    constraint group.
     """
 
     alpha: dict[str, float]
@@ -1006,6 +1102,7 @@ class FittedParams:
     max_goals: int
     degenerate_weights: bool = False
     fit_warnings: tuple[str, ...] = ()
+    historical_teams: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         self.alpha = {str(k): float(v) for k, v in self.alpha.items()}
@@ -1016,6 +1113,10 @@ class FittedParams:
         self.rho = float(self.rho)
         self.degenerate_weights = bool(self.degenerate_weights)
         self.fit_warnings = tuple(str(w) for w in self.fit_warnings)
+        self.historical_teams = tuple(str(t) for t in self.historical_teams)
+        unknown = sorted(set(self.historical_teams) - set(self.teams))
+        if unknown:
+            raise ValueError(f"historical_teams must be fitted teams; unknown: {unknown}")
 
     # ----------------------------------------------------------------- views
     @property
@@ -1025,8 +1126,28 @@ class FittedParams:
 
     @property
     def teams(self) -> tuple[str, ...]:
-        """All teams in girone order (A, B, C), alphabetical within a girone."""
+        """All fitted teams (current and historical) in girone order (A, B, C), alphabetical within a girone."""
         return tuple(t for g in Girone for t in self.teams_by_girone.get(g, ()))
+
+    @property
+    def current_teams(self) -> tuple[str, ...]:
+        """Fitted teams of the perimeter, in :attr:`teams` order (every team when no registry was used)."""
+        gone = set(self.historical_teams)
+        return tuple(t for t in self.teams if t not in gone)
+
+    def is_current(self, team: str) -> bool:
+        """True when ``team`` was fitted and belongs to the perimeter; False for historical *and* unknown teams."""
+        return team in self.alpha and team not in set(self.historical_teams)
+
+    def current_teams_by_girone(self) -> dict[Girone, tuple[str, ...]]:
+        """``teams_by_girone`` restricted to current teams (gironi left without teams are dropped)."""
+        gone = set(self.historical_teams)
+        out: dict[Girone, tuple[str, ...]] = {}
+        for g, members in self.teams_by_girone.items():
+            kept = tuple(t for t in members if t not in gone)
+            if kept:
+                out[g] = kept
+        return out
 
     def girone_of(self, team: str) -> Girone:
         """Girone a team was assigned to during the fit (``KeyError`` when unknown)."""
@@ -1080,12 +1201,16 @@ class FittedParams:
             "effective_n_ratio": self.effective_n_ratio,
             "degenerate_weights": self.degenerate_weights,
             "fit_warnings": list(self.fit_warnings),
+            "historical_teams": list(self.historical_teams),
+            "current_teams": list(self.current_teams),
         }
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> "FittedParams":
         """Inverse of :meth:`to_dict`; fields with defaults (``degenerate_weights``,
-        ``fit_warnings``) may be absent, so payloads written before they existed load."""
+        ``fit_warnings``, ``historical_teams``) may be absent, so payloads written
+        before they existed load with every team current (``current_teams`` is
+        derived, never read back)."""
         known = {f.name for f in fields(cls)}
         required = {f.name for f in fields(cls) if f.default is MISSING and f.default_factory is MISSING}
         missing = required - set(payload)
@@ -1202,6 +1327,7 @@ class DixonColesEngine:
         *,
         reference_date: date | None = None,
         warm_start: FittedParams | None = None,
+        registry: TeamRegistry | None = None,
     ) -> FittedParams:
         """Estimate ``alpha, beta, gamma, rho`` by weighted maximum likelihood.
 
@@ -1209,6 +1335,10 @@ class DixonColesEngine:
         date for the time-decay defaults to the most recent match date.
         ``warm_start`` initialises the optimiser from a previous fit when its team
         set matches the current one (it is ignored, with a warning, otherwise).
+        ``registry`` defines the perimeter (see the module docstring): registry
+        teams are current and sit in their registry girone, the other teams of the
+        frame are fitted as historical opponents and listed in
+        ``FittedParams.historical_teams``. Without it every team is current.
 
         The time-decay weights are checked with :func:`time_weight_diagnostics`:
         when they collapse (``effective_n < min_effective_n_ratio * n_matches``)
@@ -1234,6 +1364,7 @@ class DixonColesEngine:
             l2_penalty_home=cfg.l2_penalty_home,
             home_prior=cfg.home_prior,
             l2_penalty_rho=cfg.l2_penalty_rho,
+            registry=registry,
         )
         effective_n = float(data.w.sum())
         n_matches = len(data.x)
@@ -1261,6 +1392,9 @@ class DixonColesEngine:
             extra={
                 "n_matches": n_matches,
                 "n_teams": index.n_teams,
+                "n_current_teams": len(index.current_teams),
+                "n_historical_teams": len(index.historical),
+                "perimeter": registry.season_label if registry is not None else None,
                 "gironi": [g.value for g in index.gironi],
                 "method": cfg.method,
                 "xi": cfg.xi,
@@ -1339,6 +1473,7 @@ class DixonColesEngine:
             max_goals=cfg.max_goals,
             degenerate_weights=collapsed,
             fit_warnings=tuple(fit_warnings),
+            historical_teams=index.historical,
         )
         self._params = params
         self._index = index
@@ -1578,16 +1713,23 @@ class DixonColesEngine:
         return [self.predict(fx) for fx in fixtures]
 
     # ------------------------------------------------------------- reporting
-    def ranking(self, girone: Girone | str | None = None) -> pd.DataFrame:
+    def ranking(self, girone: Girone | str | None = None, *, include_historical: bool = False) -> pd.DataFrame:
         """Strength table sorted by ``alpha`` (desc) then ``beta`` (desc).
 
         Columns: ``team, girone, alpha, beta, gamma, attack_index, defence_index,
         xg_for_vs_avg, xg_against_vs_avg`` where ``attack_index = exp(alpha)``,
         ``defence_index = exp(beta)``, ``xg_for_vs_avg = exp(alpha) * mean_girone(exp(-beta))``
         and ``xg_against_vs_avg = exp(-beta) * mean_girone(exp(alpha))``.
+
+        Only the current teams of the perimeter are listed (``girone`` is their
+        registry girone when the fit used a registry); ``include_historical=True``
+        adds the historical opponents too. The per-girone means of the ``vs_avg``
+        columns are taken over the listed teams.
         """
         params = self.params_
         frame = params.to_frame()
+        if not include_historical and params.historical_teams:
+            frame = frame.loc[~frame["team"].isin(params.historical_teams)]
         if girone is not None:
             g = Girone.parse(girone)
             if g not in params.teams_by_girone:

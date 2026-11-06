@@ -18,8 +18,11 @@ def test_mini_mode_runs_end_to_end(tmp_path: Path, capsys: pytest.CaptureFixture
     out = pipeline.main(["--mode", "mini", "--export", str(export), "--log-level", "ERROR"])
     captured = capsys.readouterr().out
 
-    assert len(out.matches) == 20
+    # 20 current-season matches plus the two synthetic past seasons of the 14 mini teams (default --history 2)
+    assert len(out.current_matches) == 20 and len(out.history_matches) == 108
+    assert len(out.matches) == 128 == out.params.n_matches
     assert list(out.matches.columns) == list(MATCH_COLUMNS)
+    assert out.season_label == "2026/27" and "Perimetro: Serie C 2026/27 (14 squadre)" in captured
     assert out.params.converged
     assert len(out.predictions) == len(out.fixtures) > 0
     # every quote selection was evaluated
@@ -52,12 +55,15 @@ def test_mini_mode_predictions_are_sane() -> None:
 
 
 def test_full_mode_reports_parameter_recovery(capsys: pytest.CaptureFixture[str]) -> None:
-    out = pipeline.main(["--mode", "full", "--no-export", "--log-level", "ERROR", "--seed", "3"])
+    # --rounds fixes 30 played rounds whatever today's date (the default follows the calendar as of today)
+    out = pipeline.main(["--mode", "full", "--no-export", "--log-level", "ERROR", "--seed", "3", "--rounds", "30"])
+    console = capsys.readouterr().out
     assert out.recovery is not None and len(out.recovery) == 3
+    assert len(out.current_matches) == 900 and "30 giornate giocate (--rounds)" in console
     assert (out.recovery["corr_alpha"] > 0.8).all()
     assert (out.recovery["corr_beta"] > 0.7).all()
     assert ((out.recovery["gamma_hat"] - out.recovery["gamma_true"]).abs() < 0.15).all()
-    assert "RECUPERO DEI PARAMETRI" in capsys.readouterr().out
+    assert "RECUPERO DEI PARAMETRI" in console
 
 
 def test_kelly_and_threshold_flags_are_applied() -> None:
@@ -159,9 +165,13 @@ def test_auto_prior_is_based_on_matches_per_team_not_total_matches(tmp_path: Pat
         assert abs(gamma - league.true_params.gamma[g]) < 0.25, (g, gamma)
     assert max(r for p in out.predictions for r in (p.home_rate, p.away_rate)) < 4.0
 
-    # the full simulated season (30 per team) still runs the pure MLE under 'auto'
-    full = pipeline.main(["--mode", "full", "--no-export", "--log-level", "ERROR", "--seed", "3"])
+    # 30 played rounds (30 per team) still run the pure MLE under 'auto'; as of 2026-11-06 only 11 rounds are
+    # played, so the calendar-anchored run keeps the prior on (the synthetic history never counts as coverage)
+    full = pipeline.main(["--mode", "full", "--no-export", "--log-level", "ERROR", "--seed", "3", "--rounds", "30"])
     assert full.params.penalty == 0.0 and not pipeline.prior_recommended(full.matches)
+    today = pipeline.main(["--mode", "full", "--no-export", "--log-level", "ERROR", "--seed", "3", "--as-of", "2026-11-06"])
+    assert len(today.current_matches) == 330 and today.params.penalty > 0.0
+    assert pipeline.prior_recommended(today.matches, registry=today.registry, season=today.season_label)
 
 
 def test_parameters_on_optimiser_bounds_are_reported(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:

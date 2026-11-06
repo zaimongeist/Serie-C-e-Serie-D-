@@ -650,20 +650,23 @@ def test_team_in_two_gironi_goes_to_majority_girone(mini, caplog):
     extra = df.iloc[[0]].copy()
     extra["match_id"] = "CROSS-0001"
     extra["girone"] = "B"
-    extra["home_team"] = "Vicenza"  # a Girone A team guesting in Girone B
-    extra["away_team"] = "Arezzo"
+    extra["home_team"] = "Pro Vercelli"  # a Girone A team guesting in Girone B
+    extra["away_team"] = "Pescara"
     extra["home_goals"] = 1
     extra["away_goals"] = 1
     df = pd.concat([df, extra], ignore_index=True)
     with caplog.at_level(logging.WARNING, logger="src.engine.model"):
         params = DixonColesEngine(DixonColesConfig(l2_penalty=0.1)).fit(df)
-    assert params.girone_of("Vicenza") is Girone.A
-    assert "Vicenza" not in params.teams_by_girone[Girone.B]
+    assert params.girone_of("Pro Vercelli") is Girone.A
+    assert "Pro Vercelli" not in params.teams_by_girone[Girone.B]
     assert params.n_matches == 21
     assert any("more than one girone" in rec.getMessage() for rec in caplog.records)
     # the index helper reports the same assignment
     index = build_team_index(df.assign(girone=df["girone"].astype("string")))
-    assert index.girone_of("Vicenza") is Girone.A
+    assert index.girone_of("Pro Vercelli") is Girone.A
+    # without a registry every fitted team is current
+    assert params.historical_teams == () and set(params.current_teams) == set(params.teams)
+    assert params.is_current("Pro Vercelli") and not params.is_current("Nowhere FC")
 
 
 def test_min_matches_per_team_is_logged_not_fatal(mini, caplog):
@@ -920,9 +923,10 @@ def test_reference_date_outside_the_sample_is_logged(league12, caplog):
     assert any("outside the match sample" in rec.getMessage() for rec in caplog.records)
     assert "precedes" not in before.message  # the optimiser message is untouched for a non-degenerate fit
     caplog.clear()
-    # more than a year after the data: every match is discounted and an active prior gets relatively stronger
+    # more than a year after the data (the simulated season is 2026/27): every match is discounted
+    # and an active prior gets relatively stronger
     with caplog.at_level(logging.WARNING, logger="src.engine.model"):
-        later = engine.fit(league12.matches, reference_date=date(2026, 12, 31))
+        later = engine.fit(league12.matches, reference_date=date(2027, 12, 31))
     assert later.converged and not later.degenerate_weights
     assert 0.1 < later.effective_n_ratio < 0.5
     assert len(later.fit_warnings) == 1 and "after the latest match" in later.fit_warnings[0]

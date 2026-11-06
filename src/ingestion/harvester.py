@@ -15,6 +15,26 @@ The module is organised in layers that can be used independently:
   providers and returns a validated canonical ``DataFrame``; also offers CSV
   persistence helpers and a CLI (``python -m src.ingestion.harvester``).
 
+Seasons and perimeter
+---------------------
+The team dictionary of one season (``config/teams_<season>.json``,
+:data:`src.common.teams.DEFAULT_SEASON` by default) is the *perimeter*: its
+teams are the current teams. SofaScore exposes the previous seasons of every
+girone, and :meth:`SofaScoreProvider.harvest_seasons` /
+:meth:`Harvester.harvest_all` harvest the newest ``seasons`` of them (three by
+default) into **one** frame with the fixed 16-column schema -- no season column,
+the season of a match is :func:`src.common.schemas.season_of` of its date.
+Fixtures (not-started events) come from the current season only. Team names of
+past seasons are resolved with the current dictionary extended by the aliases
+of the older dictionaries (:meth:`TeamRegistry.with_historical_aliases`): a
+club that still plays keeps its current canonical name whatever girone it was
+in, a club that left keeps its old canonical spelling and is reported in
+:attr:`HarvestResult.historical_teams`. :attr:`HarvestResult.seasons` and
+:attr:`HarvestResult.n_matches_by_season` say what the frame holds. Payloads
+of completed seasons are immutable and are cached with the long
+``[http] history_cache_ttl_hours`` (365 days) instead of ``cache_ttl_hours``
+(6 h), so a multi-season run repeated later re-downloads the current season only.
+
 Nothing here performs network I/O at import time, and every network path can
 be driven by an injected ``httpx`` transport, a fake sleeper and a seeded RNG,
 so the whole module is testable offline.
@@ -33,6 +53,7 @@ import sys
 import tempfile
 import time
 import tomllib
+from collections import Counter
 from collections.abc import Awaitable, Callable, Coroutine, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta, timezone
@@ -53,9 +74,10 @@ from src.common.schemas import (
     MatchRecord,
     empty_matches_frame,
     matches_to_frame,
+    season_of,
     validate_matches_df,
 )
-from src.common.teams import TeamRegistry, load_registry
+from src.common.teams import DEFAULT_SEASON, TeamRegistry, list_seasons, load_registry, season_file_stem
 from src.ingestion.team_matcher import TeamMatcher
 
 __all__ = [
@@ -75,6 +97,7 @@ __all__ = [
     "NotFoundError",
     "RateLimitedError",
     "RawCache",
+    "SeasonHarvest",
     "SeasonInfo",
     "SofaScoreEndpoints",
     "SofaScoreProvider",
@@ -87,6 +110,7 @@ __all__ = [
     "run_concurrently",
     "save_fixtures",
     "save_processed",
+    "season_label_from_year",
     "site_origin",
 ]
 
@@ -187,6 +211,7 @@ class HttpConfig:
     max_concurrency: int = 4
     min_delay_seconds: float = 0.4
     cache_ttl_hours: float = 6.0
+    history_cache_ttl_hours: float = 8760.0
 
     def __post_init__(self) -> None:
         if self.timeout_seconds <= 0:
@@ -201,11 +226,23 @@ class HttpConfig:
             raise ValueError("min_delay_seconds must be >= 0")
         if self.cache_ttl_hours < 0:
             raise ValueError("cache_ttl_hours must be >= 0")
+        if self.history_cache_ttl_hours < 0:
+            raise ValueError("history_cache_ttl_hours must be >= 0")
 
     @property
     def cache_ttl(self) -> timedelta:
-        """Cache time-to-live as a :class:`timedelta`."""
+        """Time-to-live of volatile payloads (current season) as a :class:`timedelta`."""
         return timedelta(hours=float(self.cache_ttl_hours))
+
+    @property
+    def history_cache_ttl(self) -> timedelta:
+        """Time-to-live of stable payloads (completed seasons) as a :class:`timedelta`.
+
+        Rounds, events and statistics of a season that has ended never change, so
+        they are kept far longer (365 days by default) than the current season's
+        payloads: repeated multi-season runs re-download the current season only.
+        """
+        return timedelta(hours=float(self.history_cache_ttl_hours))
 
 
 @dataclass(frozen=True)
@@ -373,6 +410,7 @@ def load_endpoints(path: Path = CONFIG_DIR / "endpoints.toml") -> EndpointsConfi
         max_concurrency=int(http_raw.get("max_concurrency", defaults.max_concurrency)),
         min_delay_seconds=float(http_raw.get("min_delay_seconds", defaults.min_delay_seconds)),
         cache_ttl_hours=float(http_raw.get("cache_ttl_hours", defaults.cache_ttl_hours)),
+        history_cache_ttl_hours=float(http_raw.get("history_cache_ttl_hours", defaults.history_cache_ttl_hours)),
     )
     log.debug("endpoints loaded", extra={"path": str(path)})
     return EndpointsConfig(sofascore=sofascore, fotmob=fotmob, http=http)
@@ -388,11 +426,21 @@ class RawCache:
     Writes are atomic (temp file + :func:`os.replace`). ``ttl=None`` never
     expires; ``ttl=timedelta(0)`` expires immediately (cache effectively
     write-only, useful for debugging).
+
+    Two time-to-lives apply: ``ttl`` to *volatile* payloads (the default, e.g.
+    the running season, whose results and statistics still change) and
+    ``stable_ttl`` to payloads the caller declares *stable* with
+    ``get(..., stable=True)`` (e.g. a completed season, whose rounds, events and
+    statistics are immutable). Both use the same ``None`` / ``timedelta(0)``
+    semantics; ``stable_ttl`` defaults to never expiring. The file format is the
+    same for both kinds, so a payload fetched as volatile is served to a stable
+    read and vice versa; only the expiry rule differs.
     """
 
-    def __init__(self, directory: Path, ttl: timedelta | None = None) -> None:
+    def __init__(self, directory: Path, ttl: timedelta | None = None, *, stable_ttl: timedelta | None = None) -> None:
         self.directory = Path(directory)
         self.ttl = ttl
+        self.stable_ttl = stable_ttl
         self.hits = 0
         self.misses = 0
         self.directory.mkdir(parents=True, exist_ok=True)
@@ -421,16 +469,25 @@ class RawCache:
         return self.directory / f"{self.key_for(url, params)}.json"
 
     # ------------------------------------------------------------- access
-    def _is_expired(self, fetched_at: str) -> bool:
-        if self.ttl is None:
+    def ttl_for(self, *, stable: bool = False) -> timedelta | None:
+        """Time-to-live that applies to a read: ``stable_ttl`` for stable payloads, else ``ttl``."""
+        return self.stable_ttl if stable else self.ttl
+
+    def _is_expired(self, fetched_at: str, *, stable: bool = False) -> bool:
+        ttl = self.ttl_for(stable=stable)
+        if ttl is None:
             return False
         stamp = datetime.fromisoformat(str(fetched_at))
         if stamp.tzinfo is None:
             stamp = stamp.replace(tzinfo=timezone.utc)
-        return datetime.now(timezone.utc) >= stamp + self.ttl
+        return datetime.now(timezone.utc) >= stamp + ttl
 
-    def get(self, url: str, params: Mapping[str, Any] | None = None) -> Any | None:
-        """Cached payload or ``None`` on miss, expiry or unreadable file."""
+    def get(self, url: str, params: Mapping[str, Any] | None = None, *, stable: bool = False) -> Any | None:
+        """Cached payload or ``None`` on miss, expiry or unreadable file.
+
+        ``stable`` says the payload cannot change upstream any more (a completed
+        season): the entry then expires after ``stable_ttl`` instead of ``ttl``.
+        """
         path = self.path_for(url, params)
         if not path.exists():
             self.misses += 1
@@ -439,13 +496,13 @@ class RawCache:
             record = json.loads(path.read_text(encoding="utf-8"))
             if not isinstance(record, dict) or "payload" not in record:
                 raise ValueError("cache record without payload")
-            expired = self._is_expired(record.get("fetched_at", ""))
+            expired = self._is_expired(record.get("fetched_at", ""), stable=stable)
         except (OSError, ValueError, TypeError) as exc:
             log.warning("corrupt cache file treated as miss", extra={"path": str(path), "error": str(exc)})
             self.misses += 1
             return None
         if expired:
-            log.debug("cache entry expired", extra={"path": str(path), "url": url})
+            log.debug("cache entry expired", extra={"path": str(path), "url": url, "stable": stable})
             self.misses += 1
             return None
         self.hits += 1
@@ -688,10 +745,14 @@ class AsyncHarvesterClient:
             self._last_started = now
 
     # ----------------------------------------------------------------- core
-    async def get_json(self, path: str, params: Mapping[str, Any] | None = None, *, use_cache: bool = True) -> Any:
+    async def get_json(
+        self, path: str, params: Mapping[str, Any] | None = None, *, use_cache: bool = True, stable: bool = False
+    ) -> Any:
         """GET ``path`` and return the decoded JSON body.
 
-        Cache hits return immediately. Retryable failures (HTTP 429, 5xx,
+        Cache hits return immediately; ``stable`` marks a payload that cannot
+        change upstream any more (a completed season), so the cache applies its
+        long ``stable_ttl`` to it (see :class:`RawCache`). Retryable failures (HTTP 429, 5xx,
         transport errors, timeouts) are retried up to ``http.max_retries``
         times; other 4xx raise at once (:class:`NotFoundError` for 404), as do
         undecodable bodies and other non-transient ``httpx`` errors. Every
@@ -701,13 +762,13 @@ class AsyncHarvesterClient:
         url = self.build_url(path)
         if use_cache and self.cache is not None:
             try:
-                cached = self.cache.get(url, params)
+                cached = self.cache.get(url, params, stable=stable)
             except OSError as exc:  # unreadable cache directory: fetch instead
                 cached = None
                 log.warning("cache read failed, fetching", extra={"url": url, "error": str(exc)})
             if cached is not None:
                 self.stats.cache_hits += 1
-                log.debug("cache hit", extra={"url": url})
+                log.debug("cache hit", extra={"url": url, "stable": stable})
                 return cached
         client = self._ensure_client()
         async with self._semaphore:
@@ -881,13 +942,99 @@ def _utc_date_from_iso(value: Any) -> date | None:
     return when.astimezone(timezone.utc).date()
 
 
-def _canonical_team(matcher: TeamMatcher, raw_name: str, girone: Girone, source: str) -> str:
-    """Canonical name via ``matcher``; the raw spelling (with a warning) when unmapped."""
+# =============================================================================
+# Season helpers (pure)
+# =============================================================================
+_SEASON_YEAR_RE = re.compile(r"^\s*(\d{2}|\d{4})\s*[/_\-]\s*(\d{2}|\d{4})\s*$")
+
+
+def season_label_from_year(year: str | None) -> str | None:
+    """Normalise a season spelling to the public label ``'2026/27'``.
+
+    Accepts SofaScore's ``year`` field (``'26/27'``), registry stems
+    (``'2026_27'``), ``'2026-27'`` and ``'2026/2027'``. Returns ``None`` when the
+    text is not a season or its second year does not follow the first, so callers
+    can fall back to :func:`src.common.schemas.season_of` on match dates.
+    """
+    if year is None:
+        return None
+    found = _SEASON_YEAR_RE.match(str(year))
+    if found is None:
+        return None
+    first, second = found.group(1), found.group(2)
+    start = int(first) if len(first) == 4 else (1900 if int(first) >= 70 else 2000) + int(first)
+    end = int(second) if len(second) == 4 else (start // 100) * 100 + int(second)
+    if len(second) == 2 and end < start:  # '1999/00'
+        end += 100
+    if end != start + 1:
+        return None
+    return f"{start}/{end % 100:02d}"
+
+
+def _season_start_year(label: str) -> int | None:
+    normalised = season_label_from_year(label)
+    return int(normalised[:4]) if normalised else None
+
+
+def _sort_season_labels(labels: Iterable[str]) -> list[str]:
+    """Distinct labels, newest first; labels that are not seasons go last, in first-seen order."""
+    distinct = list(dict.fromkeys(str(label) for label in labels if label))
+    seasons = [label for label in distinct if _season_start_year(label) is not None]
+    others = [label for label in distinct if _season_start_year(label) is None]
+    seasons.sort(key=lambda label: -(_season_start_year(label) or 0))
+    return [*seasons, *others]
+
+
+def _season_counts(records: Iterable[MatchRecord]) -> Counter[str]:
+    """Matches per season label (:func:`season_of` of the match date)."""
+    return Counter(season_of(record.date) for record in records)
+
+
+def _events_season_label(batches: Iterable[Iterable[dict]]) -> str | None:
+    """Season label most of the raw events belong to (by ``startTimestamp``), ``None`` without dates."""
+    counts: Counter[str] = Counter()
+    for events in batches:
+        for event in events:
+            when = _utc_date_from_epoch(event.get("startTimestamp")) if isinstance(event, dict) else None
+            if when is not None:
+                counts[season_of(when)] += 1
+    return counts.most_common(1)[0][0] if counts else None
+
+
+def _season_is_completed(label: str | None, *, current: bool, today: date | None = None) -> bool:
+    """Whether a listed season has ended, so its payloads are immutable (cached as *stable*).
+
+    The SofaScore listing is newest first: a season that is not the first entry
+    (``current=False``) is older than the newest one. It counts as completed when
+    its ``label`` precedes the running season (:func:`season_of` of ``today``,
+    July-June), or when no label is known at all. The first listed season, and a
+    season pinned by id (always ``current``), are never completed: they may still
+    be in progress, so their rounds, events and statistics keep the short TTL.
+    """
+    if current:
+        return False
+    start = _season_start_year(label) if label else None
+    if start is None:
+        return True
+    running = _season_start_year(season_of(today if today is not None else date.today()))
+    return running is not None and start < running
+
+
+def _canonical_team(matcher: TeamMatcher, raw_name: str, girone: Girone | None, source: str) -> str:
+    """Canonical name via ``matcher``; the raw spelling (with a warning) when unmapped.
+
+    ``girone=None`` performs an unrestricted lookup (historical seasons).
+    """
     result = matcher.match(raw_name, girone)
     if result.canonical is None:
         log.warning(
             "unmapped team name kept raw",
-            extra={"source": source, "team": raw_name, "girone": girone.value, "candidates": list(result.candidates[:3])},
+            extra={
+                "source": source,
+                "team": raw_name,
+                "girone": girone.value if girone is not None else None,
+                "candidates": list(result.candidates[:3]),
+            },
         )
         return raw_name.strip()
     return result.canonical
@@ -945,6 +1092,31 @@ class SeasonInfo:
     name: str
 
 
+@dataclass(frozen=True)
+class SeasonHarvest:
+    """Outcome of :meth:`SofaScoreProvider.harvest_seasons` for one season of one girone.
+
+    ``label`` is the public season label (``'2026/27'``); ``historical`` says the
+    season lies outside the perimeter of the team dictionary (its names were
+    resolved without girone restriction); ``current`` marks the newest season of
+    the listing, the only one whose not-started events are kept as ``fixtures``.
+    ``completed`` says the season has ended (see :func:`_season_is_completed`):
+    its payloads were read and written through the cache as *stable*, with the
+    long ``history_cache_ttl`` instead of the short ``cache_ttl``.
+    A past season that could not be harvested has ``error`` set and no matches.
+    """
+
+    season: SeasonInfo
+    label: str
+    matches: tuple[MatchRecord, ...]
+    fixtures: tuple[Fixture, ...]
+    rounds: int
+    current: bool
+    historical: bool
+    error: str | None = None
+    completed: bool = False
+
+
 class SofaScoreProvider:
     """Navigate the SofaScore unique-tournament API for one girone."""
 
@@ -973,14 +1145,17 @@ class SofaScoreProvider:
             raise HarvestError("no seasons returned", url=self.endpoints.url_seasons(girone))
         return seasons[0].id
 
-    async def rounds(self, girone: Girone | str, season_id: int, *, regular_only: bool = True) -> list[int]:
+    async def rounds(
+        self, girone: Girone | str, season_id: int, *, regular_only: bool = True, stable: bool = False
+    ) -> list[int]:
         """Sorted distinct round numbers of the season.
 
         With ``regular_only`` entries carrying a ``name``/``prefix`` (play-off
         and play-out rounds) are skipped. When the API lists no rounds but a
-        ``currentRound`` exists, rounds ``1..current`` are assumed.
+        ``currentRound`` exists, rounds ``1..current`` are assumed. ``stable``
+        says the season has ended: the payload is cached with the long TTL.
         """
-        payload = await self.client.get_json(self.endpoints.url_rounds(girone, season_id)) or {}
+        payload = await self.client.get_json(self.endpoints.url_rounds(girone, season_id), stable=stable) or {}
         numbers: set[int] = set()
         for item in payload.get("rounds", []) or []:
             if not isinstance(item, dict) or item.get("round") is None:
@@ -994,8 +1169,9 @@ class SofaScoreProvider:
                 numbers = set(range(1, int(current) + 1))
         return sorted(numbers)
 
-    async def events_for_round(self, girone: Girone | str, season_id: int, round: int) -> list[dict]:
-        payload = await self.client.get_json(self.endpoints.url_events_by_round(girone, season_id, round)) or {}
+    async def events_for_round(self, girone: Girone | str, season_id: int, round: int, *, stable: bool = False) -> list[dict]:
+        """Raw events of one round; ``stable`` (completed season) selects the long cache TTL."""
+        payload = await self.client.get_json(self.endpoints.url_events_by_round(girone, season_id, round), stable=stable) or {}
         return [e for e in payload.get("events", []) or [] if isinstance(e, dict)]
 
     async def next_events(self, girone: Girone | str, season_id: int, page: int = 0) -> list[dict]:
@@ -1006,16 +1182,27 @@ class SofaScoreProvider:
         payload = await self.client.get_json(self.endpoints.url_events_last(girone, season_id, page)) or {}
         return [e for e in payload.get("events", []) or [] if isinstance(e, dict)]
 
-    async def statistics(self, event_id: int | str) -> dict:
-        payload = await self.client.get_json(self.endpoints.url_event_statistics(event_id))
+    async def statistics(self, event_id: int | str, *, stable: bool = False) -> dict:
+        """Raw statistics payload of one event; ``stable`` (completed season) selects the long cache TTL."""
+        payload = await self.client.get_json(self.endpoints.url_event_statistics(event_id), stable=stable)
         return payload if isinstance(payload, dict) else {}
 
     # -------------------------------------------------------------- parsers
     @staticmethod
-    def parse_event(event: dict, girone: Girone, matcher: TeamMatcher) -> MatchRecord | Fixture | None:
+    def parse_event(
+        event: dict, girone: Girone, matcher: TeamMatcher, *, historical: bool = False
+    ) -> MatchRecord | Fixture | None:
         """Convert one SofaScore event to a :class:`MatchRecord` (finished),
-        a :class:`Fixture` (not started) or ``None`` (anything else)."""
+        a :class:`Fixture` (not started) or ``None`` (anything else).
+
+        ``girone`` is the tournament the event was listed under and is stored on
+        the record. Team names are resolved within that girone's *current*
+        composition, unless ``historical`` is set (events of a past season): a
+        club may since have moved girone or left Serie C, so the lookup is then
+        unrestricted and may yield a historical canonical name.
+        """
         girone = Girone.parse(girone)
+        lookup: Girone | None = None if historical else girone
         event_id = event.get("id")
         if event_id is None:
             return None
@@ -1031,8 +1218,8 @@ class SofaScoreProvider:
         if not home_raw or not away_raw:
             log.warning("event without team names skipped", extra={"match_id": match_id})
             return None
-        home = _canonical_team(matcher, home_raw, girone, "sofascore")
-        away = _canonical_team(matcher, away_raw, girone, "sofascore")
+        home = _canonical_team(matcher, home_raw, lookup, "sofascore")
+        away = _canonical_team(matcher, away_raw, lookup, "sofascore")
         if home == away:
             log.warning("event with identical teams skipped", extra={"match_id": match_id, "team": home})
             return None
@@ -1106,10 +1293,10 @@ class SofaScoreProvider:
         return out
 
     # -------------------------------------------------------------- harvest
-    async def _safe_statistics(self, match: MatchRecord) -> dict[str, float | None] | None:
+    async def _safe_statistics(self, match: MatchRecord, *, stable: bool = False) -> dict[str, float | None] | None:
         event_id = match.match_id.removeprefix("SS-")
         try:
-            payload = await self.statistics(event_id)
+            payload = await self.statistics(event_id, stable=stable)
         except HarvestError as exc:
             log.warning(
                 "statistics unavailable, keeping match without stats",
@@ -1118,59 +1305,227 @@ class SofaScoreProvider:
             return None
         return self.parse_statistics(payload, self.endpoints.stat_keys)
 
-    async def _events_or_empty(self, girone: Girone, season_id: int, round_no: int) -> list[dict]:
+    async def _events_or_empty(self, girone: Girone, season_id: int, round_no: int, *, stable: bool = False) -> list[dict]:
         try:
-            return await self.events_for_round(girone, season_id, round_no)
+            return await self.events_for_round(girone, season_id, round_no, stable=stable)
         except NotFoundError as exc:
             log.warning("round not found, skipped", extra={"girone": girone.value, "round": round_no, "url": exc.url})
             return []
 
-    async def harvest(
-        self,
-        girone: Girone | str,
-        *,
-        season_id: int | None = None,
-        rounds: Iterable[int] | None = None,
-        with_stats: bool = True,
-    ) -> tuple[list[MatchRecord], list[Fixture]]:
-        """Played matches and upcoming fixtures of ``girone``.
+    def _perimeter_label(self) -> str | None:
+        """Season label of the matcher's dictionary (``None`` for synthetic registries)."""
+        return season_label_from_year(str(getattr(self.matcher.registry, "season", "") or ""))
 
-        Statistics are fetched concurrently for finished matches; a failing
-        statistics call keeps the match with ``None`` stats.
+    async def _fetch_season_events(
+        self, g: Girone, season_id: int, rounds: Iterable[int] | None, *, stable: bool = False
+    ) -> tuple[list[list[dict]], int]:
+        """Raw events of every (regular) round of ``season_id``; returns the batches and the round count.
+
+        ``stable`` (completed season) is forwarded to every request so the cache
+        keeps the payloads with the long TTL.
         """
-        g = Girone.parse(girone)
-        if season_id is None:
-            season_id = await self.current_season_id(g)
         if rounds is not None:
             round_list = sorted({int(r) for r in rounds})
         else:
-            round_list = await self.rounds(g, season_id)
+            round_list = await self.rounds(g, season_id, stable=stable)
             if not round_list:
                 # A payload drift (``{"rounds": []}`` without ``currentRound``) must
                 # surface as a failure, not as a silently empty season.
                 raise HarvestError("rounds payload lists no rounds", url=self.endpoints.url_rounds(g, season_id))
-        batches = await run_concurrently(self._events_or_empty(g, season_id, r) for r in round_list)
+        batches = await run_concurrently(self._events_or_empty(g, season_id, r, stable=stable) for r in round_list)
+        return batches, len(round_list)
 
+    async def _parse_season(
+        self, g: Girone, batches: Iterable[Iterable[dict]], *, historical: bool, with_stats: bool, stable: bool = False
+    ) -> tuple[list[MatchRecord], list[Fixture]]:
+        """Parse raw event batches (deduplicated by id) and attach statistics on request.
+
+        ``stable`` (completed season) makes the statistics requests use the long cache TTL.
+        """
         matches: dict[str, MatchRecord] = {}
         fixtures: dict[str, Fixture] = {}
         for events in batches:
             for event in events:
-                parsed = self.parse_event(event, g, self.matcher)
+                parsed = self.parse_event(event, g, self.matcher, historical=historical)
                 if isinstance(parsed, MatchRecord):
                     matches[parsed.match_id] = parsed
                 elif isinstance(parsed, Fixture):
                     fixtures[parsed.match_id] = parsed
         ordered = list(matches.values())
         if with_stats and ordered:
-            stats = await run_concurrently(self._safe_statistics(m) for m in ordered)
+            stats = await run_concurrently(self._safe_statistics(m, stable=stable) for m in ordered)
             ordered = [replace(m, **s) if s is not None else m for m, s in zip(ordered, stats, strict=True)]
             fetched = [m for m, s in zip(ordered, stats, strict=True) if s is not None]
             _warn_missing_metrics(fetched, self.endpoints.stat_keys, self.name)
+        return ordered, list(fixtures.values())
+
+    async def _harvest_season(
+        self,
+        g: Girone,
+        info: SeasonInfo,
+        *,
+        current: bool,
+        perimeter: str | None,
+        rounds: Iterable[int] | None,
+        with_stats: bool,
+    ) -> SeasonHarvest:
+        # A season that has ended cannot change upstream: its rounds, events and
+        # statistics are read and written through the cache as *stable* (long TTL),
+        # so repeated multi-season runs re-download the current season only.
+        completed = _season_is_completed(season_label_from_year(info.year), current=current)
+        batches, n_rounds = await self._fetch_season_events(g, info.id, rounds, stable=completed)
+        label = season_label_from_year(info.year) or _events_season_label(batches)
+        historical = (label != perimeter) if (label is not None and perimeter is not None) else not current
+        matches, fixtures = await self._parse_season(
+            g, batches, historical=historical, with_stats=with_stats, stable=completed
+        )
+        if not current and fixtures:
+            log.info(
+                "not-started events of a past season dropped",
+                extra={"girone": g.value, "season_id": info.id, "dropped": len(fixtures)},
+            )
+            fixtures = []
+        if label is None:
+            label = info.name or f"season {info.id}"
+        log.info(
+            "sofascore season harvest complete",
+            extra={
+                "girone": g.value,
+                "season_id": info.id,
+                "season": label,
+                "historical": historical,
+                "completed": completed,
+                "rounds": n_rounds,
+                "matches": len(matches),
+                "fixtures": len(fixtures),
+            },
+        )
+        return SeasonHarvest(
+            season=info,
+            label=label,
+            matches=tuple(matches),
+            fixtures=tuple(fixtures),
+            rounds=n_rounds,
+            current=current,
+            historical=historical,
+            completed=completed,
+        )
+
+    async def harvest_seasons(
+        self,
+        girone: Girone | str,
+        *,
+        season_id: int | None = None,
+        seasons: int = 1,
+        rounds: Iterable[int] | None = None,
+        with_stats: bool = True,
+        strict: bool = False,
+    ) -> list[SeasonHarvest]:
+        """Harvest the newest ``seasons`` seasons of ``girone``, one :class:`SeasonHarvest` each, newest first.
+
+        The first entry is the *current* season of the listing: it is the only one
+        whose not-started events are kept as fixtures, and a failure there always
+        propagates as :class:`HarvestError`. A season whose label differs from the
+        matcher's dictionary season is *historical*: its team names are resolved
+        without girone restriction (clubs may have moved girone or left Serie C)
+        and, unless ``strict`` is set, a past season that fails is returned with
+        ``error`` set instead of aborting the whole girone.
+
+        ``season_id`` pins one season (``seasons`` is then ignored); ``rounds`` is
+        an explicit round list applied to every harvested season (default: all
+        regular rounds of each season). Statistics are fetched concurrently for
+        finished matches; a failing statistics call keeps the match with ``None``
+        stats. The payloads of a *completed* season (every listed season after the
+        first whose label precedes the running one) go through the cache as
+        stable, with the long ``history_cache_ttl``; a pinned ``season_id`` is
+        always treated as current (short TTL).
+        """
+        g = Girone.parse(girone)
+        if int(seasons) < 1:
+            raise ValueError("seasons must be >= 1")
+        if season_id is not None:
+            infos = [SeasonInfo(id=int(season_id), year="", name="")]
+        else:
+            listed = await self.seasons(g)
+            if not listed:
+                raise HarvestError("no seasons returned", url=self.endpoints.url_seasons(g))
+            infos = listed[: int(seasons)]
+            if len(infos) < int(seasons):
+                log.warning(
+                    "fewer seasons available than requested",
+                    extra={"girone": g.value, "requested": int(seasons), "available": len(listed)},
+                )
+        perimeter = self._perimeter_label()
+        newest = season_label_from_year(infos[0].year)
+        if perimeter is not None and newest is not None and newest != perimeter:
+            log.warning(
+                "newest listed season differs from the team dictionary season",
+                extra={"girone": g.value, "newest_season": newest, "dictionary_season": perimeter},
+            )
+        out: list[SeasonHarvest] = []
+        for index, info in enumerate(infos):
+            current = index == 0
+            try:
+                out.append(
+                    await self._harvest_season(
+                        g, info, current=current, perimeter=perimeter, rounds=rounds, with_stats=with_stats
+                    )
+                )
+            except HarvestError as exc:
+                if current or strict:
+                    raise
+                label = season_label_from_year(info.year) or info.name or f"season {info.id}"
+                log.error(
+                    "historical season failed, skipped",
+                    extra={"girone": g.value, "season_id": info.id, "season": label, "status": exc.status, "url": exc.url},
+                )
+                out.append(
+                    SeasonHarvest(
+                        season=info,
+                        label=label,
+                        matches=(),
+                        fixtures=(),
+                        rounds=0,
+                        current=False,
+                        historical=True,
+                        error=str(exc),
+                        completed=_season_is_completed(label, current=False),
+                    )
+                )
         log.info(
             "sofascore harvest complete",
-            extra={"girone": g.value, "season_id": season_id, "rounds": len(round_list), "matches": len(ordered), "fixtures": len(fixtures)},
+            extra={
+                "girone": g.value,
+                "seasons": [item.label for item in out],
+                "matches": sum(len(item.matches) for item in out),
+                "fixtures": sum(len(item.fixtures) for item in out),
+                "failed": [item.label for item in out if item.error],
+            },
         )
-        return ordered, list(fixtures.values())
+        return out
+
+    async def harvest(
+        self,
+        girone: Girone | str,
+        *,
+        season_id: int | None = None,
+        seasons: int = 1,
+        rounds: Iterable[int] | None = None,
+        with_stats: bool = True,
+    ) -> tuple[list[MatchRecord], list[Fixture]]:
+        """Played matches and upcoming fixtures of ``girone``.
+
+        With ``seasons > 1`` (and no ``season_id``) the newest ``seasons`` seasons
+        are harvested and concatenated, newest first; fixtures come from the
+        current season only. Any failing season raises (see
+        :meth:`harvest_seasons` for the lenient, per-season view).
+        """
+        harvested = await self.harvest_seasons(
+            girone, season_id=season_id, seasons=seasons, rounds=rounds, with_stats=with_stats, strict=True
+        )
+        matches = [m for item in harvested for m in item.matches]
+        fixtures = [f for item in harvested for f in item.fixtures]
+        return matches, fixtures
 
 
 # =============================================================================
@@ -1364,7 +1719,19 @@ class FotMobProvider:
 # =============================================================================
 @dataclass
 class HarvestResult:
-    """Outcome of :meth:`Harvester.harvest_all`."""
+    """Outcome of :meth:`Harvester.harvest_all`.
+
+    ``matches`` holds every season harvested in the fixed 16-column schema (no
+    season column: the season of a row is :func:`season_of` of its date).
+    ``seasons`` lists the season labels present, newest first, and
+    ``n_matches_by_season`` the matches of each (the counts sum to
+    ``len(matches)``). ``registry_season`` is the perimeter: the season of the
+    team dictionary whose teams are the current ones. ``historical_teams`` are
+    canonical names resolved through the aliases of older dictionaries that are
+    not part of the perimeter (relegated / promoted / excluded clubs);
+    ``unmapped_teams`` are raw spellings no dictionary knows, with their counts
+    (the two sets are disjoint).
+    """
 
     matches: pd.DataFrame
     fixtures: list[Fixture]
@@ -1372,12 +1739,38 @@ class HarvestResult:
     stats: dict[str, int]
     provider: str
     failures: dict[str, str] = field(default_factory=dict)
+    seasons: tuple[str, ...] = ()
+    n_matches_by_season: dict[str, int] = field(default_factory=dict)
+    historical_teams: tuple[str, ...] = ()
+    registry_season: str = ""
+
+    @property
+    def perimeter_season(self) -> str | None:
+        """Season whose teams are the perimeter: the dictionary season, else the newest harvested."""
+        return self.registry_season or (self.seasons[0] if self.seasons else None)
+
+    @property
+    def n_historical_matches(self) -> int:
+        """Matches that belong to a season other than :attr:`perimeter_season`."""
+        perimeter = self.perimeter_season
+        return int(sum(n for label, n in self.n_matches_by_season.items() if label != perimeter))
+
+    def season_lines(self) -> list[str]:
+        """One human line per harvested season (used by the CLI)."""
+        perimeter = self.perimeter_season
+        lines: list[str] = []
+        for label in self.seasons:
+            kind = "perimeter" if label == perimeter else "history"
+            lines.append(f"  {label}: {self.n_matches_by_season.get(label, 0)} matches ({kind})")
+        return lines
 
     def summary(self) -> str:
         """One-line human summary (used by the CLI)."""
         gironi = ",".join(sorted(self.matches["girone"].dropna().unique().tolist())) if len(self.matches) else "-"
         return (
             f"provider={self.provider} gironi={gironi} matches={len(self.matches)} fixtures={len(self.fixtures)} "
+            f"season={self.registry_season or '-'} seasons={','.join(self.seasons) or '-'} "
+            f"historical_matches={self.n_historical_matches} historical_teams={len(self.historical_teams)} "
             f"unmapped_teams={len(self.unmapped_teams)} requests={self.stats.get('requests', 0)} "
             f"retries={self.stats.get('retries', 0)} cache_hits={self.stats.get('cache_hits', 0)} "
             f"errors={self.stats.get('errors', 0)} failures={len(self.failures)}"
@@ -1392,9 +1785,27 @@ class Harvester:
 
     ``providers`` is tried in order for each girone; the first provider that
     succeeds wins, failures are logged and recorded in
-    :attr:`HarvestResult.failures`. ``season_id`` applies to SofaScore only
-    (FotMob exposes the current season). ``extra_headers`` reach every
-    provider client (FotMob's ``x-mas`` signature header belongs there).
+    :attr:`HarvestResult.failures`. ``season_id`` and multi-season harvesting
+    apply to SofaScore only (FotMob exposes the current season).
+    ``extra_headers`` reach every provider client (FotMob's ``x-mas`` signature
+    header belongs there).
+
+    ``registry`` (or ``season``, the stem of ``config/teams_<season>.json``,
+    :data:`DEFAULT_SEASON` by default) defines the perimeter of current teams.
+    Unless a ``matcher`` is injected, the matcher is built on that registry
+    extended with the aliases of every *older* dictionary found in
+    ``config_dir`` (``historical_aliases``), so the names of past seasons are
+    canonicalised consistently: clubs that still play keep their current name,
+    clubs that left keep their old canonical spelling and are reported as
+    :attr:`HarvestResult.historical_teams`.
+
+    Raw payloads are cached in ``cache_dir``: ``cache_ttl`` (``[http]
+    cache_ttl_hours``, 6 h) applies to the current season, whose results and
+    statistics still change; ``history_cache_ttl`` (``[http]
+    history_cache_ttl_hours``, 365 days) applies to completed seasons, whose
+    payloads are immutable, so a multi-season run repeated later re-downloads
+    the current season only. ``None`` for either means "take the endpoints
+    configuration".
     """
 
     def __init__(
@@ -1410,16 +1821,29 @@ class Harvester:
         matcher: TeamMatcher | None = None,
         sleeper: Sleeper = asyncio.sleep,
         rng: random.Random | None = None,
+        season: str | None = None,
+        historical_aliases: bool = True,
+        config_dir: Path = CONFIG_DIR,
+        history_cache_ttl: timedelta | None = None,
     ) -> None:
         names = tuple(str(p).lower() for p in providers)
         unknown = [p for p in names if p not in PROVIDER_NAMES]
         if unknown or not names:
             raise ValueError(f"providers must be a non-empty subset of {PROVIDER_NAMES}, got {providers!r}")
         self.endpoints = endpoints if endpoints is not None else load_endpoints()
-        self.registry = registry if registry is not None else load_registry()
-        self.matcher = matcher if matcher is not None else TeamMatcher(self.registry)
+        self.config_dir = Path(config_dir)
+        if registry is not None:
+            self.registry = registry
+        else:
+            self.registry = load_registry(season or DEFAULT_SEASON, self.config_dir)
+        if matcher is not None:
+            self.matcher = matcher
+        else:
+            match_registry = self.registry_with_history(self.registry, self.config_dir) if historical_aliases else self.registry
+            self.matcher = TeamMatcher(match_registry)
         ttl = cache_ttl if cache_ttl is not None else self.endpoints.http.cache_ttl
-        self.cache = RawCache(Path(cache_dir), ttl=ttl)
+        stable_ttl = history_cache_ttl if history_cache_ttl is not None else self.endpoints.http.history_cache_ttl
+        self.cache = RawCache(Path(cache_dir), ttl=ttl, stable_ttl=stable_ttl)
         self.providers = names
         self._transport = transport
         self._extra_headers = dict(extra_headers or {})
@@ -1446,14 +1870,43 @@ class Harvester:
     def _base_url(self, name: str) -> str:
         return self.endpoints.sofascore.base_url if name == SofaScoreProvider.name else self.endpoints.fotmob.base_url
 
-    def _count_unmapped(self, matches: Iterable[MatchRecord], fixtures: Iterable[Fixture]) -> dict[str, int]:
-        canonical = {g: set(teams) for g, teams in self.registry.teams_by_girone.items()}
-        counts: dict[str, int] = {}
+    @staticmethod
+    def registry_with_history(registry: TeamRegistry, config_dir: Path = CONFIG_DIR) -> TeamRegistry:
+        """``registry`` extended with the aliases of every older ``teams_<season>.json`` in ``config_dir``.
+
+        Older dictionaries are merged most recent first through
+        :meth:`TeamRegistry.with_historical_aliases`; the current composition is
+        unchanged. A registry whose ``season`` is not a season label (synthetic
+        leagues) is returned as is.
+        """
+        stem = season_file_stem(str(registry.season))
+        if season_label_from_year(stem) is None:
+            return registry
+        older = sorted((s for s in list_seasons(Path(config_dir)) if s < stem), reverse=True)
+        if not older:
+            return registry
+        merged = registry.with_historical_aliases(*(load_registry(s, Path(config_dir)) for s in older))
+        log.info(
+            "historical aliases merged",
+            extra={"season": stem, "older_seasons": older, "historical_teams": len(merged.historical_names)},
+        )
+        return merged
+
+    def _classify_teams(
+        self, matches: Iterable[MatchRecord], fixtures: Iterable[Fixture]
+    ) -> tuple[dict[str, int], tuple[str, ...]]:
+        """Raw spellings no dictionary knows (with counts) and the historical canonical names seen."""
+        unmapped: dict[str, int] = {}
+        historical: set[str] = set()
         for record in (*matches, *fixtures):
             for name in (record.home_team, record.away_team):
-                if name not in canonical.get(record.girone, set()):
-                    counts[name] = counts.get(name, 0) + 1
-        return dict(sorted(counts.items()))
+                if self.matcher.is_current(name):
+                    continue
+                if self.matcher.is_historical(name):
+                    historical.add(name)
+                else:
+                    unmapped[name] = unmapped.get(name, 0) + 1
+        return dict(sorted(unmapped.items())), tuple(sorted(historical))
 
     # ---------------------------------------------------------------- public
     async def harvest_all(
@@ -1461,18 +1914,27 @@ class Harvester:
         gironi: Iterable[Girone] = tuple(Girone),
         *,
         season_id: int | None = None,
+        seasons: int = 3,
         with_stats: bool = True,
     ) -> HarvestResult:
         """Harvest ``gironi`` and return a validated canonical frame plus fixtures.
 
-        Raises :class:`HarvestError` only when every girone failed on every
-        provider; partial failures are reported in ``HarvestResult.failures``.
+        On SofaScore the newest ``seasons`` seasons of every girone are harvested
+        (current season plus history; ``season_id`` pins a single season instead);
+        fixtures come from the current season only. A past season that fails is
+        recorded in ``HarvestResult.failures`` under ``"<girone>:<provider>:<season>"``
+        and the rest is kept. Raises :class:`HarvestError` only when every girone
+        failed on every provider; partial failures are reported in
+        ``HarvestResult.failures``.
         """
+        if int(seasons) < 1:
+            raise ValueError("seasons must be >= 1")
         targets = [Girone.parse(g) for g in gironi]
         clients: dict[str, AsyncHarvesterClient] = {}
         providers: dict[str, SofaScoreProvider | FotMobProvider] = {}
         all_matches: list[MatchRecord] = []
         all_fixtures: list[Fixture] = []
+        season_labels: list[str] = []
         used: list[str] = []
         failures: dict[str, str] = {}
         last_error: HarvestError | None = None
@@ -1486,7 +1948,16 @@ class Harvester:
                     provider = providers[name]
                     try:
                         if isinstance(provider, SofaScoreProvider):
-                            matches, fixtures = await provider.harvest(girone, season_id=season_id, with_stats=with_stats)
+                            harvested = await provider.harvest_seasons(
+                                girone, season_id=season_id, seasons=seasons, with_stats=with_stats
+                            )
+                            matches = [m for item in harvested for m in item.matches]
+                            fixtures = [f for item in harvested for f in item.fixtures]
+                            for item in harvested:
+                                if item.label not in season_labels:
+                                    season_labels.append(item.label)
+                                if item.error:
+                                    failures[f"{girone.value}:{name}:{item.label}"] = item.error
                         else:
                             matches, fixtures = await provider.harvest(girone, with_stats=with_stats)
                     except HarvestError as exc:
@@ -1518,13 +1989,20 @@ class Harvester:
         seen: set[str] = set()
         fixtures_unique = [f for f in all_fixtures if not (f.match_id in seen or seen.add(f.match_id))]
         frame = matches_to_frame(all_matches) if all_matches else empty_matches_frame()
+        counts = _season_counts(all_matches)
+        labels = _sort_season_labels([*season_labels, *counts])
+        unmapped, historical = self._classify_teams(all_matches, fixtures_unique)
         result = HarvestResult(
             matches=frame,
             fixtures=fixtures_unique,
-            unmapped_teams=self._count_unmapped(all_matches, fixtures_unique),
+            unmapped_teams=unmapped,
             stats=totals.as_dict(),
             provider="+".join(used) if used else self.providers[0],
             failures=failures,
+            seasons=tuple(labels),
+            n_matches_by_season={label: int(counts.get(label, 0)) for label in labels},
+            historical_teams=historical,
+            registry_season=season_label_from_year(str(self.registry.season)) or str(self.registry.season),
         )
         log.info("harvest_all complete", extra={"summary": result.summary()})
         return result
@@ -1666,7 +2144,18 @@ def _build_parser() -> argparse.ArgumentParser:
         description="Harvest Serie C matches and fixtures from SofaScore / FotMob into the canonical CSVs.",
     )
     parser.add_argument("--gironi", nargs="+", default=["A", "B", "C"], choices=["A", "B", "C"], help="gironi to harvest")
-    parser.add_argument("--season-id", type=int, default=None, help="SofaScore season id (default: current)")
+    parser.add_argument(
+        "--seasons",
+        type=int,
+        default=3,
+        help="seasons to harvest, newest first: the current one plus N-1 of history, all in ONE matches CSV (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--season",
+        default=DEFAULT_SEASON,
+        help="team dictionary config/teams_<season>.json defining the perimeter of current teams (default: %(default)s)",
+    )
+    parser.add_argument("--season-id", type=int, default=None, help="SofaScore season id: harvest only that season (default: the newest --seasons)")
     parser.add_argument("--out", type=Path, default=PROCESSED_DIR / "matches.csv", help="matches CSV output")
     parser.add_argument("--fixtures-out", type=Path, default=PROCESSED_DIR / "fixtures.csv", help="fixtures CSV output")
     parser.add_argument("--no-stats", action="store_true", help="skip per-match statistics calls")
@@ -1678,27 +2167,77 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--log-json", action="store_true", help="emit JSON-lines logs")
     parser.add_argument("--providers", nargs="+", default=["sofascore"], choices=list(PROVIDER_NAMES), help="ordered provider fallbacks")
     parser.add_argument("--cache-dir", type=Path, default=RAW_DIR, help="raw JSON cache directory")
-    parser.add_argument("--cache-ttl-hours", type=float, default=None, help="override cache TTL (hours)")
+    parser.add_argument(
+        "--cache-ttl-hours",
+        type=float,
+        default=None,
+        help="cache TTL (hours) of the current season's payloads, which still change (default: [http] cache_ttl_hours, 6)",
+    )
+    parser.add_argument(
+        "--history-cache-ttl-hours",
+        type=float,
+        default=None,
+        help="cache TTL (hours) of completed seasons, whose payloads never change; 0 forces their re-download "
+        "(default: [http] history_cache_ttl_hours, 8760 = 365 days)",
+    )
     parser.add_argument("--endpoints", type=Path, default=CONFIG_DIR / "endpoints.toml", help="endpoints TOML file")
     parser.add_argument("--x-mas", default=os.getenv("FOTMOB_X_MAS"), help="FotMob x-mas signature header (env FOTMOB_X_MAS)")
     return parser
 
 
+def _print_season_report(result: HarvestResult, *, season_stem: str, n_current_teams: int) -> None:
+    """Per-season console summary: perimeter, matches per season, history used, historical teams."""
+    perimeter = result.perimeter_season or "-"
+    print(f"perimeter: season {perimeter} (config/teams_{season_stem}.json, {n_current_teams} current teams)")
+    print("seasons harvested:")
+    for line in result.season_lines() or ["  (none)"]:
+        print(line)
+    print(f"historical matches used: {result.n_historical_matches}")
+    if result.historical_teams:
+        print(
+            f"historical teams (not in the {perimeter} perimeter, history only): "
+            + ", ".join(result.historical_teams)
+            + f" ({len(result.historical_teams)})"
+        )
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """CLI entry point; returns the process exit code."""
-    args = _build_parser().parse_args(argv)
+    parser = _build_parser()
+    args = parser.parse_args(argv)
+    if args.seasons < 1:
+        parser.error("--seasons must be >= 1")
     configure_logging(json_output=args.log_json, force=True)
     extra_headers = {"x-mas": args.x_mas} if args.x_mas else None
-    harvester = Harvester(
-        endpoints=load_endpoints(args.endpoints),
-        cache_dir=args.cache_dir,
-        cache_ttl=timedelta(hours=args.cache_ttl_hours) if args.cache_ttl_hours is not None else None,
-        providers=tuple(args.providers),
-        extra_headers=extra_headers,
-    )
+    try:
+        endpoints = load_endpoints(args.endpoints)
+    except FileNotFoundError as exc:
+        log.error("endpoints file not found", extra={"path": str(args.endpoints), "error": str(exc)})
+        print(f"harvest failed: endpoints file not found: {args.endpoints}", file=sys.stderr)
+        return 1
+    except ValueError as exc:  # malformed TOML (TOMLDecodeError is a ValueError) or a missing key
+        log.error("endpoints file invalid", extra={"path": str(args.endpoints), "error": str(exc)})
+        print(f"harvest failed: invalid endpoints file {args.endpoints}: {exc}", file=sys.stderr)
+        return 1
+    try:
+        harvester = Harvester(
+            endpoints=endpoints,
+            cache_dir=args.cache_dir,
+            cache_ttl=timedelta(hours=args.cache_ttl_hours) if args.cache_ttl_hours is not None else None,
+            history_cache_ttl=timedelta(hours=args.history_cache_ttl_hours) if args.history_cache_ttl_hours is not None else None,
+            providers=tuple(args.providers),
+            extra_headers=extra_headers,
+            season=args.season,
+        )
+    except FileNotFoundError as exc:
+        log.error("team dictionary not found", extra={"season": args.season, "error": str(exc)})
+        print(f"harvest failed: {exc}", file=sys.stderr)
+        return 1
     gironi = [Girone.parse(g) for g in args.gironi]
     try:
-        result = asyncio.run(harvester.harvest_all(gironi, season_id=args.season_id, with_stats=not args.no_stats))
+        result = asyncio.run(
+            harvester.harvest_all(gironi, season_id=args.season_id, seasons=args.seasons, with_stats=not args.no_stats)
+        )
     except HarvestError as exc:
         log.error("harvest failed", extra={"url": exc.url, "status": exc.status, "attempts": exc.attempts})
         print(f"harvest failed: {exc}", file=sys.stderr)
@@ -1706,6 +2245,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     complete = not result.failures and len(result.matches) > 0
     write, reason = _write_decision(result, args.out, allow_partial=args.allow_partial)
     print(result.summary())
+    _print_season_report(
+        result, season_stem=season_file_stem(args.season), n_current_teams=len(harvester.registry.canonical_names)
+    )
     if write:
         save_processed(result.matches, args.out)
         save_fixtures(result.fixtures, args.fixtures_out)

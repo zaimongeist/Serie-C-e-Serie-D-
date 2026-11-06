@@ -8,14 +8,30 @@ Environment variables
 ---------------------
 ``SERIEC_FORCE_SIMULATE=1``
     Always use the synthetic league, even when ``data/processed/matches.csv`` exists.
-``SERIEC_SIM_ROUNDS`` (int >= 1, default 15)
-    Played rounds of the simulated league; values above the season length are
-    clamped by the data layer so one round of fixtures always remains.
+``SERIEC_SEASON`` (default ``2026_27``)
+    Registry season (``config/teams_<season>.json``): the perimeter of teams that
+    are ranked, predicted and priced. Older seasons in the data are history only;
+    the simulated league of another season runs on that season's calendar.
+``SERIEC_HISTORY`` (int 0-2, default 2)
+    Synthetic seasons before the registry season (2024/25 and 2025/26 for
+    2026/27) prepended to the simulated league.
+``SERIEC_AS_OF`` (ISO date, default today)
+    Calendar position of the simulated league: rounds dated before it are
+    played, the next round is the fixture list. It is resolved on every run
+    (:func:`resolve_as_of`), so without the variable the position advances
+    with the real calendar while the server runs instead of being cached.
+``SERIEC_SIM_ROUNDS`` (int >= 1, optional)
+    Fixed number of played rounds of the simulated league instead of the
+    calendar; values above the season length are clamped by the data layer so
+    one round of fixtures always remains.
 ``SERIEC_SEED`` (int >= 0, default 7)
     Random seed of the simulated league.
 
-Invalid or out-of-range values (non-integers, a negative seed, zero rounds)
-are logged and replaced by the defaults instead of crashing the page.
+Invalid or out-of-range values (non-integers, a negative seed, zero rounds, an
+unparseable date, an unknown season file) are logged and replaced by the
+defaults instead of crashing the page; should the pipeline itself refuse a
+valid-looking combination (``ValueError``), the page shows the error and falls
+back to the default season, calendar and seed.
 
 The heavy work (load/simulate, fit, predict, value) lives in
 :mod:`src.dashboard.state` and is cached with ``st.cache_resource`` keyed on
@@ -28,7 +44,7 @@ from __future__ import annotations
 
 import os
 import sys
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Final
 
@@ -43,8 +59,11 @@ st.set_page_config(page_title="Serie C Quant Lab", page_icon="⚽", layout="wide
 
 from src.common.logging_config import get_logger
 from src.common.schemas import Girone, Market, MatchPrediction
+from src.common.teams import DEFAULT_SEASON, list_seasons, season_file_stem
 from src.dashboard import container_width_kwargs
 from src.dashboard.state import (
+    DEFAULT_HISTORY_SEASONS,
+    MAX_HISTORY_SEASONS,
     MIN_SIM_ROUNDS,
     PipelineState,
     build_state,
@@ -66,6 +85,8 @@ log = get_logger(__name__)
 
 GIRONE_OPTIONS: Final[tuple[str, ...]] = ("Tutti", "A", "B", "C")
 KELLY_OPTIONS: Final[dict[str, float]] = {"1/8": 0.125, "1/4": 0.25}
+#: Played rounds the dashboard simulated before the calendar-anchored league; kept for compatibility,
+#: the default is now ``None`` (rounds derived from ``SERIEC_AS_OF``/today).
 DEFAULT_SIM_ROUNDS: Final[int] = 15
 DEFAULT_SEED: Final[int] = 7
 #: Smallest "goals per team" the heatmap slider allows (a compact view folds the tail into an ``N+`` cell).
@@ -108,6 +129,64 @@ def env_int(name: str, default: int, *, minimum: int | None = None) -> int:
     return value
 
 
+def env_optional_int(name: str, *, minimum: int | None = None, maximum: int | None = None) -> int | None:
+    """Integer environment variable that may be absent: ``None`` when unset, blank or invalid.
+
+    Out-of-range values (below ``minimum`` or above ``maximum``) are logged and
+    treated as unset, so ``SERIEC_SIM_ROUNDS=0`` falls back to the calendar.
+    """
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return None
+    try:
+        value = int(raw.strip())
+    except ValueError:
+        log.warning("invalid integer environment variable, ignored", extra={"variable": name, "value": raw})
+        return None
+    if (minimum is not None and value < minimum) or (maximum is not None and value > maximum):
+        log.warning(
+            "environment variable out of range, ignored",
+            extra={"variable": name, "value": value, "minimum": minimum, "maximum": maximum},
+        )
+        return None
+    return value
+
+
+def env_date(name: str) -> date | None:
+    """ISO date (``YYYY-MM-DD``) environment variable; ``None`` when unset or unparseable (logged)."""
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return None
+    try:
+        return date.fromisoformat(raw.strip()[:10])
+    except ValueError:
+        log.warning("invalid date environment variable, using today", extra={"variable": name, "value": raw})
+        return None
+
+
+def env_season(name: str, default: str = DEFAULT_SEASON) -> str:
+    """Registry season from the environment, validated against the ``config/teams_*.json`` files."""
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    stem = season_file_stem(raw)
+    if stem not in list_seasons():
+        log.warning("unknown season file, using default", extra={"variable": name, "value": raw, "available": list_seasons(), "default": default})
+        return default
+    return stem
+
+
+def resolve_as_of() -> date:
+    """Calendar position of the simulated league: ``SERIEC_AS_OF`` when valid, otherwise today.
+
+    Resolved on every script run and passed to :func:`load_state` explicitly, so
+    the cache key changes every day and the played rounds follow the real
+    calendar while the server runs (a ``None`` key would freeze the day the
+    state was first computed).
+    """
+    return env_date("SERIEC_AS_OF") or date.today()
+
+
 # =============================================================================
 # Cached pipeline
 # =============================================================================
@@ -119,7 +198,10 @@ def load_state(
     bankroll_units: float,
     simulate: bool | None,
     seed: int,
-    n_rounds: int,
+    n_rounds: int | None = None,
+    season: str = DEFAULT_SEASON,
+    history_seasons: int = DEFAULT_HISTORY_SEASONS,
+    as_of: date | None = None,
 ) -> PipelineState:
     """Build (and cache) the pipeline state for one combination of sidebar parameters."""
     return build_state(
@@ -129,6 +211,9 @@ def load_state(
         simulate=simulate,
         seed=seed,
         n_rounds=n_rounds,
+        season=season,
+        history_seasons=history_seasons,
+        as_of=as_of,
     )
 
 
@@ -156,10 +241,12 @@ def render_sidebar() -> tuple[Girone | None, float, float, float]:
 
 
 def render_source_badge(container: st.delta_generator.DeltaGenerator, state: PipelineState) -> None:
-    """Data-source badge with the fit diagnostics."""
+    """Data-source badge: perimeter (season, teams, current vs historical matches) and fit diagnostics."""
     params = state.params
     body = (
-        f"**{state.n_matches}** partite · **{state.n_fixtures}** partite in programma  \n"
+        f"**{state.perimeter_text}**  \n"
+        f"{state.n_matches} partite nel fit · **{state.n_fixtures}** partite in programma · "
+        f"{state.n_historical_teams} squadre storiche escluse  \n"
         f"Fit: {params.method} · LL {params.log_likelihood:.1f}  \n"
         f"Convergenza: {'sì' if params.converged else 'no'} · {params.fit_seconds:.2f} s  \n"
         f"Prior gaussiana: {'attiva' if state.prior_enabled else 'disattivata'}"
@@ -175,7 +262,11 @@ def render_source_badge(container: st.delta_generator.DeltaGenerator, state: Pip
 # =============================================================================
 def render_ranking_tab(state: PipelineState, girone: Girone | None) -> None:
     st.subheader("Classifica di forza (parametri Dixon-Coles)")
-    st.caption("α = forza offensiva, β = solidità difensiva (più alto = subisce meno), γ = vantaggio casa del girone; indici = exp(parametro).")
+    st.caption(
+        "α = forza offensiva, β = solidità difensiva (più alto = subisce meno), γ = vantaggio casa del girone; indici = exp(parametro). "
+        f"Solo le squadre della Serie C {state.season_label} nel girone del dizionario corrente; le squadre delle stagioni passate "
+        f"({state.n_historical_teams}) entrano nella stima solo come avversarie."
+    )
     table = ranking_table(state, girone)
     if table.empty:
         st.info("Nessuna squadra stimata per il girone selezionato.")
@@ -237,7 +328,13 @@ def render_match_tab(state: PipelineState, girone: Girone | None) -> None:
     st.subheader("Partita e matrice dei punteggi")
     preds = fixtures_for(state, girone)
     if not preds:
-        st.info("Nessuna partita in programma per il girone selezionato.")
+        message = "Nessuna partita in programma per il girone selezionato."
+        if state.skipped_fixtures:
+            message += (
+                f" {len(state.skipped_fixtures)} partite caricate sono state saltate perché di un'altra stagione o con squadre "
+                f"fuori dal perimetro {state.season_label} (dettagli in *Dettagli pipeline*)."
+            )
+        st.info(message)
         return
     labels = [f"[{p.fixture.girone.value}] {p.fixture.date.isoformat()} · {p.fixture.label}" for p in preds]
     choice = st.selectbox("Partita del prossimo turno", labels, index=0, key="fixture")
@@ -368,22 +465,53 @@ def main() -> None:
 
     simulate: bool | None = True if env_flag("SERIEC_FORCE_SIMULATE") else None
     seed = env_int("SERIEC_SEED", DEFAULT_SEED, minimum=0)
-    n_rounds = env_int("SERIEC_SIM_ROUNDS", DEFAULT_SIM_ROUNDS, minimum=MIN_SIM_ROUNDS)
-    state = load_state(
-        min_ev=min_ev,
-        kelly_fraction=kelly_fraction,
-        bankroll_units=bankroll,
-        simulate=simulate,
-        seed=seed,
-        n_rounds=n_rounds,
-    )
+    n_rounds = env_optional_int("SERIEC_SIM_ROUNDS", minimum=MIN_SIM_ROUNDS)
+    season = env_season("SERIEC_SEASON")
+    history_seasons = env_optional_int("SERIEC_HISTORY", minimum=0, maximum=MAX_HISTORY_SEASONS)
+    history = DEFAULT_HISTORY_SEASONS if history_seasons is None else history_seasons
+    as_of = resolve_as_of()
+    try:
+        state = load_state(
+            min_ev=min_ev,
+            kelly_fraction=kelly_fraction,
+            bankroll_units=bankroll,
+            simulate=simulate,
+            seed=seed,
+            n_rounds=n_rounds,
+            season=season,
+            history_seasons=history,
+            as_of=as_of,
+        )
+    except ValueError as exc:
+        # the page never crashes on a configuration the data layer refuses: say so and use the defaults
+        log.warning(
+            "pipeline failed with the requested parameters, falling back to the defaults",
+            extra={"season": season, "history_seasons": history, "n_rounds": n_rounds, "seed": seed, "error": str(exc)},
+        )
+        st.error(
+            f"Pipeline non eseguibile con i parametri richiesti (stagione {season_file_stem(season).replace('_', '/')}, "
+            f"storico {history}, giornate {n_rounds if n_rounds is not None else 'da calendario'}, seed {seed}): {exc}. "
+            f"Uso la configurazione predefinita: stagione {DEFAULT_SEASON.replace('_', '/')}, calendario al {as_of.isoformat()}, seed {DEFAULT_SEED}.",
+            icon="⚠️",
+        )
+        state = load_state(
+            min_ev=min_ev,
+            kelly_fraction=kelly_fraction,
+            bankroll_units=bankroll,
+            simulate=simulate,
+            seed=DEFAULT_SEED,
+            n_rounds=None,
+            season=DEFAULT_SEASON,
+            history_seasons=DEFAULT_HISTORY_SEASONS,
+            as_of=as_of,
+        )
     render_source_badge(badge, state)
 
     st.title("⚽ Serie C Quant Lab")
     scope = "tutti i gironi" if girone is None else f"Girone {girone.value}"
     st.caption(
-        f"Dixon-Coles su {state.n_matches} partite · {len(state.predictions)} previsioni · soglia EV {min_ev:.1%} · "
-        f"Kelly x{kelly_fraction:g} · bankroll {bankroll:g} unità · vista: {scope}"
+        f"{state.perimeter_text} · Dixon-Coles su {state.n_matches} partite · {len(state.predictions)} previsioni · "
+        f"soglia EV {min_ev:.1%} · Kelly x{kelly_fraction:g} · bankroll {bankroll:g} unità · vista: {scope}"
     )
     with st.expander("Dettagli pipeline", expanded=False):
         st.markdown("\n".join(f"- {note}" for note in state.notes))

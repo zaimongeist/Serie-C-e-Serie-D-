@@ -9,9 +9,10 @@ on dtypes and column order.
 from __future__ import annotations
 
 import math
+import re
 import warnings
 from dataclasses import asdict, dataclass, field, fields
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from enum import Enum
 from typing import Any, Final, Iterable, Mapping, Sequence
 
@@ -26,6 +27,7 @@ __all__ = [
     "MATCH_DTYPES",
     "REQUIRED_MATCH_COLUMNS",
     "OPTIONAL_MATCH_COLUMNS",
+    "SEASON_START_MONTH",
     "MatchRecord",
     "Fixture",
     "OddsQuote",
@@ -34,12 +36,67 @@ __all__ = [
     "SELECTIONS",
     "ValidationReport",
     "matches_to_frame",
+    "season_bounds",
+    "season_of",
     "validate_matches_df",
     "validate_matches_report",
     "empty_matches_frame",
 ]
 
 log = get_logger(__name__)
+
+#: A football season runs from July to June: a match played in July 2026 or
+#: later (up to June 2027) belongs to the season labelled ``'2026/27'``.
+SEASON_START_MONTH: Final[int] = 7
+
+_SEASON_LABEL_RE: Final[re.Pattern[str]] = re.compile(r"^\s*(\d{4})\s*[/_\-]\s*(\d{2}|\d{4})\s*$")
+
+
+def season_of(d: date | datetime | pd.Timestamp | str) -> str:
+    """Season label of a match date, ``'2026/27'`` for July 2026 - June 2027.
+
+    The 16-column match frame deliberately has no ``season`` column: the season is
+    a function of the date, so every module that needs a label (per-season
+    summaries, "current season" filters, history ranges) derives it here and
+    agrees with the others. ISO strings and ``pandas`` timestamps are accepted;
+    a missing value (``NaT``/``None``) raises :class:`ValueError`.
+    """
+    if d is None or d is pd.NaT:
+        raise ValueError("season_of: the date is missing")
+    if isinstance(d, str):
+        d = date.fromisoformat(d.strip()[:10])
+    elif isinstance(d, pd.Timestamp):
+        if pd.isna(d):
+            raise ValueError("season_of: the date is missing")
+        d = d.date()
+    elif isinstance(d, datetime):
+        d = d.date()
+    elif not isinstance(d, date):
+        raise TypeError(f"season_of expects a date, datetime, Timestamp or ISO string, got {type(d).__name__}")
+    start_year = d.year if d.month >= SEASON_START_MONTH else d.year - 1
+    return f"{start_year}/{(start_year + 1) % 100:02d}"
+
+
+def season_bounds(label: str) -> tuple[date, date]:
+    """First and last calendar day of a season label (``'2026/27'`` -> 1 July 2026, 30 June 2027).
+
+    ``'2026_27'``, ``'2026-27'`` and ``'2026/2027'`` are accepted as well, so the
+    file stems of ``config/teams_<season>.json`` work directly. A label whose
+    second year is not the first plus one raises :class:`ValueError`.
+    """
+    match = _SEASON_LABEL_RE.match(str(label))
+    if match is None:
+        raise ValueError(f"invalid season label {label!r}: expected 'YYYY/YY' such as '2026/27'")
+    start_year = int(match.group(1))
+    second = match.group(2)
+    end_year = int(second) if len(second) == 4 else (start_year // 100) * 100 + int(second)
+    if len(second) == 2 and end_year < start_year:  # '1999/00'
+        end_year += 100
+    if end_year != start_year + 1:
+        raise ValueError(f"invalid season label {label!r}: the second year must follow the first")
+    first = date(start_year, SEASON_START_MONTH, 1)
+    last = date(end_year, SEASON_START_MONTH, 1) - timedelta(days=1)
+    return first, last
 
 
 class Girone(str, Enum):

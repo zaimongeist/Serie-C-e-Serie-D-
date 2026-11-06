@@ -55,7 +55,7 @@ from src.simulation.generator import (
     simulate_mini_dataset,
 )
 
-TRAP_TEAM = "Vicenza"
+TRAP_TEAM = "Cittadella"  # Girone A team of the 2026/27 registry (the default simulated composition); not a _three_match_window opponent
 
 
 # ----------------------------------------------------------------------------- helpers
@@ -456,11 +456,11 @@ class TestRegressionTraps:
         assert {t.team for t in detect_regression_traps(trapped_matches)} <= {t.team for t in loose}
 
     def test_sorted_by_severity_desc(self, trapped_matches: pd.DataFrame) -> None:
-        df = inject_regression_trap(trapped_matches, "Arezzo", xga_total=6.0)
+        df = inject_regression_trap(trapped_matches, "Perugia", xga_total=6.0)
         traps = detect_regression_traps(df)
         severities = [t.severity for t in traps]
         assert severities == sorted(severities, reverse=True)
-        assert traps[0].team == "Arezzo"
+        assert traps[0].team == "Perugia"
         assert traps[0].severity == pytest.approx(6.0 - 1)
         assert TRAP_TEAM in {t.team for t in traps}
 

@@ -14,6 +14,22 @@ dashboard can be unit-tested without a browser:
 
 Bookmaker odds are read from ``odds_dir/*.csv`` in the same format
 ``main.load_odds_dir`` understands, see :func:`load_odds_quotes`.
+
+Perimeter and history
+---------------------
+The dashboard ranks, predicts and prices only the teams of the registry of the
+selected ``season`` (``config/teams_2026_27.json`` by default, 60 teams). The
+match frame may hold up to three seasons: the rows of the registry season are
+the *current* matches (coverage, traps and the auto-prior rule are judged on
+them), the older rows are *history* that only sharpens the strength estimates
+(the engine fits every team, flags the ones outside the registry as historical
+and keeps them out of :func:`ranking_table`; fixtures involving them, and
+fixtures dated in another season than the registry's -- a stale ``fixtures.csv``
+of last season -- are skipped and listed in the notes). Without processed data
+a league is simulated on the registry season's real calendar (2026/27 by
+default; played rounds derived from ``as_of``, today by default, see
+:func:`simulate_current_season`) together with ``history_seasons`` synthetic
+seasons *preceding* it (:func:`src.simulation.generator.history_seasons_for`).
 """
 from __future__ import annotations
 
@@ -21,7 +37,7 @@ import math
 import time
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Final, Literal
 
@@ -31,8 +47,18 @@ import plotly.graph_objects as go
 
 from src.common.logging_config import get_logger
 from src.common.paths import ODDS_DIR, PROCESSED_DIR, ROOT
-from src.common.schemas import SELECTIONS, Fixture, Girone, Market, MatchPrediction, OddsQuote
-from src.common.teams import TeamRegistry, load_registry
+from src.common.schemas import (
+    SELECTIONS,
+    Fixture,
+    Girone,
+    Market,
+    MatchPrediction,
+    OddsQuote,
+    empty_matches_frame,
+    season_of,
+    validate_matches_df,
+)
+from src.common.teams import DEFAULT_SEASON, TeamRegistry, load_registry
 from src.engine.model import DixonColesConfig, DixonColesEngine, FittedParams
 from src.engine.value import (
     KellyConfig,
@@ -42,16 +68,27 @@ from src.engine.value import (
     detect_regression_traps,
 )
 from src.ingestion.harvester import load_fixtures, load_processed
-from src.simulation.generator import inject_regression_trap, round_robin, simulate_league
+from src.simulation.generator import (
+    HISTORY_SEASONS,
+    SimulatedLeague,
+    history_seasons_for,
+    inject_regression_trap,
+    round_robin,
+    simulate_history,
+    simulate_league,
+)
 
 __all__ = [
+    "DEFAULT_HISTORY_SEASONS",
     "MARKETS_COLUMNS",
     "MARKET_LABELS",
+    "MAX_HISTORY_SEASONS",
     "MIN_SIM_ROUNDS",
     "ODDS_COLUMNS",
     "PRIOR_THRESHOLD_MATCHES",
     "PRIOR_MIN_MATCHES_PER_TEAM",
     "matches_per_team",
+    "perimeter_matches",
     "prior_recommended",
     "RANKING_COLUMNS",
     "TRAPS_COLUMNS",
@@ -62,14 +99,18 @@ __all__ = [
     "export_csv_bytes",
     "fixtures_for",
     "heatmap_figure",
+    "history_label",
     "load_odds_quotes",
     "markets_table",
     "max_sim_rounds",
     "no_odds_message",
     "opportunities_table",
+    "other_season_reason",
     "predictions_table",
     "quotes_for",
     "ranking_table",
+    "simulate_current_season",
+    "split_by_season",
     "strength_figure",
     "traps_table",
     "value_table",
@@ -87,6 +128,11 @@ PRIOR_THRESHOLD_MATCHES: Final[int] = 100
 
 #: Smallest number of played rounds a simulated league can have (the fit needs matches).
 MIN_SIM_ROUNDS: Final[int] = 1
+#: Synthetic past seasons prepended to the simulated league by default (the two before the registry season:
+#: 2024/25 and 2025/26 for 2026/27).
+DEFAULT_HISTORY_SEASONS: Final[int] = 2
+#: Largest number of synthetic past seasons available (``len(HISTORY_SEASONS)``).
+MAX_HISTORY_SEASONS: Final[int] = len(HISTORY_SEASONS)
 
 #: Required columns of a bookmaker odds CSV (one row per quoted selection).
 ODDS_COLUMNS: Final[tuple[str, ...]] = ("match_id", "bookmaker", "market", "selection", "odds")
@@ -168,6 +214,14 @@ class PipelineState:
     ``notes`` is the human-readable log of what happened (data source, injected
     trap, fit diagnostics, skipped quotes...) shown in the *Dettagli pipeline*
     expander.
+
+    ``matches`` is everything the fit saw (history included); ``current_matches``
+    are its rows of the registry season (``season_label``) and ``history_matches``
+    the older ones. ``registry`` is the perimeter: ``fixtures`` are the fixtures
+    loaded (filtered or not), while ``predictions``, ``opportunities`` and
+    ``traps`` only ever concern current teams and the current season;
+    ``skipped_fixtures`` names the fixtures left out (dated in another season,
+    historical or unknown teams).
     """
 
     matches: pd.DataFrame
@@ -181,16 +235,59 @@ class PipelineState:
     source: Source
     built_at: datetime
     notes: list[str] = field(default_factory=list)
+    registry: TeamRegistry | None = None
+    season_label: str = ""
+    current_matches: pd.DataFrame = field(default_factory=empty_matches_frame)
+    history_matches: pd.DataFrame = field(default_factory=empty_matches_frame)
+    skipped_fixtures: list[str] = field(default_factory=list)
 
     @property
     def n_matches(self) -> int:
-        """Number of played matches used by the fit."""
+        """Number of played matches used by the fit (current season and history)."""
         return len(self.matches)
+
+    @property
+    def n_current_matches(self) -> int:
+        """Played matches of the registry season (the perimeter's own evidence)."""
+        return len(self.current_matches)
+
+    @property
+    def n_history_matches(self) -> int:
+        """Played matches of previous seasons used only to sharpen the strengths."""
+        return len(self.history_matches)
 
     @property
     def n_fixtures(self) -> int:
         """Number of upcoming fixtures loaded (predicted or not)."""
         return len(self.fixtures)
+
+    @property
+    def n_current_teams(self) -> int:
+        """Fitted teams of the perimeter (every fitted team when no registry was used)."""
+        return len(self.params.current_teams)
+
+    @property
+    def n_historical_teams(self) -> int:
+        """Fitted teams outside the perimeter (opponents from past seasons)."""
+        return len(self.params.historical_teams)
+
+    @property
+    def history_label(self) -> str:
+        """Season range of the history, ``'2024/25-2025/26'`` (``''`` without history)."""
+        return history_label(self.history_matches)
+
+    @property
+    def perimeter_text(self) -> str:
+        """Italian one-liner for badges and subtitles:
+        ``'Stagione 2026/27 · 60 squadre · 330 partite stagione corrente · 2280 partite storiche (2024/25-2025/26)'``."""
+        n_teams = self.registry.n_teams if self.registry is not None else self.n_current_teams
+        text = (
+            f"Stagione {self.season_label} · {n_teams} squadre · {self.n_current_matches} partite stagione corrente · "
+            f"{self.n_history_matches} partite storiche"
+        )
+        if self.n_history_matches:
+            text += f" ({self.history_label})"
+        return text
 
     @property
     def gironi(self) -> tuple[Girone, ...]:
@@ -202,6 +299,67 @@ class PipelineState:
         """Whether the fit used the Gaussian (MAP) prior."""
         cfg = self.engine.config
         return bool(cfg.l2_penalty > 0.0 or cfg.l2_penalty_home > 0.0 or cfg.l2_penalty_rho > 0.0)
+
+
+# =============================================================================
+# Seasons and perimeter helpers
+# =============================================================================
+def split_by_season(matches: pd.DataFrame, season_label: str) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """``(current, history)``: rows of ``matches`` whose :func:`season_of` is ``season_label`` and the rest.
+
+    Both frames keep the canonical columns and a fresh index; an empty input
+    yields two empty frames. Rows of seasons *after* ``season_label`` count as
+    history too (they cannot exist for a current season, so this only matters
+    for mistyped dates, which the engine's weight diagnostics report anyway).
+    """
+    if matches.empty:
+        return empty_matches_frame(), empty_matches_frame()
+    label = str(season_label).replace("_", "/")
+    seasons = pd.to_datetime(matches["date"]).map(season_of)
+    is_current = (seasons == label).to_numpy(dtype=bool)
+    return matches.loc[is_current].reset_index(drop=True), matches.loc[~is_current].reset_index(drop=True)
+
+
+def history_label(matches: pd.DataFrame) -> str:
+    """``'2024/25-2025/26'`` for the seasons spanned by ``matches`` (one label when a single season, ``''`` when empty)."""
+    if matches.empty:
+        return ""
+    seasons = sorted(set(pd.to_datetime(matches["date"]).map(season_of)))
+    return seasons[0] if len(seasons) == 1 else f"{seasons[0]}-{seasons[-1]}"
+
+
+def perimeter_matches(
+    matches: pd.DataFrame,
+    *,
+    registry: TeamRegistry | None = None,
+    season: str | None = None,
+) -> pd.DataFrame:
+    """Rows of ``matches`` that count as *coverage of the perimeter*.
+
+    With ``season`` only the rows of that season label are kept (see
+    :func:`split_by_season`); with ``registry`` only the rows where **both** teams
+    are current teams of the registry. With neither the frame is returned
+    unchanged, which is the pre-2026/27 behaviour of the callers.
+    """
+    out = matches
+    if season is not None:
+        out, _ = split_by_season(out, season)
+    if registry is not None and not out.empty:
+        current = set(registry.canonical_names)
+        keep = out["home_team"].isin(current) & out["away_team"].isin(current)
+        out = out.loc[keep.to_numpy(dtype=bool)].reset_index(drop=True)
+    return out
+
+
+def other_season_reason(fixture_season: str, season_label: str) -> str:
+    """Italian reason for skipping a fixture dated outside the registry season.
+
+    ``'partita di una stagione precedente (2025/26), fuori dal perimetro 2026/27'``
+    for a stale ``fixtures.csv`` of last season; ``successiva`` when the fixture
+    is dated after the registry season. Shared by the dashboard and ``main.py``.
+    """
+    kind = "precedente" if str(fixture_season) < str(season_label) else "successiva"
+    return f"partita di una stagione {kind} ({fixture_season}), fuori dal perimetro {season_label}"
 
 
 # =============================================================================
@@ -273,29 +431,65 @@ def _pick_trap_team(matches: pd.DataFrame, fixtures: Sequence[Fixture], girone: 
     return None
 
 
-def matches_per_team(matches: pd.DataFrame) -> float:
-    """Average played matches per team in the least-covered girone (``2 * n / teams``), 0.0 when empty."""
-    if matches.empty:
+def matches_per_team(
+    matches: pd.DataFrame,
+    *,
+    registry: TeamRegistry | None = None,
+    season: str | None = None,
+) -> float:
+    """Average played matches per team in the least-covered girone (``2 * n / teams``), 0.0 when empty.
+
+    ``registry``/``season`` restrict the count to the perimeter (see
+    :func:`perimeter_matches`): with three seasons in the frame the history is
+    large, but the question is how much of the *current* season the current
+    teams have played. With a registry, gironi are the registry gironi and a
+    girone without any current-season match counts as zero coverage.
+    """
+    frame = perimeter_matches(matches, registry=registry, season=season)
+    if frame.empty:
         return 0.0
     coverage = []
-    for _, group in matches.groupby("girone", observed=True):
-        teams = set(group["home_team"]) | set(group["away_team"])
-        coverage.append(2.0 * len(group) / len(teams))
-    return float(min(coverage))
+    if registry is not None:
+        gironi = {g: set(teams) for g, teams in registry.teams_by_girone.items() if teams}
+        for g, members in gironi.items():
+            played = frame["home_team"].isin(members) | frame["away_team"].isin(members)
+            n = int(played.sum())
+            coverage.append(2.0 * n / len(members))
+    else:
+        for _, group in frame.groupby("girone", observed=True):
+            teams = set(group["home_team"]) | set(group["away_team"])
+            coverage.append(2.0 * len(group) / len(teams))
+    return float(min(coverage)) if coverage else 0.0
 
 
-def prior_recommended(matches: pd.DataFrame, *, min_matches_per_team: float = PRIOR_MIN_MATCHES_PER_TEAM) -> bool:
+def prior_recommended(
+    matches: pd.DataFrame,
+    *,
+    min_matches_per_team: float = PRIOR_MIN_MATCHES_PER_TEAM,
+    registry: TeamRegistry | None = None,
+    season: str | None = None,
+) -> bool:
     """Auto rule: MAP estimate while some girone has fewer than ``min_matches_per_team`` matches per team.
 
     A total-match threshold is misleading for a 60-team league (100 matches are
-    fewer than 2 per team), so coverage is measured per team in the thinnest girone.
+    fewer than 2 per team), so coverage is measured per team in the thinnest
+    girone. Coverage is counted on the **current-season matches of current
+    teams** when ``registry``/``season`` are given: history never counts, however
+    long it is.
     """
-    return matches_per_team(matches) < min_matches_per_team
+    return matches_per_team(matches, registry=registry, season=season) < min_matches_per_team
 
 
-def _model_config(matches: pd.DataFrame, *, xi: float, use_prior: bool | None) -> tuple[DixonColesConfig, bool]:
+def _model_config(
+    matches: pd.DataFrame,
+    *,
+    xi: float,
+    use_prior: bool | None,
+    registry: TeamRegistry | None = None,
+    season: str | None = None,
+) -> tuple[DixonColesConfig, bool]:
     """Resolve the ``use_prior`` tri-state into a config; returns ``(config, prior_on)``."""
-    prior_on = prior_recommended(matches) if use_prior is None else bool(use_prior)
+    prior_on = prior_recommended(matches, registry=registry, season=season) if use_prior is None else bool(use_prior)
     if prior_on:
         return DixonColesConfig.with_gaussian_prior(xi=xi), True
     return DixonColesConfig(xi=xi), False
@@ -340,33 +534,109 @@ def max_sim_rounds(registry: TeamRegistry | None = None) -> int:
     as the fixture list, so asking for the full season (or more) yields no
     fixtures, no predictions and no odds. The dashboard therefore clamps
     ``n_rounds`` to ``[MIN_SIM_ROUNDS, max_sim_rounds()]`` (``37`` with the
-    default registry). ``registry`` defaults to the real 2025/26 composition.
+    default registry). ``registry`` defaults to the real 2026/27 composition.
     """
     reg = load_registry() if registry is None else registry
     total_rounds = max(len(round_robin(teams)) for teams in reg.teams_by_girone.values())
     return max(MIN_SIM_ROUNDS, total_rounds - 1)
 
 
-def _simulated_inputs(seed: int, n_rounds: int, notes: list[str]) -> tuple[pd.DataFrame, list[Fixture], list[OddsQuote]]:
-    """Synthetic league with a REGRESSION_TRAP injected on a Girone A team of the next round.
+def simulate_current_season(
+    seed: int,
+    registry: TeamRegistry,
+    *,
+    n_rounds: int | None = None,
+    as_of: date | None = None,
+    notes: list[str] | None = None,
+) -> tuple[SimulatedLeague, int]:
+    """Simulated current season of ``registry`` on its real calendar; returns ``(league, played_rounds)``.
 
-    ``n_rounds`` is clamped to ``[MIN_SIM_ROUNDS, max_sim_rounds()]`` so the
-    league always has a next round to predict; a clamp is recorded in ``notes``.
+    Shared by the dashboard fallback and ``main.py --mode full`` so both read
+    the calendar the same way. With ``n_rounds`` the played rounds are fixed,
+    clamped to ``[MIN_SIM_ROUNDS, max_sim_rounds(registry)]`` so one round of
+    fixtures always remains (a clamp is recorded in ``notes``). Otherwise the
+    rounds dated before ``as_of`` (today by default) are played and the first
+    round on/after it is the fixture list: before the kick-off one round is
+    played anyway, after the last round the last one is kept as fixtures, both
+    with a note. ``notes`` (Italian, for the UI and the console) is extended in
+    place when given.
     """
-    upper = max_sim_rounds()
-    played = min(max(int(n_rounds), MIN_SIM_ROUNDS), upper)
-    if played != n_rounds:
+    notes = [] if notes is None else notes
+    upper = max_sim_rounds(registry)
+    if n_rounds is not None:
+        played = min(max(int(n_rounds), MIN_SIM_ROUNDS), upper)
+        if played != n_rounds:
+            notes.append(
+                f"Giornate simulate richieste: {n_rounds}; valore limitato a {played} (intervallo valido "
+                f"{MIN_SIM_ROUNDS}-{upper}) così resta una giornata in programma da prevedere."
+            )
+            log.warning("simulated rounds clamped", extra={"requested": n_rounds, "used": played, "max": upper})
+        return simulate_league(seed=seed, registry=registry, n_rounds=played), played
+    today = date.today() if as_of is None else as_of
+    league = simulate_league(seed=seed, registry=registry, as_of=today)
+    played = int(league.matches["round"].max()) if not league.matches.empty else 0
+    if played < MIN_SIM_ROUNDS:
         notes.append(
-            f"Giornate simulate richieste: {n_rounds}; valore limitato a {played} (intervallo valido "
-            f"{MIN_SIM_ROUNDS}-{upper}) così resta una giornata in programma da prevedere."
+            f"Calendario simulato al {today.isoformat()}: la stagione {registry.season_label} non è ancora iniziata; "
+            f"simulo comunque {MIN_SIM_ROUNDS} giornata così il modello ha dati."
         )
-        log.warning("simulated rounds clamped", extra={"requested": n_rounds, "used": played, "max": upper})
-    league = simulate_league(seed=seed, n_rounds=played)
+        played = MIN_SIM_ROUNDS
+        league = simulate_league(seed=seed, registry=registry, n_rounds=played)
+    elif not league.fixtures:
+        notes.append(
+            f"Calendario simulato al {today.isoformat()}: la stagione {registry.season_label} è conclusa; "
+            f"tengo l'ultima giornata come partite in programma ({upper} giornate giocate)."
+        )
+        played = upper
+        league = simulate_league(seed=seed, registry=registry, n_rounds=played)
+    else:
+        notes.append(
+            f"Calendario simulato al {today.isoformat()}: giornate con data precedente giocate ({played}), "
+            f"la prima giornata in data uguale o successiva ({league.fixtures[0].date.isoformat()}) è il turno da prevedere."
+        )
+    log.info(
+        "simulated current season positioned on the calendar",
+        extra={"season": registry.season_label, "as_of": today.isoformat(), "played_rounds": played, "n_fixtures": len(league.fixtures)},
+    )
+    return league, played
+
+
+def _simulated_inputs(
+    seed: int,
+    n_rounds: int | None,
+    notes: list[str],
+    *,
+    registry: TeamRegistry | None = None,
+    history_seasons: int = DEFAULT_HISTORY_SEASONS,
+    as_of: date | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame, list[Fixture], list[OddsQuote]]:
+    """Synthetic league on the real calendar plus synthetic history; returns ``(current, history, fixtures, quotes)``.
+
+    The current season is :func:`simulate_current_season` on ``registry``
+    (2026/27 by default): with ``n_rounds`` the played rounds are fixed and
+    clamped, otherwise they follow the calendar as of ``as_of`` (today by
+    default). ``history_seasons`` (0-2) synthetic seasons *before* the registry
+    season (:func:`history_seasons_for`) from :func:`simulate_history` share the
+    same true parameters. A REGRESSION_TRAP is injected on a Girone A team of
+    the next round (current season only).
+    """
+    reg = load_registry() if registry is None else registry
+    league, played = simulate_current_season(seed, reg, n_rounds=n_rounds, as_of=as_of, notes=notes)
     matches = league.matches
     notes.append(
-        f"Dataset simulato (seed={seed}, {played} giornate giocate): {len(matches)} partite, "
+        f"Dataset simulato (seed={seed}, {played} giornate giocate): {len(matches)} partite della stagione {reg.season_label}, "
         f"{len(league.fixtures)} partite in programma, {len(league.odds)} quote del bookmaker sintetico."
     )
+    history = empty_matches_frame()
+    if history_seasons > 0:
+        past = simulate_history(seed=seed, registry=reg, seasons=history_seasons_for(reg, int(history_seasons)))
+        history = past.matches
+        swapped = sorted(set(past.teams) - set(reg.canonical_names))
+        notes.append(
+            f"Storico simulato: {len(history)} partite delle stagioni {', '.join(past.seasons)} con {len(swapped)} squadre "
+            f"non più in Serie C {reg.season_label} ({', '.join(swapped[:6])}{', ...' if len(swapped) > 6 else ''}): "
+            "usate solo per stimare meglio le forze, escluse da classifica, previsioni e valore."
+        )
     trap_team = _pick_trap_team(matches, league.fixtures, Girone.A)
     if trap_team is not None:
         matches = inject_regression_trap(matches, trap_team)
@@ -377,7 +647,7 @@ def _simulated_inputs(seed: int, n_rounds: int, notes: list[str]) -> tuple[pd.Da
         log.info("regression trap injected", extra={"team": trap_team})
     else:
         notes.append("Nessuna squadra del Girone A con 3 gare giocate e una partita in programma: trappola non iniettata.")
-    return matches, league.fixtures, league.odds
+    return matches, history, league.fixtures, league.odds
 
 
 # =============================================================================
@@ -392,40 +662,66 @@ def build_state(
     bankroll_units: float = 100.0,
     xi: float = 0.0018,
     seed: int = 7,
-    n_rounds: int = 15,
+    n_rounds: int | None = None,
     simulate: bool | None = None,
     use_prior: bool | None = None,
+    season: str = DEFAULT_SEASON,
+    history_seasons: int = DEFAULT_HISTORY_SEASONS,
+    as_of: date | None = None,
+    registry: TeamRegistry | None = None,
 ) -> PipelineState:
     """Run load/simulate -> fit -> predict -> value and return a :class:`PipelineState`.
 
+    Perimeter
+        ``season`` selects the registry (``config/teams_<season>.json``, 2026/27
+        by default; ``registry`` overrides it, e.g. for a simulated composition).
+        Its teams are the only ones ranked, predicted and priced: the fit sees
+        every match of the frame, but teams outside the registry are fitted as
+        *historical* opponents only. The rows of the registry season are the
+        current matches; older rows are history.
     Data source
         ``processed_dir/matches.csv`` is used when it exists and ``simulate`` is
         not ``True`` (``fixtures.csv`` alongside it when present, odds from
-        ``odds_dir/*.csv`` in the :func:`load_odds_quotes` format). Otherwise
-        a league is simulated with :func:`simulate_league` (``seed``,
-        ``n_rounds`` played rounds, the next round as fixtures) and a
-        REGRESSION_TRAP is injected on one Girone A team of the next round.
+        ``odds_dir/*.csv`` in the :func:`load_odds_quotes` format); it may hold
+        several seasons. Otherwise a league is simulated with
+        :func:`simulate_current_season` on the registry season's real calendar
+        (2026/27 by default) -- with ``n_rounds`` the played rounds are fixed,
+        with ``n_rounds=None`` they are the rounds dated before ``as_of`` (today
+        by default) and the next round is the fixture list -- plus
+        ``history_seasons`` (0-2) synthetic seasons preceding it from
+        :func:`simulate_history`; a REGRESSION_TRAP is injected on one Girone A
+        team of the next round.
     Model
         ``use_prior=None`` enables the Gaussian prior while the least-covered
-        girone has fewer than :data:`PRIOR_MIN_MATCHES_PER_TEAM` played matches
-        per team (see :func:`prior_recommended`); ``True`` forces
-        :meth:`DixonColesConfig.with_gaussian_prior`, ``False`` the plain MLE.
-        ``xi`` is the time-decay rate per day.
+        girone has fewer than :data:`PRIOR_MIN_MATCHES_PER_TEAM` played
+        *current-season* matches per current team (see
+        :func:`prior_recommended`; history never counts as coverage); ``True``
+        forces :meth:`DixonColesConfig.with_gaussian_prior`, ``False`` the plain
+        MLE. ``xi`` is the time-decay rate per day.
     Value
         ``ValueEngine(min_ev, KellyConfig(kelly_fraction, bankroll_units))`` is
         run on the predictions and the quotes; without quotes the
-        opportunities simply stay empty. Fixtures with teams unknown to the fit
-        are skipped with a note instead of raising.
+        opportunities simply stay empty. Fixtures dated in another season than
+        the registry's (a stale ``fixtures.csv`` of last season), with a
+        historical team or with a team unknown to the fit are skipped with a
+        note instead of raising, so Match & Heatmap and the value panel only
+        ever show current-season matches between current teams; traps are
+        detected on the current-season matches of current teams only.
     Validation
-        ``seed`` must be ``>= 0`` (``numpy`` rejects negative seeds) and
-        ``n_rounds >= 1``; both raise :class:`ValueError` up front. Values of
-        ``n_rounds`` above :func:`max_sim_rounds` are clamped with a note, not
-        rejected, so a "full season" request still produces fixtures.
+        ``seed`` must be ``>= 0`` (``numpy`` rejects negative seeds),
+        ``n_rounds`` (when given) ``>= 1`` and ``history_seasons`` in
+        ``[0, MAX_HISTORY_SEASONS]``; all raise :class:`ValueError` up front.
+        Values of ``n_rounds`` above :func:`max_sim_rounds` are clamped with a
+        note, not rejected, so a "full season" request still produces fixtures.
     """
     if seed < 0:
         raise ValueError(f"seed must be >= 0 (got {seed})")
-    if n_rounds < MIN_SIM_ROUNDS:
+    if n_rounds is not None and n_rounds < MIN_SIM_ROUNDS:
         raise ValueError(f"n_rounds must be >= {MIN_SIM_ROUNDS} (got {n_rounds})")
+    if not 0 <= int(history_seasons) <= MAX_HISTORY_SEASONS:
+        raise ValueError(f"history_seasons must be in [0, {MAX_HISTORY_SEASONS}] (got {history_seasons})")
+    reg = load_registry(season) if registry is None else registry
+    season_label = reg.season_label
     notes: list[str] = []
     started = time.perf_counter()
     loaded: tuple[pd.DataFrame, list[Fixture], list[OddsQuote]] | None = None
@@ -438,26 +734,53 @@ def build_state(
             log.warning("processed matches requested but missing", extra={"path": str(matches_path)})
     if loaded is not None:
         source: Source = "processed"
-        matches, fixtures, quotes = loaded
+        all_matches, fixtures, quotes = loaded
+        current, history = split_by_season(all_matches, season_label)
     else:
         source = "simulated"
-        matches, fixtures, quotes = _simulated_inputs(seed, n_rounds, notes)
+        current, history, fixtures, quotes = _simulated_inputs(
+            seed, n_rounds, notes, registry=reg, history_seasons=int(history_seasons), as_of=as_of
+        )
+    matches = validate_matches_df(pd.concat([history, current], ignore_index=True)) if not history.empty else current
+    if matches.empty:
+        raise ValueError(f"no played matches available for the {season_label} perimeter")
 
-    config, prior_on = _model_config(matches, xi=xi, use_prior=use_prior)
+    config, prior_on = _model_config(current, xi=xi, use_prior=use_prior, registry=reg, season=season_label)
     engine = DixonColesEngine(config)
-    params = engine.fit(matches)
+    params = engine.fit(matches, registry=reg)
+    hist_label = history_label(history)
+    notes.append(
+        f"Perimetro: Serie C {season_label}, {reg.n_teams} squadre nel dizionario, {len(params.current_teams)} con partite; "
+        f"{len(current)} partite della stagione corrente"
+        + (f" e {len(history)} partite storiche ({hist_label})" if len(history) else " e nessuna partita storica")
+        + f"; {len(params.historical_teams)} squadre storiche stimate solo come avversarie"
+        + (f" ({', '.join(params.historical_teams[:6])}{', ...' if len(params.historical_teams) > 6 else ''})" if params.historical_teams else "")
+        + "."
+    )
+    without_matches = sorted(set(reg.canonical_names) - set(params.current_teams))
+    if without_matches:
+        notes.append(
+            f"{len(without_matches)} squadre del dizionario {season_label} senza partite nei dati (non stimate): "
+            f"{', '.join(without_matches[:8])}{', ...' if len(without_matches) > 8 else ''}."
+        )
     notes.append(
         f"Stima Dixon-Coles: metodo {params.method}, convergenza {'sì' if params.converged else 'no'} "
         f"({params.message}), log-likelihood {params.log_likelihood:.2f}, {params.n_iter} iterazioni in "
         f"{params.fit_seconds:.2f} s, xi={params.xi}, prior gaussiana {'attiva' if prior_on else 'disattivata'}"
         + (f" (penalità {params.penalty:.3f})" if prior_on else "")
+        + f" (copertura {matches_per_team(current, registry=reg, season=season_label):.1f} partite per squadra nel girone meno coperto)"
         + f", rho={params.rho:+.4f}."
     )
     log.info(
         "dashboard fit",
         extra={
             "source": source,
+            "season": season_label,
             "n_matches": params.n_matches,
+            "n_current_matches": len(current),
+            "n_history_matches": len(history),
+            "n_current_teams": len(params.current_teams),
+            "n_historical_teams": len(params.historical_teams),
             "method": params.method,
             "converged": params.converged,
             "log_likelihood": params.log_likelihood,
@@ -467,30 +790,65 @@ def build_state(
     )
 
     predictions: list[MatchPrediction] = []
-    skipped: list[str] = []
+    skipped_unknown: list[str] = []
+    skipped_historical: list[str] = []
+    skipped_season: list[str] = []
+    other_seasons: set[str] = set()
     for fx in fixtures:
+        fixture_season = season_of(fx.date)
+        if fixture_season != season_label:
+            skipped_season.append(fx.label)
+            other_seasons.add(fixture_season)
+            log.warning(
+                "fixture of another season skipped",
+                extra={"match_id": fx.match_id, "date": fx.date.isoformat(), "fixture_season": fixture_season, "season": season_label},
+            )
+            continue
+        outside = [t for t in (fx.home_team, fx.away_team) if t in params.alpha and not params.is_current(t)]
+        if outside:
+            skipped_historical.append(fx.label)
+            log.warning(
+                "fixture outside the perimeter skipped",
+                extra={"match_id": fx.match_id, "season": season_label, "historical_teams": outside},
+            )
+            continue
         try:
             predictions.append(engine.predict(fx))
         except (KeyError, ValueError) as exc:
-            skipped.append(fx.label)
+            skipped_unknown.append(fx.label)
             log.warning("fixture not predictable", extra={"match_id": fx.match_id, "error": str(exc)})
-    if skipped:
-        notes.append(f"{len(skipped)} partite in programma saltate (squadre non presenti nello storico): {', '.join(skipped[:5])}" + (" ..." if len(skipped) > 5 else "") + ".")
+    if skipped_season:
+        reasons = "; ".join(other_season_reason(s, season_label) for s in sorted(other_seasons))
+        notes.append(
+            f"{len(skipped_season)} partite in programma saltate ({reasons}): "
+            f"{', '.join(skipped_season[:5])}" + (" ..." if len(skipped_season) > 5 else "") + "."
+        )
+    if skipped_historical:
+        notes.append(
+            f"{len(skipped_historical)} partite in programma saltate (squadre fuori dal perimetro {season_label}): "
+            f"{', '.join(skipped_historical[:5])}" + (" ..." if len(skipped_historical) > 5 else "") + "."
+        )
+    if skipped_unknown:
+        notes.append(f"{len(skipped_unknown)} partite in programma saltate (squadre non presenti nello storico): {', '.join(skipped_unknown[:5])}" + (" ..." if len(skipped_unknown) > 5 else "") + ".")
 
     value_engine = ValueEngine(min_ev=min_ev, kelly=KellyConfig(fraction=kelly_fraction, bankroll_units=bankroll_units))
-    traps = detect_regression_traps(
-        matches,
-        window=value_engine.trap_window,
-        max_goals_against=value_engine.trap_max_goals_against,
-        min_xg_against=value_engine.trap_min_xg_against,
-    )
-    opportunities = value_engine.evaluate(predictions, quotes, matches=matches, traps=traps)
+    traps = [
+        t
+        for t in detect_regression_traps(
+            current,
+            window=value_engine.trap_window,
+            max_goals_against=value_engine.trap_max_goals_against,
+            min_xg_against=value_engine.trap_min_xg_against,
+        )
+        if params.is_current(t.team)
+    ] if not current.empty else []
+    opportunities = value_engine.evaluate(predictions, quotes, matches=current, traps=traps)
     n_value = sum(1 for o in opportunities if o.value)
     n_trap_flags = sum(1 for o in opportunities if o.is_trap)
     notes.append(
         f"Motore valore: {len(opportunities)} selezioni valutate, {n_value} sopra soglia EV {min_ev:.1%}, "
-        f"Kelly x{kelly_fraction:g} su {bankroll_units:g} unità, {len(traps)} squadre in trappola di regressione, "
-        f"{n_trap_flags} selezioni Over/GG segnalate."
+        f"Kelly x{kelly_fraction:g} su {bankroll_units:g} unità, {len(traps)} squadre in trappola di regressione "
+        f"(stagione {season_label}), {n_trap_flags} selezioni Over/GG segnalate."
     )
     notes.append(f"Pipeline completata in {time.perf_counter() - started:.2f} s.")
     return PipelineState(
@@ -505,6 +863,11 @@ def build_state(
         source=source,
         built_at=datetime.now(UTC),
         notes=notes,
+        registry=reg,
+        season_label=season_label,
+        current_matches=current,
+        history_matches=history,
+        skipped_fixtures=skipped_season + skipped_historical + skipped_unknown,
     )
 
 
@@ -518,8 +881,10 @@ def _as_girone(girone: Girone | str | None) -> Girone | None:
 def ranking_table(state: PipelineState, girone: Girone | None) -> pd.DataFrame:
     """Strength ranking (alpha desc) with Italian labels, rounded to 3 decimals.
 
-    ``girone=None`` returns every fitted team; a girone with no fitted teams
-    yields an empty frame with the same columns instead of raising.
+    Only the current teams of the perimeter are listed and ``Girone`` is their
+    registry girone (historical opponents never appear). ``girone=None`` returns
+    every current team; a girone with no fitted teams yields an empty frame with
+    the same columns instead of raising.
     """
     g = _as_girone(girone)
     if g is not None and g not in state.params.teams_by_girone:

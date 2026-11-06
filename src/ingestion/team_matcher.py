@@ -24,6 +24,19 @@ A score of 100 can only come from the exact or alias steps.
 When ``thefuzz`` is not importable the module falls back to a
 :mod:`difflib`-based scorer (``DIFFLIB_FALLBACK`` is then ``True``); the flag
 is consulted on every lookup so tests can exercise both code paths.
+
+Current and historical teams
+----------------------------
+The canonical names of ``registry.teams_by_girone`` are the **current** teams
+(the season perimeter). A registry built with
+:meth:`~src.common.teams.TeamRegistry.with_historical_aliases` also carries the
+spellings of clubs that only played in previous seasons; those resolve to their
+old canonical spelling (``"Ternana Calcio"`` -> ``"Ternana"``), which the matcher
+reports in :attr:`TeamMatcher.historical_names`. Historical teams belong to no
+current girone: a lookup restricted to a girone only ever returns a team of that
+girone's current composition, while an unrestricted lookup (``girone=None``, the
+mode used for past seasons, where clubs may since have changed girone or left
+the league) can return current and historical teams alike.
 """
 from __future__ import annotations
 
@@ -194,6 +207,11 @@ class TeamMatcher:
         lower of the two, capped at :data:`MAX_FUZZY_SCORE`.
 
     Results are memoised per ``(normalised name, girone)``.
+
+    Canonical names reachable through the alias table that are not part of
+    ``registry.teams_by_girone`` (plus ``registry.historical_names`` when the
+    registry provides it) are *historical*: they are returned by unrestricted
+    lookups only, see :attr:`historical_names`.
     """
 
     def __init__(
@@ -214,7 +232,21 @@ class TeamMatcher:
         self.scorer_name = scorer
         self._scorer_fn: Scorer | None = _resolve_scorer(scorer)
         self._alias_table: dict[str, str] = dict(registry.alias_table())
-        self._canonical_by_norm: dict[str, str] = {normalize_name(c): c for c in registry.canonical_names}
+        current = tuple(registry.canonical_names)
+        current_set = frozenset(current)
+        declared = tuple(getattr(registry, "historical_names", ()) or ())
+        self._historical: frozenset[str] = frozenset(
+            name for name in (*declared, *self._alias_table.values()) if name not in current_set
+        )
+        self._current: frozenset[str] = current_set
+        # Exact step: the normalised canonical spelling of every current team plus the
+        # identity entries (normalised old canonical -> old canonical) of historical ones.
+        self._canonical_by_norm: dict[str, str] = {
+            key: canonical
+            for key, canonical in self._alias_table.items()
+            if canonical in self._historical and normalize_name(canonical) == key
+        }
+        self._canonical_by_norm.update({normalize_name(c): c for c in current})
         self._girone_of: dict[str, Girone] = {
             canonical: girone for girone, teams in registry.teams_by_girone.items() for canonical in teams
         }
@@ -227,7 +259,29 @@ class TeamMatcher:
 
     # ------------------------------------------------------------------ helpers
     def _in_girone(self, canonical: str, girone: Girone | None) -> bool:
+        """``True`` when ``canonical`` may be returned for a lookup restricted to ``girone``.
+
+        Historical teams have no current girone, so they pass only unrestricted lookups.
+        """
         return girone is None or self._girone_of.get(canonical) == girone
+
+    @property
+    def current_names(self) -> frozenset[str]:
+        """Canonical names of the current composition (the season perimeter)."""
+        return self._current
+
+    @property
+    def historical_names(self) -> frozenset[str]:
+        """Canonical names known only from previous seasons (never part of a current girone)."""
+        return self._historical
+
+    def is_historical(self, canonical: str) -> bool:
+        """``True`` when ``canonical`` is a historical team (see :attr:`historical_names`)."""
+        return canonical in self._historical
+
+    def is_current(self, canonical: str) -> bool:
+        """``True`` when ``canonical`` is a team of the current composition."""
+        return canonical in self._current
 
     def _extract(self, query: str, keys: Sequence[str], limit: int) -> list[tuple[str, int]]:
         """Rank alias keys for ``query`` with thefuzz or, when unavailable, difflib."""
@@ -285,7 +339,12 @@ class TeamMatcher:
 
     # ------------------------------------------------------------------- public
     def match(self, name: str, girone: Girone | str | None = None) -> MatchResult:
-        """Resolve ``name`` to a canonical team of ``girone`` (or of any girone)."""
+        """Resolve ``name`` to a canonical team.
+
+        With ``girone`` the answer is restricted to that girone's *current*
+        composition; with ``girone=None`` every known team qualifies, historical
+        ones included (use it for events of past seasons).
+        """
         g = Girone.parse(girone) if girone is not None else None
         query = "" if name is None else str(name)
         norm = normalize_name(query) if query.strip() else ""

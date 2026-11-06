@@ -13,6 +13,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from datetime import date
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -211,11 +212,15 @@ def test_load_odds_quotes_skips_invalid_groups(tmp_path: Path) -> None:
 def test_ranking_table_labels_and_counts(sim_state: PipelineState) -> None:
     full = ranking_table(sim_state, None)
     assert list(full.columns) == list(RANKING_COLUMNS)
-    assert len(full) == len(sim_state.params.teams)
+    # only the 60 current teams are ranked; the historical opponents of the synthetic past seasons are fitted but hidden
+    assert len(full) == len(sim_state.params.current_teams) == 60 < len(sim_state.params.teams)
+    assert not set(full["Squadra"]) & set(sim_state.params.historical_teams)
+    current_by_girone = sim_state.params.current_teams_by_girone()
     for g in Girone:
         table = ranking_table(sim_state, g)
         assert list(table.columns) == list(RANKING_COLUMNS)
-        assert len(table) == len(sim_state.params.teams_by_girone[g]) == 20
+        assert len(table) == len(current_by_girone[g]) == 20
+        assert set(table["Squadra"]) == set(sim_state.registry.teams(g)), "Girone = girone del dizionario 2026/27"
         assert set(table["Girone"]) == {g.value}
         alphas = table["Forza Offensiva (α)"].to_numpy()
         assert np.all(np.diff(alphas) <= 1e-9), "sorted by alpha descending"
@@ -419,6 +424,11 @@ def test_app_renders_with_apptest(monkeypatch: pytest.MonkeyPatch) -> None:
     assert [tab.label for tab in at.tabs] == ["Classifica Forza", "Match & Heatmap", "Opportunità di Valore", "Export"]
     assert len(at.get("download_button")) >= 1
     assert any("Dati simulati" in i.value for i in at.sidebar.info)
+    # the badge and the subtitle state the perimeter: season, teams, current-season vs historical matches
+    perimeter = "Stagione 2026/27 · 60 squadre · 240 partite stagione corrente · 2280 partite storiche (2024/25-2025/26)"
+    assert any(perimeter in i.value for i in at.sidebar.info)
+    assert any(perimeter in c.value for c in at.caption)
+    assert any("squadre storiche escluse" in i.value for i in at.sidebar.info)
     assert at.metric, "the match tab shows the metrics row"
     assert any("EV = P_modello" in c.value for c in at.caption)
 
@@ -489,7 +499,8 @@ def test_build_state_clamps_full_season_rounds() -> None:
     assert MIN_SIM_ROUNDS == 1
     state = build_state(simulate=True, seed=3, xi=0.0, n_rounds=50)
     assert state.source == "simulated"
-    assert state.n_matches == upper * 30  # 3 gironi x 10 matches per round
+    assert state.n_current_matches == upper * 30  # 3 gironi x 10 matches per round
+    assert state.n_matches == state.n_current_matches + state.n_history_matches
     assert len(state.fixtures) == 30 and len(state.predictions) == 30
     assert state.quotes and state.opportunities, "the synthetic bookmaker still quotes the last round"
     assert state.traps and any(o.is_trap for o in state.opportunities), "the trap is still injected"
@@ -499,9 +510,9 @@ def test_build_state_clamps_full_season_rounds() -> None:
     plain = build_state(simulate=True, seed=3, xi=0.0, n_rounds=upper)
     assert plain.n_matches == state.n_matches
     assert not any("limitato a" in n for n in plain.notes)
-    # the lower bound is valid too: one played round, prior on, next round predicted
+    # the lower bound is valid too: one played round, prior on (history does not count as coverage), next round predicted
     tiny = build_state(simulate=True, seed=3, xi=0.0, n_rounds=MIN_SIM_ROUNDS)
-    assert tiny.n_matches == 30 and len(tiny.predictions) == 30 and tiny.prior_enabled
+    assert tiny.n_current_matches == 30 and tiny.n_history_matches > 0 and len(tiny.predictions) == 30 and tiny.prior_enabled
 
 
 def test_no_odds_message_is_source_aware(sim_state: PipelineState) -> None:
@@ -552,6 +563,7 @@ def test_app_survives_out_of_range_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("SERIEC_FORCE_SIMULATE", "1")
     monkeypatch.setenv("SERIEC_SEED", "-1")  # negative seed -> default seed, no crash
     monkeypatch.setenv("SERIEC_SIM_ROUNDS", "99")  # full season -> clamped, fixtures still present
+    monkeypatch.setenv("SERIEC_AS_OF", "2026-11-06")  # deterministic calendar position
     at = AppTest.from_file(str(APP_PATH), default_timeout=240)
     at.run()
     assert not at.exception, [e.value for e in at.exception]
@@ -562,12 +574,21 @@ def test_app_survives_out_of_range_env(monkeypatch: pytest.MonkeyPatch) -> None:
     assert any("limitato a 37" in m.value for m in at.markdown), "the clamp is reported in 'Dettagli pipeline'"
     assert not any("aggiungi file CSV" in i.value for i in at.info)
 
-    monkeypatch.setenv("SERIEC_SIM_ROUNDS", "0")  # below the minimum -> default rounds
+    monkeypatch.setenv("SERIEC_SIM_ROUNDS", "0")  # below the minimum -> ignored, calendar as of SERIEC_AS_OF
     monkeypatch.setenv("SERIEC_SEED", "abc")  # not an integer -> default seed
+    monkeypatch.setenv("SERIEC_HISTORY", "7")  # out of range -> default (2 synthetic seasons)
     at.run()
     assert not at.exception, [e.value for e in at.exception]
     assert len(at.selectbox(key="fixture").options) == 30
-    assert any("seed=7, 15 giornate giocate" in m.value for m in at.markdown)
+    assert any("seed=7, 11 giornate giocate" in m.value for m in at.markdown)  # 2026-08-23 .. 2026-11-01 played
+    assert any("Stagione 2026/27 · 60 squadre · 330 partite stagione corrente · 2280 partite storiche (2024/25-2025/26)" in i.value for i in at.sidebar.info)
+
+    monkeypatch.setenv("SERIEC_AS_OF", "not-a-date")  # unparseable -> today, page still renders
+    monkeypatch.setenv("SERIEC_SEASON", "1999_00")  # unknown season file -> default 2026/27
+    monkeypatch.setenv("SERIEC_HISTORY", "0")
+    at.run()
+    assert not at.exception, [e.value for e in at.exception]
+    assert any("Stagione 2026/27 · 60 squadre" in i.value and "0 partite storiche" in i.value for i in at.sidebar.info)
 
 
 def test_app_heatmap_renders_complete_matrix(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -603,3 +624,61 @@ def test_app_heatmap_renders_complete_matrix(monkeypatch: pytest.MonkeyPatch) ->
     assert np.isclose(z6[6, 6], z[6:, 6:].sum()) and np.allclose(z6[6, :6], z[6:, :6].sum(axis=0))
     assert list(layout6["xaxis"]["ticktext"]) == ["0", "1", "2", "3", "4", "5", "6+"]
     assert any("(6+)" in c.value and "100%" in c.value for c in at.caption)
+
+
+def test_app_non_default_season_renders_on_its_own_calendar(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Regression: ``SERIEC_SEASON=2025_26`` (a documented value) crashed the page with 'HISTORICAL_TEAMS pool
+    exhausted' and, had it not, would have simulated the 2025/26 perimeter on the 2026/27 calendar."""
+    from streamlit.testing.v1 import AppTest
+
+    monkeypatch.setenv("SERIEC_FORCE_SIMULATE", "1")
+    monkeypatch.setenv("SERIEC_SEASON", "2025_26")
+    monkeypatch.setenv("SERIEC_AS_OF", "2025-11-06")
+    at = AppTest.from_file(str(APP_PATH), default_timeout=240)
+    at.run()
+    assert not at.exception, [e.value for e in at.exception]
+    assert not at.error, [e.value for e in at.error]
+    perimeter = "Stagione 2025/26 · 60 squadre · 330 partite stagione corrente · 2280 partite storiche (2023/24-2024/25)"
+    assert any(perimeter in i.value for i in at.sidebar.info)
+    options = at.selectbox(key="fixture").options
+    assert len(options) == 30 and all("2025-11-09" in o for o in options)
+    assert any("Calendario simulato al 2025-11-06" in m.value for m in at.markdown)
+    assert any("Storica 1" in m.value or "Caldiero Terme" in m.value for m in at.markdown), "the padded history is reported"
+
+
+def test_app_resolves_today_on_every_run_and_survives_a_pipeline_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Regression: without ``SERIEC_AS_OF`` the cache key was ``as_of=None`` and ``date.today()`` was evaluated once
+    inside the cached state, so the calendar position never advanced while the server ran. The app now resolves
+    today itself and passes it down; a ``ValueError`` from the data layer shows an error and falls back to the
+    default season instead of crashing the page."""
+    import src.dashboard.state as state_module
+    from streamlit.testing.v1 import AppTest
+
+    original = state_module.build_state
+    received: list[date | None] = []
+
+    def recording_build_state(**kwargs):
+        received.append(kwargs.get("as_of"))
+        if kwargs.get("n_rounds") == 5:
+            raise ValueError("configurazione rifiutata (test)")
+        return original(**kwargs)
+
+    monkeypatch.setattr(state_module, "build_state", recording_build_state)
+    monkeypatch.setenv("SERIEC_FORCE_SIMULATE", "1")
+    monkeypatch.setenv("SERIEC_SEED", "11")  # a seed no other test uses: the cache cannot answer for us
+    monkeypatch.delenv("SERIEC_AS_OF", raising=False)
+    monkeypatch.delenv("SERIEC_SIM_ROUNDS", raising=False)
+    at = AppTest.from_file(str(APP_PATH), default_timeout=240)
+    at.run()
+    assert not at.exception, [e.value for e in at.exception]
+    assert received and received[-1] == date.today(), "today is resolved by the app and is part of the cache key"
+    assert any(f"Calendario simulato al {date.today().isoformat()}" in m.value for m in at.markdown)
+
+    received.clear()
+    monkeypatch.setenv("SERIEC_SIM_ROUNDS", "5")  # the wrapper refuses this combination
+    at.run()
+    assert not at.exception, [e.value for e in at.exception]
+    assert any("Pipeline non eseguibile con i parametri richiesti" in e.value and "stagione 2026/27" in e.value for e in at.error)
+    assert received and received[0] == date.today()  # the refused call (the fallback may be served by the cache)
+    assert any("Stagione 2026/27 · 60 squadre" in i.value for i in at.sidebar.info)
+    assert at.metric, "the fallback state renders the match tab"

@@ -1,4 +1,11 @@
-"""Offline tests for :mod:`src.ingestion.harvester` (mock transports, no sleeping)."""
+"""Offline tests for :mod:`src.ingestion.harvester` (mock transports, no sleeping).
+
+The girone A fixtures are 2025/26 SofaScore payloads: the single-season tests use
+the 2025/26 dictionary (``LEGACY_SEASON``) as their perimeter so they do not depend
+on :data:`src.common.teams.DEFAULT_SEASON`. The multi-season tests (girone B, four
+listed seasons) use the current 2026/27 perimeter with the 2025/26 aliases merged
+in, the configuration the CLI runs with by default.
+"""
 from __future__ import annotations
 
 import asyncio
@@ -9,6 +16,7 @@ import logging
 import random
 import re
 import shutil
+from collections import Counter
 from collections.abc import Callable
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -18,8 +26,8 @@ import httpx
 import pandas as pd
 import pytest
 
-from src.common.schemas import MATCH_COLUMNS, MATCH_DTYPES, Fixture, Girone, MatchRecord
-from src.common.teams import TeamRegistry, load_registry
+from src.common.schemas import MATCH_COLUMNS, MATCH_DTYPES, Fixture, Girone, MatchRecord, season_of
+from src.common.teams import DEFAULT_SEASON, TeamRegistry, load_registry
 from src.ingestion import harvester as hv
 from src.ingestion.harvester import (
     DEFAULT_USER_AGENTS,
@@ -33,17 +41,21 @@ from src.ingestion.harvester import (
     NotFoundError,
     RateLimitedError,
     RawCache,
+    SeasonHarvest,
     SeasonInfo,
     SofaScoreProvider,
     load_endpoints,
     parse_retry_after,
     parse_stat_value,
+    season_label_from_year,
 )
 from src.ingestion.team_matcher import TeamMatcher
 
 FIXTURES = Path(__file__).parent / "fixtures" / "sofascore"
 SEASON_ID = 77030
 TOURNAMENT_A = 141
+LEGACY_SEASON = "2025_26"  # dictionary matching the girone A fixture payloads
+CURRENT_SEASON = "2026_27"  # the perimeter (DEFAULT_SEASON)
 BROKEN_STATS_EVENT = 13579103  # statistics endpoint answers 500 every time
 MISSING_STATS_EVENT = 13579113  # statistics endpoint answers 404
 UTC = timezone.utc
@@ -120,6 +132,20 @@ def sofascore_router(request: httpx.Request) -> httpx.Response:
     return json_response({"error": {"code": 404, "message": f"no route for {path}"}}, status=404)
 
 
+@pytest.fixture(autouse=True)
+def _restore_root_logging() -> Any:
+    """``hv.main`` reconfigures the root logger onto the captured stderr of its test;
+    put the previous handlers back so later tests do not log to a closed stream."""
+    root = logging.getLogger()
+    handlers, level = list(root.handlers), root.level
+    yield
+    for handler in list(root.handlers):
+        root.removeHandler(handler)
+    for handler in handlers:
+        root.addHandler(handler)
+    root.setLevel(level)
+
+
 @pytest.fixture
 def http_cfg() -> HttpConfig:
     return HttpConfig(
@@ -135,12 +161,17 @@ def http_cfg() -> HttpConfig:
 
 @pytest.fixture(scope="module")
 def registry() -> TeamRegistry:
-    return load_registry()
+    return load_registry(LEGACY_SEASON)
 
 
 @pytest.fixture(scope="module")
 def matcher(registry: TeamRegistry) -> TeamMatcher:
     return TeamMatcher(registry)
+
+
+@pytest.fixture(scope="module")
+def current_registry() -> TeamRegistry:
+    return load_registry(CURRENT_SEASON)
 
 
 def make_client(
@@ -865,7 +896,7 @@ async def test_harvester_harvest_all_dataframe_contract(tmp_path: Path, registry
     harvester = Harvester(
         endpoints=cfg, registry=registry, cache_dir=tmp_path / "raw", transport=transport, sleeper=RecordingSleeper(), rng=random.Random(3)
     )
-    result = await harvester.harvest_all([Girone.A])
+    result = await harvester.harvest_all([Girone.A], seasons=1)
     assert isinstance(result, HarvestResult)
     df = result.matches
     assert list(df.columns) == list(MATCH_COLUMNS)
@@ -888,16 +919,25 @@ async def test_harvester_harvest_all_dataframe_contract(tmp_path: Path, registry
     assert set(result.stats) == {"requests", "retries", "cache_hits", "errors"}
     assert result.stats["retries"] == cfg.http.max_retries and result.stats["cache_hits"] == 0
     assert "matches=5" in result.summary()
+    # Season bookkeeping of a single-season harvest on its own perimeter.
+    assert result.seasons == ("2025/26",) and result.n_matches_by_season == {"2025/26": 5}
+    assert result.registry_season == "2025/26" == result.perimeter_season
+    assert result.n_historical_matches == 0 and result.historical_teams == ()
+    assert result.season_lines() == ["  2025/26: 5 matches (perimeter)"]
+    assert "season=2025/26 seasons=2025/26 historical_matches=0" in result.summary()
 
     # Second run on the same cache directory: only the uncacheable failures hit the transport again.
     before = transport.calls
     second = Harvester(endpoints=cfg, registry=registry, cache_dir=tmp_path / "raw", transport=transport, sleeper=RecordingSleeper())
-    again = await second.harvest_all([Girone.A], with_stats=True)
+    again = await second.harvest_all([Girone.A], seasons=1, with_stats=True)
     assert transport.calls - before == (cfg.http.max_retries + 1) + 1
     assert again.stats["cache_hits"] == 2 + 3 + 3
     pd.testing.assert_frame_equal(again.matches, df)
 
-    assert (await Harvester(endpoints=cfg, registry=registry, cache_dir=tmp_path / "raw", transport=transport).harvest_all([])).matches.empty
+    empty = await Harvester(endpoints=cfg, registry=registry, cache_dir=tmp_path / "raw", transport=transport).harvest_all([], seasons=1)
+    assert empty.matches.empty and empty.seasons == () and empty.n_matches_by_season == {} and empty.perimeter_season == "2025/26"
+    with pytest.raises(ValueError, match="seasons"):
+        await Harvester(endpoints=cfg, registry=registry, cache_dir=tmp_path / "raw", transport=transport).harvest_all([Girone.A], seasons=0)
 
 
 @pytest.mark.asyncio
@@ -976,6 +1016,7 @@ def test_save_and_load_fixtures_round_trip(tmp_path: Path) -> None:
 def test_cli_parser_defaults() -> None:
     args = hv._build_parser().parse_args([])
     assert args.gironi == ["A", "B", "C"] and args.season_id is None and args.no_stats is False
+    assert args.seasons == 3 and args.season == DEFAULT_SEASON == CURRENT_SEASON
     assert args.out == hv.PROCESSED_DIR / "matches.csv" and args.fixtures_out == hv.PROCESSED_DIR / "fixtures.csv"
     custom = hv._build_parser().parse_args(["--gironi", "A", "C", "--season-id", "77030", "--no-stats", "--log-json", "--providers", "fotmob", "sofascore"])
     assert custom.gironi == ["A", "C"] and custom.season_id == 77030 and custom.no_stats and custom.log_json
@@ -985,8 +1026,8 @@ def test_cli_parser_defaults() -> None:
 def test_cli_main_writes_outputs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
     seen: dict[str, Any] = {}
 
-    async def fake_harvest_all(self: Harvester, gironi, *, season_id=None, with_stats=True) -> HarvestResult:
-        seen.update(gironi=list(gironi), season_id=season_id, with_stats=with_stats, providers=self.providers)
+    async def fake_harvest_all(self: Harvester, gironi, *, season_id=None, seasons=3, with_stats=True) -> HarvestResult:
+        seen.update(gironi=list(gironi), season_id=season_id, seasons=seasons, with_stats=with_stats, providers=self.providers)
         matches = hv.matches_to_frame([MatchRecord("SS-1", date(2025, 8, 23), 1, Girone.A, "Pro Vercelli", "Vicenza", 0, 2)])
         return HarvestResult(
             matches=matches,
@@ -1003,7 +1044,7 @@ def test_cli_main_writes_outputs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
         ["--gironi", "A", "--season-id", "77030", "--out", str(out), "--fixtures-out", str(fixtures_out), "--no-stats", "--cache-dir", str(tmp_path / "raw")]
     )
     assert code == 0
-    assert seen == {"gironi": [Girone.A], "season_id": 77030, "with_stats": False, "providers": ("sofascore",)}
+    assert seen == {"gironi": [Girone.A], "season_id": 77030, "seasons": 3, "with_stats": False, "providers": ("sofascore",)}
     assert Harvester.load_processed(out)["match_id"].tolist() == ["SS-1"]
     assert Harvester.load_fixtures(fixtures_out)[0].match_id == "SS-2"
     printed = capsys.readouterr().out
@@ -1107,7 +1148,7 @@ async def test_cache_read_failure_falls_back_to_network(
 ) -> None:
     cache = RawCache(tmp_path)
 
-    def unreadable(url: str, params: Any = None) -> Any:
+    def unreadable(url: str, params: Any = None, *, stable: bool = False) -> Any:
         raise PermissionError(13, "Permission denied", str(tmp_path))
 
     monkeypatch.setattr(cache, "get", unreadable)
@@ -1138,7 +1179,7 @@ async def test_sofascore_harvest_treats_no_rounds_as_failure(http_cfg: HttpConfi
 
 
 def _fake_harvest_all(matches: pd.DataFrame, failures: dict[str, str]) -> Callable[..., Any]:
-    async def fake(self: Harvester, gironi, *, season_id=None, with_stats=True) -> HarvestResult:
+    async def fake(self: Harvester, gironi, *, season_id=None, seasons=3, with_stats=True) -> HarvestResult:
         return HarvestResult(
             matches=matches,
             fixtures=[Fixture("SS-9", date(2025, 9, 6), 3, Girone.A, "AlbinoLeffe", "Lumezzane")],
@@ -1321,3 +1362,528 @@ def test_load_fixtures_dedupes_by_match_id_keeps_first_and_warns(tmp_path: Path,
         clean = Harvester.load_fixtures(Harvester.save_fixtures([first, second], tmp_path / "clean.csv"))
     assert clean == [first, second]
     assert not [r for r in caplog.records if "duplicate fixtures" in r.getMessage()]
+
+
+# ============================================================================ multi-season (girone B, 2026/27 perimeter)
+TOURNAMENT_B = 142
+SEASON_B_2627, SEASON_B_2526, SEASON_B_2425, SEASON_B_2324 = 88031, 77031, 63516, 52885
+SEASON_B_NAMES = {SEASON_B_2627: "26/27", SEASON_B_2526: "25/26", SEASON_B_2425: "24/25", SEASON_B_2324: "23/24"}
+MULTI_ROUNDS: dict[int, dict[str, Any]] = {
+    SEASON_B_2627: {"currentRound": {"round": 2}, "rounds": [{"round": 1}, {"round": 2}, {"round": 3}]},
+    SEASON_B_2526: {
+        "currentRound": {"round": 38},
+        "rounds": [{"round": 1}, {"round": 2}, {"round": 39, "name": "Playoff Round 1", "slug": "playoff-round-1", "prefix": "Playoff"}],
+    },
+    SEASON_B_2425: {"currentRound": {"round": 38}, "rounds": [{"round": 1}]},
+    # 2023/24 deliberately has no rounds payload: the router answers 404 for it.
+}
+
+
+def _ts(iso: str) -> int:
+    return int(datetime.fromisoformat(iso).replace(tzinfo=UTC).timestamp())
+
+
+def make_event(
+    event_id: int,
+    season_id: int,
+    round_no: int,
+    home: str,
+    away: str,
+    when: str,
+    *,
+    status: str = "finished",
+    score: tuple[int, int] = (1, 0),
+) -> dict[str, Any]:
+    """A SofaScore event of girone B shaped like the real payload."""
+    year = SEASON_B_NAMES[season_id]
+    finished = status == "finished"
+    return {
+        "tournament": {"name": "Serie C, Girone B", "uniqueTournament": {"name": "Serie C, Girone B", "id": TOURNAMENT_B}, "id": TOURNAMENT_B},
+        "season": {"name": f"Serie C, Girone B {year}", "year": year, "id": season_id},
+        "roundInfo": {"round": round_no},
+        "status": {"code": 100 if finished else 0, "description": "Ended" if finished else "Not started", "type": status},
+        "homeTeam": {"name": home, "shortName": home, "id": 1000 + event_id % 997},
+        "awayTeam": {"name": away, "shortName": away, "id": 2000 + event_id % 991},
+        "homeScore": {"current": score[0], "display": score[0]} if finished else {},
+        "awayScore": {"current": score[1], "display": score[1]} if finished else {},
+        "id": event_id,
+        "startTimestamp": _ts(when),
+    }
+
+
+MULTI_EVENTS: dict[tuple[int, int], list[dict[str, Any]]] = {
+    # current season: current teams only (Pescara, Spezia, Atalanta U23 and Latina joined girone B in 2026/27)
+    (SEASON_B_2627, 1): [
+        make_event(90001, SEASON_B_2627, 1, "Perugia", "Ravenna", "2026-08-23T18:30:00", score=(2, 1)),
+        make_event(90002, SEASON_B_2627, 1, "Delfino Pescara", "Spezia Calcio", "2026-08-23T20:45:00", score=(0, 0)),
+    ],
+    (SEASON_B_2627, 2): [
+        make_event(90011, SEASON_B_2627, 2, "Atalanta U23", "Latina Calcio 1932", "2026-08-30T15:00:00", score=(1, 3)),
+        make_event(90012, SEASON_B_2627, 2, "Forlì", "Gubbio", "2026-11-18T18:30:00", status="notstarted"),  # postponed
+    ],
+    (SEASON_B_2627, 3): [
+        make_event(90021, SEASON_B_2627, 3, "Torres", "Vis Pesaro", "2026-11-08T15:00:00", status="notstarted"),
+        make_event(90022, SEASON_B_2627, 3, "Livorno", "Grosseto", "2026-11-08T17:30:00", status="notstarted"),
+    ],
+    # 2025/26: Ternana / Arezzo / Rimini left Serie C B, Juventus Next Gen and Carpi moved to girone A
+    (SEASON_B_2526, 1): [
+        make_event(80001, SEASON_B_2526, 1, "Ternana Calcio", "Juventus U23", "2025-08-24T18:30:00", score=(2, 0)),
+        make_event(80002, SEASON_B_2526, 1, "Arezzo", "Carpi FC", "2025-08-24T20:45:00", score=(1, 1)),
+    ],
+    (SEASON_B_2526, 2): [
+        make_event(80011, SEASON_B_2526, 2, "Rimini", "Perugia", "2025-08-31T15:00:00", score=(0, 1)),
+        # never played (excluded club): a not-started event of a PAST season must not become a fixture
+        make_event(80012, SEASON_B_2526, 2, "Pontedera", "Ascoli Calcio", "2025-08-31T15:00:00", status="notstarted"),
+    ],
+    # 2024/25: SPAL is in no dictionary (unmapped), Pontedera is historical, Pescara is current
+    (SEASON_B_2425, 1): [
+        make_event(70001, SEASON_B_2425, 1, "Ternana Calcio", "Pescara", "2024-08-25T18:30:00", score=(3, 1)),
+        make_event(70002, SEASON_B_2425, 1, "SPAL", "Pontedera", "2024-08-25T20:45:00", score=(1, 0)),
+    ],
+}
+
+
+def multi_season_router(request: httpx.Request) -> httpx.Response:
+    """Girone B with four listed seasons; the oldest one has no rounds payload (404)."""
+    path = request.url.path
+    if path == f"/api/v1/unique-tournament/{TOURNAMENT_B}/seasons":
+        return json_response(load_fixture("seasons_girone_b.json"))
+    found = re.fullmatch(rf"/api/v1/unique-tournament/{TOURNAMENT_B}/season/(\d+)/rounds", path)
+    if found:
+        payload = MULTI_ROUNDS.get(int(found.group(1)))
+        return json_response(payload) if payload is not None else json_response({"error": {"code": 404}}, status=404)
+    found = re.fullmatch(rf"/api/v1/unique-tournament/{TOURNAMENT_B}/season/(\d+)/events/round/(\d+)", path)
+    if found:
+        return json_response({"events": MULTI_EVENTS.get((int(found.group(1)), int(found.group(2))), [])})
+    if re.fullmatch(r"/api/v1/event/(\d+)/statistics", path):
+        return json_response({"error": {"code": 404}}, status=404)
+    return json_response({"error": {"code": 404, "message": f"no route for {path}"}}, status=404)
+
+
+def _season_requests(transport: CountingTransport, season_id: int) -> list[str]:
+    return [str(r.url) for r in transport.requests if f"/season/{season_id}/" in r.url.path]
+
+
+def test_season_label_helpers() -> None:
+    assert season_label_from_year("26/27") == "2026/27" and season_label_from_year("2026/27") == "2026/27"
+    assert season_label_from_year("2026_27") == "2026/27" and season_label_from_year("2026-2027") == "2026/27"
+    assert season_label_from_year("99/00") == "1999/00"
+    assert season_label_from_year("26/28") is None and season_label_from_year("Serie C") is None
+    assert season_label_from_year("") is None and season_label_from_year(None) is None
+    assert hv._sort_season_labels(["2024/25", "season 7", "2026/27", "2025/26", "2026/27"]) == ["2026/27", "2025/26", "2024/25", "season 7"]
+    assert hv._events_season_label([MULTI_EVENTS[(SEASON_B_2526, 1)], MULTI_EVENTS[(SEASON_B_2627, 1)][:1]]) == "2025/26"
+    assert hv._events_season_label([[{"id": 1}]]) is None
+    assert season_of(date(2026, 8, 23)) == "2026/27" and season_of(date(2026, 6, 30)) == "2025/26"
+
+
+def test_registry_with_history_merges_older_dictionaries(current_registry: TeamRegistry, tmp_path: Path) -> None:
+    merged = Harvester.registry_with_history(current_registry)
+    assert merged.canonical_names == current_registry.canonical_names  # perimeter unchanged
+    assert {"Ternana", "Vicenza", "Pro Patria", "Rimini"} <= set(merged.historical_names)
+    assert merged.exact("Ternana Calcio") == "Ternana" and merged.exact("Juventus U23") == "Juventus Next Gen"
+    legacy = Harvester.registry_with_history(load_registry(LEGACY_SEASON))
+    assert legacy.historical_names == ()  # nothing older than 2025/26 ships
+    synthetic = TeamRegistry.from_teams("test", {"A": ["Alpha", "Beta"]})
+    assert Harvester.registry_with_history(synthetic) is synthetic
+    assert Harvester.registry_with_history(current_registry, config_dir=tmp_path) is current_registry  # no older files there
+
+    cfg = load_endpoints()
+    by_season = Harvester(endpoints=cfg, season=CURRENT_SEASON, cache_dir=tmp_path)
+    assert by_season.registry.season_label == "2026/27" and "Ternana" in by_season.matcher.historical_names
+    plain = Harvester(endpoints=cfg, season=CURRENT_SEASON, cache_dir=tmp_path, historical_aliases=False)
+    assert plain.matcher.historical_names == frozenset()
+    default = Harvester(endpoints=cfg, cache_dir=tmp_path)
+    assert default.registry.season_label == "2026/27" == Harvester(endpoints=cfg, cache_dir=tmp_path, registry=current_registry).registry.season_label
+    with pytest.raises(FileNotFoundError):
+        Harvester(endpoints=cfg, season="1999_00", cache_dir=tmp_path)
+
+
+def test_parse_event_historical_lookup_is_unrestricted(current_registry: TeamRegistry) -> None:
+    matcher = TeamMatcher(Harvester.registry_with_history(current_registry))
+    event = MULTI_EVENTS[(SEASON_B_2526, 1)][0]  # Ternana Calcio v Juventus U23, listed under girone B
+    strict = SofaScoreProvider.parse_event(event, Girone.B, matcher)
+    assert isinstance(strict, MatchRecord)
+    assert (strict.home_team, strict.away_team) == ("Ternana Calcio", "Juventus U23")  # current composition of B knows neither
+    historical = SofaScoreProvider.parse_event(event, Girone.B, matcher, historical=True)
+    assert isinstance(historical, MatchRecord)
+    assert (historical.home_team, historical.away_team) == ("Ternana", "Juventus Next Gen")
+    assert historical.girone is Girone.B and historical.date == date(2025, 8, 24)  # the girone the match was played in
+
+
+@pytest.mark.asyncio
+async def test_harvest_all_three_seasons_on_current_registry(tmp_path: Path, current_registry: TeamRegistry) -> None:
+    cfg = load_endpoints()
+    transport = CountingTransport(multi_season_router)
+    harvester = Harvester(endpoints=cfg, registry=current_registry, cache_dir=tmp_path / "raw", transport=transport, sleeper=RecordingSleeper())
+    result = await harvester.harvest_all([Girone.B], seasons=3, with_stats=False)
+
+    # all three seasons were fetched, the fourth listed season was not touched
+    assert result.seasons == ("2026/27", "2025/26", "2024/25")
+    assert result.n_matches_by_season == {"2026/27": 3, "2025/26": 3, "2024/25": 2}
+    assert sum(result.n_matches_by_season.values()) == len(result.matches) == 8
+    assert all(_season_requests(transport, sid) for sid in (SEASON_B_2627, SEASON_B_2526, SEASON_B_2425))
+    assert _season_requests(transport, SEASON_B_2324) == []
+    assert transport.calls == 1 + 3 + 6  # seasons, rounds x3, events for 3 + 2 + 1 rounds
+    assert result.failures == {} and result.provider == "sofascore"
+
+    # fixtures only from the current (first) season: the 2025/26 not-started event is dropped
+    assert [f.match_id for f in result.fixtures] == ["SS-90012", "SS-90021", "SS-90022"]
+    assert all(season_of(f.date) == "2026/27" for f in result.fixtures)
+
+    # one frame, fixed schema, no season column; the season is a function of the date
+    df = result.matches
+    assert list(df.columns) == list(MATCH_COLUMNS) and df["match_id"].is_unique
+    assert df["girone"].unique().tolist() == ["B"]  # historical rows keep the girone they were played in
+    assert Counter(season_of(d) for d in df["date"]) == result.n_matches_by_season
+    teams = set(df["home_team"]) | set(df["away_team"])
+    assert {"Juventus Next Gen", "Carpi", "Pescara", "Latina", "Spezia", "Atalanta U23"} <= teams  # current names whatever the girone then
+    assert "Juventus U23" not in teams and "Delfino Pescara" not in teams
+
+    # perimeter bookkeeping
+    assert result.registry_season == "2026/27" == result.perimeter_season
+    assert result.n_historical_matches == 5
+    assert result.historical_teams == ("Arezzo", "Pontedera", "Rimini", "Ternana")  # Ascoli only in the dropped fixture
+    assert result.unmapped_teams == {"SPAL": 1}
+    assert set(result.historical_teams).isdisjoint(result.unmapped_teams)
+    assert result.season_lines() == [
+        "  2026/27: 3 matches (perimeter)",
+        "  2025/26: 3 matches (history)",
+        "  2024/25: 2 matches (history)",
+    ]
+    assert "season=2026/27 seasons=2026/27,2025/26,2024/25 historical_matches=5 historical_teams=4 unmapped_teams=1" in result.summary()
+
+    # seasons=1 restricts to the current season
+    only_current = await Harvester(
+        endpoints=cfg, registry=current_registry, cache_dir=tmp_path / "raw1", transport=CountingTransport(multi_season_router), sleeper=RecordingSleeper()
+    ).harvest_all([Girone.B], seasons=1, with_stats=False)
+    assert only_current.seasons == ("2026/27",) and len(only_current.matches) == 3 and only_current.n_historical_matches == 0
+    assert only_current.historical_teams == () and only_current.unmapped_teams == {}
+
+
+@pytest.mark.asyncio
+async def test_provider_harvest_seasons_structure_and_tuple_api(http_cfg: HttpConfig, current_registry: TeamRegistry) -> None:
+    matcher = TeamMatcher(Harvester.registry_with_history(current_registry))
+    client, transport, _ = make_client(multi_season_router, http_cfg)
+    provider = SofaScoreProvider(client, load_endpoints().sofascore, matcher)
+    async with client:
+        harvested = await provider.harvest_seasons(Girone.B, seasons=3, with_stats=False)
+        assert [type(item) for item in harvested] == [SeasonHarvest] * 3
+        assert [item.label for item in harvested] == ["2026/27", "2025/26", "2024/25"]
+        assert [item.season.id for item in harvested] == [SEASON_B_2627, SEASON_B_2526, SEASON_B_2425]
+        assert [item.current for item in harvested] == [True, False, False]
+        assert [item.historical for item in harvested] == [False, True, True]
+        assert [len(item.matches) for item in harvested] == [3, 3, 2] and [len(item.fixtures) for item in harvested] == [3, 0, 0]
+        assert [item.rounds for item in harvested] == [3, 2, 1] and all(item.error is None for item in harvested)
+
+        matches, fixtures = await provider.harvest("B", seasons=2, with_stats=False)
+        assert [m.match_id for m in matches] == ["SS-90001", "SS-90002", "SS-90011", "SS-80001", "SS-80002", "SS-80011"]
+        assert [f.match_id for f in fixtures] == ["SS-90012", "SS-90021", "SS-90022"]
+        single, _ = await provider.harvest(Girone.B, with_stats=False)  # default: one season, as before
+        assert [m.match_id for m in single] == ["SS-90001", "SS-90002", "SS-90011"]
+        with pytest.raises(ValueError, match="seasons"):
+            await provider.harvest_seasons(Girone.B, seasons=0)
+
+
+@pytest.mark.asyncio
+async def test_pinned_past_season_is_historical_relative_to_the_perimeter(
+    http_cfg: HttpConfig, tmp_path: Path, current_registry: TeamRegistry
+) -> None:
+    matcher = TeamMatcher(Harvester.registry_with_history(current_registry))
+    client, transport, _ = make_client(multi_season_router, http_cfg)
+    provider = SofaScoreProvider(client, load_endpoints().sofascore, matcher)
+    async with client:
+        [item] = await provider.harvest_seasons(Girone.B, season_id=SEASON_B_2526, seasons=3, with_stats=False)
+    assert item.label == "2025/26" and item.season == SeasonInfo(SEASON_B_2526, "", "")  # label from the match dates
+    assert item.current and item.historical  # first (only) season of the run, yet outside the 2026/27 perimeter
+    assert {m.home_team for m in item.matches} == {"Ternana", "Arezzo", "Rimini"}
+    assert [f.match_id for f in item.fixtures] == ["SS-80012"]  # pinned season: its not-started events are the fixtures
+    assert item.fixtures[0].home_team == "Pontedera" and item.fixtures[0].away_team == "Ascoli"
+    assert not any(r.url.path.endswith("/seasons") for r in transport.requests)  # no seasons call when pinned
+
+    harvester = Harvester(
+        endpoints=load_endpoints(), registry=current_registry, cache_dir=tmp_path / "raw", transport=CountingTransport(multi_season_router), sleeper=RecordingSleeper()
+    )
+    result = await harvester.harvest_all([Girone.B], season_id=SEASON_B_2526, with_stats=False)
+    assert result.seasons == ("2025/26",) and result.registry_season == "2026/27"
+    assert result.n_historical_matches == 3 == len(result.matches)  # everything is history for the perimeter
+    assert result.historical_teams == ("Arezzo", "Ascoli", "Pontedera", "Rimini", "Ternana")
+
+
+@pytest.mark.asyncio
+async def test_more_seasons_than_available_records_the_failure(
+    http_cfg: HttpConfig, tmp_path: Path, current_registry: TeamRegistry, caplog: pytest.LogCaptureFixture
+) -> None:
+    matcher = TeamMatcher(Harvester.registry_with_history(current_registry))
+    client, transport, _ = make_client(multi_season_router, http_cfg)
+    provider = SofaScoreProvider(client, load_endpoints().sofascore, matcher)
+    with caplog.at_level(logging.WARNING, logger="src.ingestion.harvester"):
+        async with client:
+            harvested = await provider.harvest_seasons(Girone.B, seasons=5, with_stats=False)
+            with pytest.raises(NotFoundError):  # the tuple API is strict
+                await provider.harvest(Girone.B, seasons=5, with_stats=False)
+    assert [item.label for item in harvested] == ["2026/27", "2025/26", "2024/25", "2023/24"]
+    failed = harvested[-1]
+    assert failed.error and "404" in failed.error and failed.matches == () and failed.historical and not failed.current
+    assert any(r.getMessage() == "fewer seasons available than requested" and r.requested == 5 and r.available == 4 for r in caplog.records)
+    assert any(r.getMessage() == "historical season failed, skipped" and r.season == "2023/24" for r in caplog.records)
+
+    harvester = Harvester(endpoints=load_endpoints(), registry=current_registry, cache_dir=tmp_path, transport=CountingTransport(multi_season_router), sleeper=RecordingSleeper())
+    result = await harvester.harvest_all([Girone.B], seasons=4, with_stats=False)
+    assert len(result.matches) == 8 and result.seasons == ("2026/27", "2025/26", "2024/25", "2023/24")
+    assert result.n_matches_by_season["2023/24"] == 0 and sum(result.n_matches_by_season.values()) == 8
+    assert list(result.failures) == ["B:sofascore:2023/24"] and "404" in result.failures["B:sofascore:2023/24"]
+    write, reason = hv._write_decision(result, tmp_path / "matches.csv", allow_partial=False)
+    assert write is False and "partial harvest" in (reason or "")  # history gaps are not silently written over good data
+
+
+@pytest.mark.asyncio
+async def test_current_season_failure_still_raises(http_cfg: HttpConfig, current_registry: TeamRegistry) -> None:
+    def router(request: httpx.Request) -> httpx.Response:
+        if f"/season/{SEASON_B_2627}/rounds" in request.url.path:
+            return json_response({"error": "down"}, status=503)
+        return multi_season_router(request)
+
+    client, _, _ = make_client(router, http_cfg)
+    provider = SofaScoreProvider(client, load_endpoints().sofascore, TeamMatcher(current_registry))
+    async with client:
+        with pytest.raises(HarvestError) as info:
+            await provider.harvest_seasons(Girone.B, seasons=3, with_stats=False)
+    assert info.value.status == 503
+
+
+def test_cli_seasons_flags_and_season_report(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    parsed = hv._build_parser().parse_args(["--seasons", "2", "--season", "2025_26"])
+    assert parsed.seasons == 2 and parsed.season == "2025_26"
+    with pytest.raises(SystemExit) as stop:
+        hv.main(["--seasons", "0", "--cache-dir", str(tmp_path / "raw")])
+    assert stop.value.code == 2
+
+    seen: dict[str, Any] = {}
+
+    async def fake_harvest_all(self: Harvester, gironi, *, season_id=None, seasons=3, with_stats=True) -> HarvestResult:
+        seen.update(seasons=seasons, season_id=season_id, registry=self.registry.season_label, historical=sorted(self.matcher.historical_names)[:1])
+        matches = hv.matches_to_frame(
+            [
+                MatchRecord("SS-90001", date(2026, 8, 23), 1, Girone.B, "Perugia", "Ravenna", 2, 1),
+                MatchRecord("SS-80001", date(2025, 8, 24), 1, Girone.B, "Ternana", "Juventus Next Gen", 2, 0),
+                MatchRecord("SS-70001", date(2024, 8, 25), 1, Girone.B, "Ternana", "Pescara", 3, 1),
+            ]
+        )
+        return HarvestResult(
+            matches=matches,
+            fixtures=[Fixture("SS-90021", date(2026, 11, 8), 3, Girone.B, "Torres", "Vis Pesaro")],
+            unmapped_teams={"SPAL": 1},
+            stats={"requests": 10, "retries": 0, "cache_hits": 0, "errors": 0},
+            provider="sofascore",
+            seasons=("2026/27", "2025/26", "2024/25"),
+            n_matches_by_season={"2026/27": 1, "2025/26": 1, "2024/25": 1},
+            historical_teams=("Ternana",),
+            registry_season="2026/27",
+        )
+
+    monkeypatch.setattr(Harvester, "harvest_all", fake_harvest_all)
+    out, fixtures_out = tmp_path / "matches.csv", tmp_path / "fixtures.csv"
+    code = hv.main(["--gironi", "B", "--seasons", "2", "--out", str(out), "--fixtures-out", str(fixtures_out), "--cache-dir", str(tmp_path / "raw")])
+    assert code == 0
+    assert seen == {"seasons": 2, "season_id": None, "registry": "2026/27", "historical": ["Arezzo"]}
+    loaded = Harvester.load_processed(out)
+    assert list(loaded.columns) == list(MATCH_COLUMNS) and len(loaded) == 3  # one CSV, no season column
+    printed = capsys.readouterr().out
+    assert "perimeter: season 2026/27 (config/teams_2026_27.json, 60 current teams)" in printed
+    assert "  2026/27: 1 matches (perimeter)" in printed and "  2024/25: 1 matches (history)" in printed
+    assert "historical matches used: 2" in printed
+    assert "historical teams (not in the 2026/27 perimeter, history only): Ternana (1)" in printed
+    assert "unmapped teams: SPAL x1" in printed
+    assert "season=2026/27 seasons=2026/27,2025/26,2024/25 historical_matches=2" in printed
+
+    code = hv.main(["--gironi", "B", "--season", "1999_00", "--out", str(out), "--fixtures-out", str(fixtures_out), "--cache-dir", str(tmp_path / "raw")])
+    assert code == 1 and "harvest failed" in capsys.readouterr().err  # unknown dictionary: clean failure, no traceback
+
+
+# ============================================================================ review findings: ingestion
+def test_cli_missing_or_invalid_endpoints_file_is_diagnosed_as_such(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """A missing --endpoints file used to be reported as 'team dictionary not found' (finding 1).
+
+    ``hv.main`` reconfigures the root logger onto stderr (``force=True``), so the
+    structured log lines are checked on the captured stderr, as the other CLI tests do.
+    """
+    missing = tmp_path / "nonexistent.toml"
+    common = ["--cache-dir", str(tmp_path / "raw"), "--out", str(tmp_path / "m.csv"), "--fixtures-out", str(tmp_path / "f.csv")]
+    assert hv.main(["--endpoints", str(missing), *common]) == 1
+    err = capsys.readouterr().err
+    assert f"endpoints file not found path={missing}" in err and "team dictionary" not in err
+    assert f"harvest failed: endpoints file not found: {missing}" in err
+    assert not (tmp_path / "m.csv").exists()
+
+    malformed = tmp_path / "broken.toml"
+    malformed.write_text("[sofascore\nbase_url = ", encoding="utf-8")
+    assert hv.main(["--endpoints", str(malformed), *common]) == 1
+    err = capsys.readouterr().err
+    assert f"endpoints file invalid path={malformed}" in err and "team dictionary" not in err and "Traceback" not in err
+    assert f"harvest failed: invalid endpoints file {malformed}" in err
+
+    incomplete = tmp_path / "incomplete.toml"
+    incomplete.write_text('[sofascore]\nbase_url = "https://api.sofascore.com"\n', encoding="utf-8")  # keys missing
+    assert hv.main(["--endpoints", str(incomplete), *common]) == 1
+    err = capsys.readouterr().err
+    assert f"endpoints file invalid path={incomplete}" in err and "team dictionary" not in err
+
+    # The dictionary diagnosis is kept for the dictionary problem only.
+    assert hv.main(["--season", "1999_00", *common]) == 1
+    err = capsys.readouterr().err
+    assert "team dictionary not found season=1999_00" in err and "endpoints file" not in err and "harvest failed" in err
+
+
+def test_http_config_history_cache_ttl() -> None:
+    cfg = load_endpoints()
+    assert cfg.http.history_cache_ttl_hours == 8760.0 and cfg.http.history_cache_ttl == timedelta(days=365)
+    assert cfg.http.cache_ttl == timedelta(hours=6) < cfg.http.history_cache_ttl
+    assert HttpConfig().history_cache_ttl == timedelta(hours=8760)
+    assert HttpConfig(history_cache_ttl_hours=0).history_cache_ttl == timedelta(0)
+    with pytest.raises(ValueError, match="history_cache_ttl_hours"):
+        HttpConfig(history_cache_ttl_hours=-1)
+
+
+def test_load_endpoints_reads_history_cache_ttl_hours(tmp_path: Path) -> None:
+    base = (Path(__file__).resolve().parents[1] / "config" / "endpoints.toml").read_text(encoding="utf-8")
+    custom = tmp_path / "endpoints.toml"
+    custom.write_text(base.replace("history_cache_ttl_hours = 8760", "history_cache_ttl_hours = 48"), encoding="utf-8")
+    assert load_endpoints(custom).http.history_cache_ttl == timedelta(hours=48)
+    without = tmp_path / "without.toml"
+    without.write_text(base.replace("history_cache_ttl_hours = 8760\n", ""), encoding="utf-8")
+    assert load_endpoints(without).http.history_cache_ttl_hours == 8760.0  # default when the key is absent
+
+
+def test_raw_cache_stable_reads_use_the_stable_ttl(tmp_path: Path) -> None:
+    cache = RawCache(tmp_path, ttl=timedelta(0))  # volatile payloads expire at once, stable ones never (default)
+    assert cache.ttl == timedelta(0) and cache.stable_ttl is None
+    assert cache.ttl_for() == timedelta(0) and cache.ttl_for(stable=True) is None
+    cache.put("https://a/season/1/rounds", {"rounds": [1]})
+    assert cache.get("https://a/season/1/rounds") is None  # expired as volatile
+    assert cache.get("https://a/season/1/rounds", stable=True) == {"rounds": [1]}  # same file, served as stable
+    assert cache.stats == {"hits": 1, "misses": 1}
+
+    bounded = RawCache(tmp_path / "bounded", ttl=None, stable_ttl=timedelta(0))
+    bounded.put("https://a/x", [1])
+    assert bounded.get("https://a/x") == [1] and bounded.get("https://a/x", stable=True) is None
+
+    # A stale timestamp expires under a bounded stable TTL but not under ttl=None.
+    aged = RawCache(tmp_path / "aged", ttl=timedelta(hours=6), stable_ttl=timedelta(hours=8760))
+    path = aged.put("https://a/y", {"v": 1})
+    record = json.loads(path.read_text(encoding="utf-8"))
+    record["fetched_at"] = (datetime.now(UTC) - timedelta(days=30)).isoformat(timespec="seconds")
+    path.write_text(json.dumps(record), encoding="utf-8")
+    assert aged.get("https://a/y") is None and aged.get("https://a/y", stable=True) == {"v": 1}
+    record["fetched_at"] = (datetime.now(UTC) - timedelta(days=400)).isoformat(timespec="seconds")
+    path.write_text(json.dumps(record), encoding="utf-8")
+    assert aged.get("https://a/y", stable=True) is None
+
+
+def test_season_is_completed_rule() -> None:
+    today = date(2026, 11, 6)
+    assert hv._season_is_completed("2025/26", current=False, today=today) is True
+    assert hv._season_is_completed("2024/25", current=False, today=today) is True
+    assert hv._season_is_completed("2026/27", current=False, today=today) is False  # the running season, even if not listed first
+    assert hv._season_is_completed("2027/28", current=False, today=today) is False
+    assert hv._season_is_completed(None, current=False, today=today) is True  # not the newest listed season, label unknown
+    assert hv._season_is_completed("2024/25", current=True, today=today) is False  # first listed / pinned: may be in progress
+    assert hv._season_is_completed(None, current=True, today=today) is False
+    # the July-June boundary of season_of: 2025/26 is still running on 30 June 2026
+    assert hv._season_is_completed("2025/26", current=False, today=date(2026, 6, 30)) is False
+    assert hv._season_is_completed("2025/26", current=False, today=date(2026, 7, 1)) is True
+
+
+def _multi_season_router_with_stats(request: httpx.Request) -> httpx.Response:
+    """The multi-season girone B with one statistics payload for every finished event."""
+    if re.fullmatch(r"/api/v1/event/(\d+)/statistics", request.url.path):
+        return json_response(load_fixture("statistics_13579101.json"))
+    return multi_season_router(request)
+
+
+def _paths(transport: CountingTransport, start: int) -> list[str]:
+    return [r.url.path for r in transport.requests[start:]]
+
+
+@pytest.mark.asyncio
+async def test_completed_seasons_are_cached_as_stable_across_runs(tmp_path: Path, current_registry: TeamRegistry) -> None:
+    """Finding 2: with the volatile TTL elapsed, a repeated multi-season run re-downloads the current season only."""
+    cfg = load_endpoints()
+    transport = CountingTransport(_multi_season_router_with_stats)
+    make = lambda **kw: Harvester(  # noqa: E731 - small local factory
+        endpoints=cfg, registry=current_registry, cache_dir=tmp_path / "raw", transport=transport, sleeper=RecordingSleeper(), **kw
+    )
+    first = make(cache_ttl=timedelta(0))  # the current season's payloads expire immediately
+    assert first.cache.ttl == timedelta(0) and first.cache.stable_ttl == timedelta(days=365)
+    result = await first.harvest_all([Girone.B], seasons=3, with_stats=True)
+    assert result.n_matches_by_season == {"2026/27": 3, "2025/26": 3, "2024/25": 2}
+    assert transport.calls == 1 + 3 + 6 + 8  # seasons, rounds x3, events for 3+2+1 rounds, statistics x8
+    assert result.stats["cache_hits"] == 0
+
+    before = transport.calls
+    again = await make(cache_ttl=timedelta(0)).harvest_all([Girone.B], seasons=3, with_stats=True)
+    pd.testing.assert_frame_equal(again.matches, result.matches)
+    refetched = _paths(transport, before)
+    # the seasons listing and the current season (rounds, 3 event rounds, 3 statistics) are volatile: downloaded again
+    assert f"/api/v1/unique-tournament/{TOURNAMENT_B}/seasons" in refetched
+    assert sum(f"/season/{SEASON_B_2627}/" in path for path in refetched) == 1 + 3
+    assert {p for p in refetched if p.endswith("/statistics")} == {f"/api/v1/event/{e}/statistics" for e in (90001, 90002, 90011)}
+    # the two completed seasons (2 rounds payloads, 3 event rounds, 5 statistics) come from the cache
+    assert not any(f"/season/{sid}/" in path for sid in (SEASON_B_2526, SEASON_B_2425) for path in refetched)
+    assert transport.calls - before == 1 + 1 + 3 + 3 and again.stats["cache_hits"] == 2 + 3 + 5
+
+    # history TTL 0 (CLI --history-cache-ttl-hours 0) forces the completed seasons to be downloaded again
+    before = transport.calls
+    forced = await make(cache_ttl=timedelta(0), history_cache_ttl=timedelta(0)).harvest_all([Girone.B], seasons=3, with_stats=True)
+    assert forced.stats["cache_hits"] == 0 and transport.calls - before == 1 + 3 + 6 + 8
+
+    # the long TTL (default from endpoints.toml) also covers the current season's payloads within 6 h: everything is served from cache
+    before = transport.calls
+    cached = await make().harvest_all([Girone.B], seasons=3, with_stats=True)
+    assert transport.calls == before and cached.stats["cache_hits"] == 1 + 3 + 6 + 8
+
+
+@pytest.mark.asyncio
+async def test_season_harvest_reports_completed_and_pinned_seasons_stay_volatile(
+    http_cfg: HttpConfig, tmp_path: Path, current_registry: TeamRegistry
+) -> None:
+    matcher = TeamMatcher(Harvester.registry_with_history(current_registry))
+    cache = RawCache(tmp_path / "raw", ttl=timedelta(0))  # volatile entries expire immediately
+    client, transport, _ = make_client(_multi_season_router_with_stats, http_cfg, cache=cache)
+    provider = SofaScoreProvider(client, load_endpoints().sofascore, matcher)
+    async with client:
+        harvested = await provider.harvest_seasons(Girone.B, seasons=4, with_stats=True)
+        assert [item.completed for item in harvested] == [False, True, True, True]  # the failed 2023/24 season is completed too
+        assert harvested[-1].error and harvested[-1].completed
+        # a pinned past season is current for the run, hence volatile: its payloads are fetched again
+        before = transport.calls
+        [pinned] = await provider.harvest_seasons(Girone.B, season_id=SEASON_B_2526, with_stats=True)
+        assert pinned.current and pinned.historical and not pinned.completed
+        assert transport.calls - before == 1 + 2 + 3  # rounds, 2 event rounds, 3 statistics: nothing served as stable
+        # the same season harvested through the listing is completed: everything now comes from the cache
+        before = transport.calls
+        listed = await provider.harvest_seasons(Girone.B, seasons=2, with_stats=True)
+        assert [item.completed for item in listed] == [False, True]
+        assert not any(f"/season/{SEASON_B_2526}/" in r.url.path for r in transport.requests[before:])
+        assert sum(f"/season/{SEASON_B_2627}/" in r.url.path for r in transport.requests[before:]) == 1 + 3
+
+
+def test_cli_history_cache_ttl_flag(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    parsed = hv._build_parser().parse_args([])
+    assert parsed.cache_ttl_hours is None and parsed.history_cache_ttl_hours is None
+    parsed = hv._build_parser().parse_args(["--cache-ttl-hours", "1", "--history-cache-ttl-hours", "0"])
+    assert parsed.cache_ttl_hours == 1.0 and parsed.history_cache_ttl_hours == 0.0
+
+    seen: dict[str, Any] = {}
+
+    async def fake_harvest_all(self: Harvester, gironi, *, season_id=None, seasons=3, with_stats=True) -> HarvestResult:
+        seen.update(ttl=self.cache.ttl, stable_ttl=self.cache.stable_ttl)
+        matches = hv.matches_to_frame([MatchRecord("SS-90001", date(2026, 8, 23), 1, Girone.B, "Perugia", "Ravenna", 2, 1)])
+        return HarvestResult(matches=matches, fixtures=[], unmapped_teams={}, stats={"requests": 1, "retries": 0, "cache_hits": 0, "errors": 0}, provider="sofascore")
+
+    monkeypatch.setattr(Harvester, "harvest_all", fake_harvest_all)
+    common = ["--gironi", "B", "--out", str(tmp_path / "m.csv"), "--fixtures-out", str(tmp_path / "f.csv"), "--cache-dir", str(tmp_path / "raw")]
+    assert hv.main(common) == 0
+    assert seen == {"ttl": timedelta(hours=6), "stable_ttl": timedelta(hours=8760)}  # defaults from endpoints.toml
+    assert hv.main([*common, "--cache-ttl-hours", "1", "--history-cache-ttl-hours", "0"]) == 0
+    assert seen == {"ttl": timedelta(hours=1), "stable_ttl": timedelta(0)}
+    capsys.readouterr()
