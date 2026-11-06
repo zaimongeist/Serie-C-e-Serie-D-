@@ -1,8 +1,11 @@
 """Tests for the Streamlit dashboard: data layer (``src.dashboard.state``) and UI (``src.dashboard.app``)."""
 from __future__ import annotations
 
+import dataclasses
+import inspect
 import io
 import os
+import socket
 import subprocess
 import sys
 import time
@@ -12,12 +15,16 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import plotly.colors as pc
 import plotly.graph_objects as go
+import plotly.io as pio
 import pytest
 
 from src.common.schemas import SELECTIONS, Girone, Market, OddsQuote
+from src.dashboard import LEGACY_FULL_WIDTH, MODERN_FULL_WIDTH, container_width_kwargs
 from src.dashboard.state import (
     MARKETS_COLUMNS,
+    MIN_SIM_ROUNDS,
     RANKING_COLUMNS,
     TRAPS_COLUMNS,
     VALUE_COLUMNS,
@@ -28,6 +35,8 @@ from src.dashboard.state import (
     heatmap_figure,
     load_odds_quotes,
     markets_table,
+    max_sim_rounds,
+    no_odds_message,
     opportunities_table,
     predictions_table,
     quotes_for,
@@ -70,8 +79,9 @@ def test_build_state_simulated_injects_trap(sim_state: PipelineState) -> None:
     assert state.params.converged
     assert state.n_matches == len(state.matches) > 0
     assert state.traps, "the simulated run injects a REGRESSION_TRAP"
-    assert any(o.is_trap for o in state.opportunities), "at least one Over/GG selection must carry REGRESSION_TRAP"
-    assert all("REGRESSION_TRAP" in o.flags for o in state.opportunities if o.is_trap)
+    trapped = [o for o in state.opportunities if "REGRESSION_TRAP" in o.flags]
+    assert trapped, "at least one Over/GG selection must carry REGRESSION_TRAP"
+    assert all(o.selection.startswith("Over") or o.selection == "GG" for o in trapped), "only Over/GG selections are trapped"
     # the injected team is a Girone A team that plays in the next round and is mentioned in the notes
     trap_teams = {t.team for t in state.traps}
     fixture_teams_a = {t for f in state.fixtures if f.girone == Girone.A for t in (f.home_team, f.away_team)}
@@ -217,7 +227,10 @@ def test_value_table_threshold_and_order(sim_state: PipelineState) -> None:
         assert np.all(ev >= min_ev * 100.0 - 1e-6)
         assert np.all(np.diff(ev) <= 1e-9), "sorted by EV descending"
     by_girone = value_table(sim_state, 0.035, Girone.B)
-    assert set(by_girone["Girone"]) <= {"B"}
+    expected_b = sum(1 for o in sim_state.opportunities if o.ev >= 0.035 and o.girone == Girone.B)
+    assert len(by_girone) == expected_b > 0, "the girone filter must keep every Girone B value selection"
+    assert set(by_girone["Girone"]) == {"B"}
+    assert len(by_girone) < len(value_table(sim_state, 0.035)), "other gironi are filtered out"
     assert str(table["Data"].dtype).startswith("datetime64")
     flagged = value_table(sim_state, -1.0)
     assert flagged["Flag"].str.contains("REGRESSION_TRAP").any()
@@ -231,9 +244,9 @@ def test_heatmap_figure_shape(sim_state: PipelineState) -> None:
     z = np.asarray(fig.data[0].z)
     assert z.shape == (7, 7)
     assert np.allclose(z, pred.matrix[:7, :7] * 100.0)
-    assert fig.data[0].colorscale is not None
+    assert [list(stop) for stop in fig.data[0].colorscale] == [list(stop) for stop in pc.get_colorscale("Blues")]
     assert fig.layout.height == 520
-    assert fig.layout.template is not None
+    assert fig.layout.template == pio.templates["plotly"], "the 'plotly' template lets Streamlit re-theme the figure"
     assert f"Gol {pred.fixture.home_team}" == fig.layout.yaxis.title.text
     assert f"Gol {pred.fixture.away_team}" == fig.layout.xaxis.title.text
     assert pred.fixture.label in fig.layout.title.text
@@ -254,13 +267,16 @@ def test_markets_table_rows(sim_state: PipelineState) -> None:
     n_selections = sum(len(sels) for sels in SELECTIONS.values())
     assert len(table) == n_selections == 11
     assert table["Quota Book"].notna().all() and table["EV (%)"].notna().all()
-    # EV = p * odds - 1 (in %), consistent with the value engine
+    # EV = p * odds - 1 (in %), computed from the bookmaker's quote (best price when several books), not from the table
     first = table.iloc[0]
     p = pred.probabilities[Market.MATCH_ODDS]["1"]
-    book = quotes_for(sim_state, pred.match_id)[0].odds["1"] if quotes[0].market is Market.MATCH_ODDS else first["Quota Book"]
+    quoted = [q.odds["1"] for q in quotes if q.market is Market.MATCH_ODDS]
+    assert quoted, "the synthetic bookmaker quotes the 1X2 market of every fixture"
+    book = max(quoted)
     assert first["Esito"] == "1"
-    assert abs(first["EV (%)"] - round((p * first["Quota Book"] - 1.0) * 100.0, 2)) < 1e-9
-    assert book > 1.0
+    assert first["Quota Book"] == round(book, 2)
+    assert abs(first["EV (%)"] - round((p * book - 1.0) * 100.0, 2)) < 1e-9
+    assert first["Quota Fair"] == round(pred.fair_odds[Market.MATCH_ODDS]["1"], 2)
     # without quotes the book columns are NaN but the model columns are filled
     bare = markets_table(pred, [])
     assert len(bare) == n_selections
@@ -321,9 +337,16 @@ def test_app_renders_with_apptest(monkeypatch: pytest.MonkeyPatch) -> None:
     assert at.dataframe, "tables are rendered"
 
 
+def free_port() -> int:
+    """A TCP port that is free right now (so a busy 8599 cannot fail the server test)."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
 def test_streamlit_server_healthz() -> None:
-    """Launch the real server once (headless) and check /healthz, then stop it."""
-    port = 8599
+    """Launch the real server once (headless) on a free port and check /healthz, then stop it."""
+    port = free_port()
     env = {**os.environ, "SERIEC_FORCE_SIMULATE": "1", "SERIEC_SIM_ROUNDS": "6"}
     proc = subprocess.Popen(
         [sys.executable, "-m", "streamlit", "run", str(APP_PATH), "--server.headless", "true", "--server.port", str(port), "--browser.gatherUsageStats", "false"],
@@ -355,3 +378,102 @@ def test_streamlit_server_healthz() -> None:
         except subprocess.TimeoutExpired:
             proc.kill()
             proc.wait(timeout=15)
+
+
+# ----------------------------------------------------------------------------- regression tests (review findings)
+def test_build_state_rejects_negative_seed_and_zero_rounds() -> None:
+    """A negative seed or a non-positive number of rounds fails fast with an actionable message."""
+    with pytest.raises(ValueError, match=r"seed must be >= 0 \(got -1\)"):
+        build_state(simulate=True, seed=-1, xi=0.0)
+    with pytest.raises(ValueError, match=r"n_rounds must be >= 1 \(got 0\)"):
+        build_state(simulate=True, n_rounds=0, xi=0.0)
+    with pytest.raises(ValueError, match="n_rounds must be >= 1"):
+        build_state(simulate=True, n_rounds=-5, xi=0.0)
+
+
+def test_build_state_clamps_full_season_rounds() -> None:
+    """Asking for the whole season (or more) still leaves one round of fixtures, with a note."""
+    upper = max_sim_rounds()
+    assert upper == 37  # 20-team gironi -> 38 double round-robin rounds; the last one stays as fixtures
+    assert MIN_SIM_ROUNDS == 1
+    state = build_state(simulate=True, seed=3, xi=0.0, n_rounds=50)
+    assert state.source == "simulated"
+    assert state.n_matches == upper * 30  # 3 gironi x 10 matches per round
+    assert len(state.fixtures) == 30 and len(state.predictions) == 30
+    assert state.quotes and state.opportunities, "the synthetic bookmaker still quotes the last round"
+    assert state.traps and any(o.is_trap for o in state.opportunities), "the trap is still injected"
+    joined = "\n".join(state.notes)
+    assert "richieste: 50" in joined and f"limitato a {upper}" in joined
+    # a value inside the range is used verbatim and leaves no clamp note
+    plain = build_state(simulate=True, seed=3, xi=0.0, n_rounds=upper)
+    assert plain.n_matches == state.n_matches
+    assert not any("limitato a" in n for n in plain.notes)
+    # the lower bound is valid too: one played round, prior on, next round predicted
+    tiny = build_state(simulate=True, seed=3, xi=0.0, n_rounds=MIN_SIM_ROUNDS)
+    assert tiny.n_matches == 30 and len(tiny.predictions) == 30 and tiny.prior_enabled
+
+
+def test_no_odds_message_is_source_aware(sim_state: PipelineState) -> None:
+    """The value panel hint must not tell a simulated run to add odds CSVs."""
+    empty_sim = dataclasses.replace(sim_state, quotes=[], fixtures=[], predictions=[], opportunities=[])
+    msg = no_odds_message(empty_sim)
+    assert "sintetico" in msg and "partite in programma" in msg
+    assert "data/odds" not in msg and "CSV" not in msg
+    with_fixtures = dataclasses.replace(sim_state, quotes=[], opportunities=[])
+    msg_fx = no_odds_message(with_fixtures)
+    assert "sintetico" in msg_fx and "CSV" not in msg_fx and msg_fx != msg
+    processed = dataclasses.replace(sim_state, source="processed", quotes=[], opportunities=[])
+    msg_proc = no_odds_message(processed)
+    assert "data/odds" in msg_proc and "match_id, bookmaker, market, selection, odds" in msg_proc
+
+
+def test_container_width_kwargs_matches_streamlit_api() -> None:
+    """The full-width adapter picks the keyword the installed Streamlit actually accepts."""
+    import streamlit as st
+
+    def legacy(data=None, width=None, height=None, *, use_container_width: bool = False) -> None:  # noqa: ARG001
+        """Streamlit <= 1.4x signature: ``width`` is a pixel integer."""
+
+    def deprecated_tristate(label, *, width="content", use_container_width=None) -> None:  # noqa: ARG001
+        """Recent signature: ``use_container_width`` deprecated, forwards to ``width``."""
+
+    def future(label, *, width="content") -> None:  # noqa: ARG001
+        """Signature once ``use_container_width`` is removed."""
+
+    assert container_width_kwargs(legacy) == LEGACY_FULL_WIDTH == {"use_container_width": True}
+    assert container_width_kwargs(deprecated_tristate) == MODERN_FULL_WIDTH == {"width": "stretch"}
+    assert container_width_kwargs(future) == MODERN_FULL_WIDTH
+    assert container_width_kwargs(len) in (LEGACY_FULL_WIDTH, MODERN_FULL_WIDTH)  # builtins never raise
+    for name in ("button", "download_button", "dataframe", "plotly_chart"):
+        command = getattr(st, name)
+        kwargs = container_width_kwargs(command)
+        (key,) = kwargs
+        assert key in inspect.signature(command).parameters, (name, kwargs)
+    fresh = container_width_kwargs(legacy)
+    fresh["extra"] = 1
+    assert "extra" not in LEGACY_FULL_WIDTH, "the adapter returns a copy"
+
+
+def test_app_survives_out_of_range_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Negative seed and full-season rounds render a complete page instead of a stack trace."""
+    from streamlit.testing.v1 import AppTest
+
+    monkeypatch.setenv("SERIEC_FORCE_SIMULATE", "1")
+    monkeypatch.setenv("SERIEC_SEED", "-1")  # negative seed -> default seed, no crash
+    monkeypatch.setenv("SERIEC_SIM_ROUNDS", "99")  # full season -> clamped, fixtures still present
+    at = AppTest.from_file(str(APP_PATH), default_timeout=240)
+    at.run()
+    assert not at.exception, [e.value for e in at.exception]
+    assert any("Dati simulati" in i.value for i in at.sidebar.info)
+    assert not any("0 partite in programma" in i.value for i in at.sidebar.info)
+    assert at.metric, "fixtures exist, so the match tab shows its metrics"
+    assert len(at.selectbox(key="fixture").options) == 30
+    assert any("limitato a 37" in m.value for m in at.markdown), "the clamp is reported in 'Dettagli pipeline'"
+    assert not any("aggiungi file CSV" in i.value for i in at.info)
+
+    monkeypatch.setenv("SERIEC_SIM_ROUNDS", "0")  # below the minimum -> default rounds
+    monkeypatch.setenv("SERIEC_SEED", "abc")  # not an integer -> default seed
+    at.run()
+    assert not at.exception, [e.value for e in at.exception]
+    assert len(at.selectbox(key="fixture").options) == 30
+    assert any("seed=7, 15 giornate giocate" in m.value for m in at.markdown)

@@ -8,14 +8,21 @@ Environment variables
 ---------------------
 ``SERIEC_FORCE_SIMULATE=1``
     Always use the synthetic league, even when ``data/processed/matches.csv`` exists.
-``SERIEC_SIM_ROUNDS`` (int, default 15)
-    Played rounds of the simulated league.
-``SERIEC_SEED`` (int, default 7)
+``SERIEC_SIM_ROUNDS`` (int >= 1, default 15)
+    Played rounds of the simulated league; values above the season length are
+    clamped by the data layer so one round of fixtures always remains.
+``SERIEC_SEED`` (int >= 0, default 7)
     Random seed of the simulated league.
+
+Invalid or out-of-range values (non-integers, a negative seed, zero rounds)
+are logged and replaced by the defaults instead of crashing the page.
 
 The heavy work (load/simulate, fit, predict, value) lives in
 :mod:`src.dashboard.state` and is cached with ``st.cache_resource`` keyed on
-the sidebar parameters; this module only composes the widgets.
+the sidebar parameters; this module only composes the widgets. Full-width
+elements use :func:`src.dashboard.container_width_kwargs`, which picks
+``width="stretch"`` or the legacy ``use_container_width=True`` according to
+the installed Streamlit (the project declares ``streamlit>=1.38``).
 """
 from __future__ import annotations
 
@@ -36,13 +43,16 @@ st.set_page_config(page_title="Serie C Quant Lab", page_icon="⚽", layout="wide
 
 from src.common.logging_config import get_logger
 from src.common.schemas import Girone, Market, MatchPrediction
+from src.dashboard import container_width_kwargs
 from src.dashboard.state import (
+    MIN_SIM_ROUNDS,
     PipelineState,
     build_state,
     export_csv_bytes,
     fixtures_for,
     heatmap_figure,
     markets_table,
+    no_odds_message,
     opportunities_table,
     predictions_table,
     quotes_for,
@@ -58,6 +68,10 @@ GIRONE_OPTIONS: Final[tuple[str, ...]] = ("Tutti", "A", "B", "C")
 KELLY_OPTIONS: Final[dict[str, float]] = {"1/8": 0.125, "1/4": 0.25}
 DEFAULT_SIM_ROUNDS: Final[int] = 15
 DEFAULT_SEED: Final[int] = 7
+#: Full-width keyword per Streamlit command, resolved once for the installed release.
+FULL_WIDTH: Final[dict[str, dict[str, object]]] = {
+    name: container_width_kwargs(getattr(st, name)) for name in ("button", "download_button", "dataframe", "plotly_chart")
+}
 
 
 # =============================================================================
@@ -68,16 +82,28 @@ def env_flag(name: str) -> bool:
     return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
 
 
-def env_int(name: str, default: int) -> int:
-    """Integer environment variable with a safe fallback (invalid values are logged)."""
+def env_int(name: str, default: int, *, minimum: int | None = None) -> int:
+    """Integer environment variable with a safe fallback.
+
+    Non-integers and values below ``minimum`` (when given) are logged and
+    replaced by ``default``, so a bad ``SERIEC_SEED=-1`` or ``SERIEC_SIM_ROUNDS=0``
+    never reaches the pipeline and the page still renders.
+    """
     raw = os.getenv(name)
     if raw is None or not raw.strip():
         return default
     try:
-        return int(raw.strip())
+        value = int(raw.strip())
     except ValueError:
         log.warning("invalid integer environment variable, using default", extra={"variable": name, "value": raw, "default": default})
         return default
+    if minimum is not None and value < minimum:
+        log.warning(
+            "environment variable below minimum, using default",
+            extra={"variable": name, "value": value, "minimum": minimum, "default": default},
+        )
+        return default
+    return value
 
 
 # =============================================================================
@@ -121,7 +147,7 @@ def render_sidebar() -> tuple[Girone | None, float, float, float]:
         ev_pct = st.slider("Soglia EV minima (%)", min_value=0.0, max_value=15.0, value=3.5, step=0.5, key="min_ev_pct", help="Una selezione è di valore quando P_modello × Quota − 1 supera questa soglia.")
         kelly_label = st.radio("Frazione di Kelly", list(KELLY_OPTIONS), index=0, horizontal=True, key="kelly", help="Quota del Kelly pieno da puntare.")
         bankroll = st.number_input("Bankroll (unità)", min_value=1.0, max_value=1_000_000.0, value=100.0, step=10.0, key="bankroll", help="100 unità = ogni unità vale l'1% del bankroll.")
-        if st.button("Ricalcola", key="recompute", help="Svuota la cache e riesegue la pipeline.", width="stretch"):
+        if st.button("Ricalcola", key="recompute", help="Svuota la cache e riesegue la pipeline.", **FULL_WIDTH["button"]):
             st.cache_resource.clear()
             st.rerun()
     return selected_girone(girone_label), float(ev_pct) / 100.0, KELLY_OPTIONS[kelly_label], float(bankroll)
@@ -155,7 +181,7 @@ def render_ranking_tab(state: PipelineState, girone: Girone | None) -> None:
     st.dataframe(
         table,
         hide_index=True,
-        width="stretch",
+        **FULL_WIDTH["dataframe"],
         column_config={
             "Squadra": st.column_config.TextColumn("Squadra"),
             "Girone": st.column_config.TextColumn("Girone", width="small"),
@@ -170,9 +196,9 @@ def render_ranking_tab(state: PipelineState, girone: Girone | None) -> None:
         columns = st.columns(len(state.gironi) or 1)
         for col, g in zip(columns, state.gironi):
             with col:
-                st.plotly_chart(strength_figure(ranking_table(state, g), title=f"Girone {g.value}"), width="stretch", key=f"strength_{g.value}")
+                st.plotly_chart(strength_figure(ranking_table(state, g), title=f"Girone {g.value}"), **FULL_WIDTH["plotly_chart"], key=f"strength_{g.value}")
     else:
-        st.plotly_chart(strength_figure(table, title=f"Girone {girone.value}: α e β per squadra"), width="stretch", key=f"strength_{girone.value}")
+        st.plotly_chart(strength_figure(table, title=f"Girone {girone.value}: α e β per squadra"), **FULL_WIDTH["plotly_chart"], key=f"strength_{girone.value}")
 
 
 def render_match_tab(state: PipelineState, girone: Girone | None) -> None:
@@ -191,13 +217,13 @@ def render_match_tab(state: PipelineState, girone: Girone | None) -> None:
     c2.metric("μ ospiti (gol attesi)", f"{pred.away_rate:.2f}", help=f"Gol attesi di {pred.fixture.away_team}")
     c3.metric("Risultato più probabile", f"{hs}-{as_}", delta=f"{p_top:.1%}", delta_color="off")
     c4.metric("P(Over 2.5)", f"{p_over:.1%}")
-    st.plotly_chart(heatmap_figure(pred), width="stretch", key="heatmap")
+    st.plotly_chart(heatmap_figure(pred), **FULL_WIDTH["plotly_chart"], key="heatmap")
     st.markdown("**Mercati: probabilità del modello, quota fair e quota del bookmaker**")
     quotes = quotes_for(state, pred.match_id)
     st.dataframe(
         markets_table(pred, quotes),
         hide_index=True,
-        width="stretch",
+        **FULL_WIDTH["dataframe"],
         column_config={
             "Probabilità (%)": st.column_config.NumberColumn("Probabilità (%)", format="%.1f %%"),
             "Quota Fair": st.column_config.NumberColumn("Quota Fair", format="%.2f"),
@@ -212,7 +238,7 @@ def render_match_tab(state: PipelineState, girone: Girone | None) -> None:
 def render_value_tab(state: PipelineState, girone: Girone | None, min_ev: float) -> None:
     st.subheader("Opportunità di valore")
     if not state.quotes:
-        st.info("Nessuna quota bookmaker disponibile: aggiungi file CSV in data/odds (colonne match_id, bookmaker, market, selection, odds) per calcolare l'EV.")
+        st.info(no_odds_message(state))
     table = value_table(state, min_ev, girone)
     if table.empty:
         if state.quotes:
@@ -222,7 +248,7 @@ def render_value_tab(state: PipelineState, girone: Girone | None, min_ev: float)
         st.dataframe(
             table,
             hide_index=True,
-            width="stretch",
+            **FULL_WIDTH["dataframe"],
             column_config={
                 "Data": st.column_config.DateColumn("Data", format="DD/MM/YYYY"),
                 "Quota Book": st.column_config.NumberColumn("Quota Book", format="%.2f"),
@@ -245,7 +271,7 @@ def render_value_tab(state: PipelineState, girone: Girone | None, min_ev: float)
         st.dataframe(
             traps_table(state),
             hide_index=True,
-            width="stretch",
+            **FULL_WIDTH["dataframe"],
             column_config={
                 "xGA": st.column_config.NumberColumn("xGA", format="%.2f"),
                 "Severità": st.column_config.NumberColumn("Severità", format="%+.2f"),
@@ -272,7 +298,7 @@ def render_export_tab(state: PipelineState) -> None:
             file_name=f"serie_c_value_report_{today}.csv",
             mime="text/csv",
             key="dl_value",
-            width="stretch",
+            **FULL_WIDTH["download_button"],
         )
     with c2:
         st.markdown(f"**Previsioni complete** · {len(preds_frame)} partite (λ, μ, probabilità e quote fair di ogni mercato)")
@@ -282,11 +308,11 @@ def render_export_tab(state: PipelineState) -> None:
             file_name=f"serie_c_previsioni_{today}.csv",
             mime="text/csv",
             key="dl_predictions",
-            width="stretch",
+            **FULL_WIDTH["download_button"],
         )
     st.caption("CSV UTF-8, separatore virgola, decimale punto, date ISO (AAAA-MM-GG).")
     with st.expander("Anteprima previsioni"):
-        st.dataframe(preds_frame, hide_index=True, width="stretch")
+        st.dataframe(preds_frame, hide_index=True, **FULL_WIDTH["dataframe"])
 
 
 # =============================================================================
@@ -298,15 +324,15 @@ def main() -> None:
     badge = st.sidebar.empty()
 
     simulate: bool | None = True if env_flag("SERIEC_FORCE_SIMULATE") else None
-    seed = env_int("SERIEC_SEED", DEFAULT_SEED)
-    n_rounds = env_int("SERIEC_SIM_ROUNDS", DEFAULT_SIM_ROUNDS)
+    seed = env_int("SERIEC_SEED", DEFAULT_SEED, minimum=0)
+    n_rounds = env_int("SERIEC_SIM_ROUNDS", DEFAULT_SIM_ROUNDS, minimum=MIN_SIM_ROUNDS)
     state = load_state(
         min_ev=min_ev,
         kelly_fraction=kelly_fraction,
         bankroll_units=bankroll,
         simulate=simulate,
         seed=seed,
-        n_rounds=max(1, n_rounds),
+        n_rounds=n_rounds,
     )
     render_source_badge(badge, state)
 

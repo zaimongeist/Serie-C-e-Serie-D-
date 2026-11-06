@@ -29,8 +29,9 @@ import pandas as pd
 import plotly.graph_objects as go
 
 from src.common.logging_config import get_logger
-from src.common.paths import ODDS_DIR, PROCESSED_DIR
+from src.common.paths import ODDS_DIR, PROCESSED_DIR, ROOT
 from src.common.schemas import SELECTIONS, Fixture, Girone, Market, MatchPrediction, OddsQuote
+from src.common.teams import TeamRegistry, load_registry
 from src.engine.model import DixonColesConfig, DixonColesEngine, FittedParams
 from src.engine.value import (
     KellyConfig,
@@ -40,11 +41,12 @@ from src.engine.value import (
     detect_regression_traps,
 )
 from src.ingestion.harvester import load_fixtures, load_processed
-from src.simulation.generator import inject_regression_trap, simulate_league
+from src.simulation.generator import inject_regression_trap, round_robin, simulate_league
 
 __all__ = [
     "MARKETS_COLUMNS",
     "MARKET_LABELS",
+    "MIN_SIM_ROUNDS",
     "ODDS_COLUMNS",
     "PRIOR_THRESHOLD_MATCHES",
     "RANKING_COLUMNS",
@@ -58,6 +60,8 @@ __all__ = [
     "heatmap_figure",
     "load_odds_quotes",
     "markets_table",
+    "max_sim_rounds",
+    "no_odds_message",
     "opportunities_table",
     "predictions_table",
     "quotes_for",
@@ -73,6 +77,9 @@ Source = Literal["processed", "simulated"]
 
 #: Below this many played matches the Gaussian (MAP) prior is switched on automatically.
 PRIOR_THRESHOLD_MATCHES: Final[int] = 100
+
+#: Smallest number of played rounds a simulated league can have (the fit needs matches).
+MIN_SIM_ROUNDS: Final[int] = 1
 
 #: Required columns of a bookmaker odds CSV (one row per quoted selection).
 ODDS_COLUMNS: Final[tuple[str, ...]] = ("match_id", "bookmaker", "market", "selection", "odds")
@@ -297,12 +304,39 @@ def _load_processed_inputs(
     return matches, fixtures, quotes
 
 
+def max_sim_rounds(registry: TeamRegistry | None = None) -> int:
+    """Largest number of *played* rounds that still leaves one round of fixtures.
+
+    :func:`simulate_league` plays at most the whole double round-robin schedule
+    (38 rounds for 20-team gironi) and uses the round after the last played one
+    as the fixture list, so asking for the full season (or more) yields no
+    fixtures, no predictions and no odds. The dashboard therefore clamps
+    ``n_rounds`` to ``[MIN_SIM_ROUNDS, max_sim_rounds()]`` (``37`` with the
+    default registry). ``registry`` defaults to the real 2025/26 composition.
+    """
+    reg = load_registry() if registry is None else registry
+    total_rounds = max(len(round_robin(teams)) for teams in reg.teams_by_girone.values())
+    return max(MIN_SIM_ROUNDS, total_rounds - 1)
+
+
 def _simulated_inputs(seed: int, n_rounds: int, notes: list[str]) -> tuple[pd.DataFrame, list[Fixture], list[OddsQuote]]:
-    """Synthetic league with a REGRESSION_TRAP injected on a Girone A team of the next round."""
-    league = simulate_league(seed=seed, n_rounds=n_rounds)
+    """Synthetic league with a REGRESSION_TRAP injected on a Girone A team of the next round.
+
+    ``n_rounds`` is clamped to ``[MIN_SIM_ROUNDS, max_sim_rounds()]`` so the
+    league always has a next round to predict; a clamp is recorded in ``notes``.
+    """
+    upper = max_sim_rounds()
+    played = min(max(int(n_rounds), MIN_SIM_ROUNDS), upper)
+    if played != n_rounds:
+        notes.append(
+            f"Giornate simulate richieste: {n_rounds}; valore limitato a {played} (intervallo valido "
+            f"{MIN_SIM_ROUNDS}-{upper}) così resta una giornata in programma da prevedere."
+        )
+        log.warning("simulated rounds clamped", extra={"requested": n_rounds, "used": played, "max": upper})
+    league = simulate_league(seed=seed, n_rounds=played)
     matches = league.matches
     notes.append(
-        f"Dataset simulato (seed={seed}, {n_rounds} giornate giocate): {len(matches)} partite, "
+        f"Dataset simulato (seed={seed}, {played} giornate giocate): {len(matches)} partite, "
         f"{len(league.fixtures)} partite in programma, {len(league.odds)} quote del bookmaker sintetico."
     )
     trap_team = _pick_trap_team(matches, league.fixtures, Girone.A)
@@ -353,7 +387,16 @@ def build_state(
         run on the predictions and the quotes; without quotes the
         opportunities simply stay empty. Fixtures with teams unknown to the fit
         are skipped with a note instead of raising.
+    Validation
+        ``seed`` must be ``>= 0`` (``numpy`` rejects negative seeds) and
+        ``n_rounds >= 1``; both raise :class:`ValueError` up front. Values of
+        ``n_rounds`` above :func:`max_sim_rounds` are clamped with a note, not
+        rejected, so a "full season" request still produces fixtures.
     """
+    if seed < 0:
+        raise ValueError(f"seed must be >= 0 (got {seed})")
+    if n_rounds < MIN_SIM_ROUNDS:
+        raise ValueError(f"n_rounds must be >= {MIN_SIM_ROUNDS} (got {n_rounds})")
     notes: list[str] = []
     started = time.perf_counter()
     loaded: tuple[pd.DataFrame, list[Fixture], list[OddsQuote]] | None = None
@@ -469,6 +512,31 @@ def fixtures_for(state: PipelineState, girone: Girone | None) -> list[MatchPredi
 def quotes_for(state: PipelineState, match_id: str) -> list[OddsQuote]:
     """Every bookmaker quote of one fixture."""
     return [q for q in state.quotes if q.match_id == match_id]
+
+
+def no_odds_message(state: PipelineState) -> str:
+    """Italian hint shown by the value panel when ``state.quotes`` is empty.
+
+    The text depends on the data source: with harvested data the user can add
+    odds CSVs to the odds directory; with the synthetic generator the odds come
+    from the simulated bookmaker, which quotes only the upcoming fixtures, so
+    the only way to have no quotes is to have no fixtures left.
+    """
+    if state.source == "processed":
+        try:
+            odds_dir = ODDS_DIR.relative_to(ROOT).as_posix()
+        except ValueError:
+            odds_dir = str(ODDS_DIR)
+        return (
+            f"Nessuna quota bookmaker disponibile: aggiungi file CSV in {odds_dir} "
+            "(colonne match_id, bookmaker, market, selection, odds) per calcolare l'EV."
+        )
+    if not state.fixtures:
+        return (
+            "Nessuna quota: il bookmaker sintetico quota solo le partite in programma e il dataset simulato "
+            "non ne contiene (tutte le giornate risultano già giocate). Riduci le giornate simulate."
+        )
+    return "Nessuna quota del bookmaker sintetico per le partite in programma: il pannello EV resta vuoto."
 
 
 def heatmap_figure(prediction: MatchPrediction, max_goals_shown: int = 6) -> go.Figure:
