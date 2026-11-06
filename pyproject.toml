@@ -1,31 +1,9 @@
-[build-system]
-requires = ["setuptools>=69"]
-build-backend = "setuptools.build_meta"
-
-[project]
-name = "seriec-quant-lab"
-version = "0.1.0"
-description = "Dixon-Coles quantitative engine and +EV detector for Italian Serie C (Gironi A/B/C)"
-readme = "README.md"
-requires-python = ">=3.11"
-license = { text = "MIT" }
-dependencies = [
-    "numpy>=2.0",
-    "scipy>=1.13",
-    "pandas>=2.2",
-    "httpx>=0.27",
-    "thefuzz>=0.22",
-    "rapidfuzz>=3.9",
-    "streamlit>=1.38",
-    "plotly>=5.22",
-]
-
-[project.optional-dependencies]
-test = ["pytest>=8", "pytest-asyncio>=0.23", "respx>=0.21"]
-
-[tool.setuptools.packages.find]
-include = ["src*"]
+# Tool configuration only. Serie C Quant Lab is run in place from the repository root
+# (`pip install -r requirements.txt`, then `python main.py` / `streamlit run src/dashboard/app.py`):
+# the code imports the top-level `src` package and reads `config/` relative to the checkout,
+# so it is not distributed as a wheel and there is deliberately no [build-system]/[project] table.
+# Python 3.12+ is required by the pinned numpy/scipy releases (see requirements.txt).
 
 [tool.ruff]
 line-length = 120
-target-version = "py311"
+target-version = "py312"

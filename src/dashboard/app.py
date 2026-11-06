@@ -68,6 +68,8 @@ GIRONE_OPTIONS: Final[tuple[str, ...]] = ("Tutti", "A", "B", "C")
 KELLY_OPTIONS: Final[dict[str, float]] = {"1/8": 0.125, "1/4": 0.25}
 DEFAULT_SIM_ROUNDS: Final[int] = 15
 DEFAULT_SEED: Final[int] = 7
+#: Smallest "goals per team" the heatmap slider allows (a compact view folds the tail into an ``N+`` cell).
+HEATMAP_MIN_GOALS: Final[int] = 3
 #: Full-width keyword per Streamlit command, resolved once for the installed release.
 FULL_WIDTH: Final[dict[str, dict[str, object]]] = {
     name: container_width_kwargs(getattr(st, name)) for name in ("button", "download_button", "dataframe", "plotly_chart")
@@ -201,6 +203,36 @@ def render_ranking_tab(state: PipelineState, girone: Girone | None) -> None:
         st.plotly_chart(strength_figure(table, title=f"Girone {girone.value}: α e β per squadra"), **FULL_WIDTH["plotly_chart"], key=f"strength_{girone.value}")
 
 
+def heatmap_goals_control(full_goals: int) -> int:
+    """Slider choosing how many goals per team the heatmap draws; returns the chosen maximum.
+
+    The range is ``[HEATMAP_MIN_GOALS, full_goals]`` (``full_goals`` = the
+    engine's ``max_goals``, i.e. the whole ``prediction.matrix``) and the default
+    is ``full_goals``, so the complete matrix is shown unless the user asks for
+    a compact view; :func:`heatmap_figure` then folds the tail into an ``N+``
+    row/column so the cells keep summing to 100%. A matrix too small for a
+    range yields ``full_goals`` without rendering a widget.
+    """
+    low = min(HEATMAP_MIN_GOALS, full_goals)
+    if low >= full_goals:
+        return full_goals
+    return int(
+        st.slider(
+            "Gol massimi nella matrice",
+            min_value=low,
+            max_value=full_goals,
+            value=full_goals,
+            step=1,
+            key="heatmap_max_goals",
+            help=(
+                f"{full_goals} = matrice completa del modello. Un valore più basso mostra una vista compatta: "
+                "l'ultima riga/colonna (N+) accorpa la probabilità di N o più gol, "
+                "così le celle sommano sempre al 100%."
+            ),
+        )
+    )
+
+
 def render_match_tab(state: PipelineState, girone: Girone | None) -> None:
     st.subheader("Partita e matrice dei punteggi")
     preds = fixtures_for(state, girone)
@@ -217,7 +249,18 @@ def render_match_tab(state: PipelineState, girone: Girone | None) -> None:
     c2.metric("μ ospiti (gol attesi)", f"{pred.away_rate:.2f}", help=f"Gol attesi di {pred.fixture.away_team}")
     c3.metric("Risultato più probabile", f"{hs}-{as_}", delta=f"{p_top:.1%}", delta_color="off")
     c4.metric("P(Over 2.5)", f"{p_over:.1%}")
-    st.plotly_chart(heatmap_figure(pred), **FULL_WIDTH["plotly_chart"], key="heatmap")
+    full_goals = pred.matrix.shape[0] - 1
+    control, _ = st.columns([1, 2])
+    with control:
+        shown = heatmap_goals_control(full_goals)
+    st.plotly_chart(heatmap_figure(pred, max_goals_shown=shown), **FULL_WIDTH["plotly_chart"], key="heatmap")
+    if shown < full_goals:
+        st.caption(
+            f"Matrice compatta 0-{shown} gol: l'ultima riga e l'ultima colonna ({shown}+) accorpano i punteggi con "
+            f"{shown} o più gol, così le celle sommano sempre al 100%."
+        )
+    else:
+        st.caption(f"Matrice completa 0-{full_goals} gol per squadra: le celle sommano al 100%.")
     st.markdown("**Mercati: probabilità del modello, quota fair e quota del bookmaker**")
     quotes = quotes_for(state, pred.match_id)
     st.dataframe(

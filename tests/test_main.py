@@ -112,3 +112,169 @@ def test_load_odds_dir_skips_malformed_groups(tmp_path: Path) -> None:
     quotes = pipeline.load_odds_dir(tmp_path)
     assert [q.match_id for q in quotes] == ["M1"]
     assert quotes[0].odds == {"1": 2.1, "X": 3.3, "2": 3.4}
+
+
+# ============================================================================ review findings (robustness of the console pipeline)
+def _save_league(tmp_path: Path, league, *, odds: bool = False) -> tuple[Path, Path, Path]:
+    """Write a simulated league in the harvester's CSV layout; returns (matches, fixtures, odds_dir)."""
+    from src.ingestion.harvester import save_fixtures, save_processed
+
+    processed, fixtures, odds_dir = tmp_path / "matches.csv", tmp_path / "fixtures.csv", tmp_path / "odds"
+    save_processed(league.matches, processed)
+    save_fixtures(league.fixtures, fixtures)
+    odds_dir.mkdir()
+    if odds:
+        rows = [
+            {"match_id": q.match_id, "bookmaker": q.bookmaker, "market": q.market.value, "selection": sel, "odds": o}
+            for q in league.odds
+            for sel, o in q.odds.items()
+        ]
+        pd.DataFrame(rows).to_csv(odds_dir / "simbook.csv", index=False)
+    return processed, fixtures, odds_dir
+
+
+def test_auto_prior_is_based_on_matches_per_team_not_total_matches(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """120 matches over 60 teams are 2 per team: the old ``len(matches) < 100`` rule switched the
+    prior off and the pure MLE pinned rho/gamma on their bounds (home multiplier x3). The rule now
+    looks at the matches per team of the least-covered girone."""
+    league = simulate_league(seed=7, n_rounds=4)
+    assert len(league.matches) == 120
+    assert pipeline.matches_per_team(league.matches) == pytest.approx(4.0)
+    assert pipeline.prior_recommended(league.matches)
+    # a full half season (15 per team) is where the MLE takes over; a single thin girone keeps the prior on
+    half = simulate_league(seed=7, n_rounds=15).matches
+    assert pipeline.matches_per_team(half) == pytest.approx(15.0) and not pipeline.prior_recommended(half)
+    thin = half[(half["girone"] != "C") | (half["round"] <= 2)]
+    assert pipeline.matches_per_team(thin) == pytest.approx(2.0) and pipeline.prior_recommended(thin)
+    assert pipeline.matches_per_team(half.iloc[0:0]) == 0.0
+
+    processed, fixtures, _ = _save_league(tmp_path, league)
+    out = pipeline.main(["--processed", str(processed), "--fixtures", str(fixtures), "--no-export", "--log-level", "ERROR"])
+    banner = capsys.readouterr().out
+    assert out.params.penalty > 0.0, "auto prior must be on with 4 matches per team"
+    assert "stima MAP con prior gaussiana (4.0 partite per squadra" in banner
+    assert pipeline.parameters_at_bounds(out.params, out.engine.config) == []
+    assert -0.15 < out.params.rho < 0.15
+    for g, gamma in out.params.gamma.items():
+        assert abs(gamma - league.true_params.gamma[g]) < 0.25, (g, gamma)
+    assert max(r for p in out.predictions for r in (p.home_rate, p.away_rate)) < 4.0
+
+    # the full simulated season (30 per team) still runs the pure MLE under 'auto'
+    full = pipeline.main(["--mode", "full", "--no-export", "--log-level", "ERROR", "--seed", "3"])
+    assert full.params.penalty == 0.0 and not pipeline.prior_recommended(full.matches)
+
+
+def test_parameters_on_optimiser_bounds_are_reported(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """With ``--prior off`` on 2 matches per team the MLE is degenerate: the console must say so."""
+    league = simulate_league(seed=7, n_rounds=4)
+    processed, fixtures, _ = _save_league(tmp_path, league)
+    out = pipeline.main(["--processed", str(processed), "--fixtures", str(fixtures), "--prior", "off", "--no-export", "--log-level", "ERROR"])
+    captured = capsys.readouterr().out
+    hits = pipeline.parameters_at_bounds(out.params, out.engine.config)
+    assert "rho" in hits and len(hits) >= 2
+    assert "ATTENZIONE" in captured and "parametri sui limiti dell'ottimizzatore" in captured and "rho" in captured
+    assert any("limiti dell'ottimizzatore" in n for n in out.notes)
+    # the helper itself
+    from dataclasses import replace as dc_replace
+
+    inside = dc_replace(out.params, rho=0.0, alpha={t: 0.1 for t in out.params.alpha}, beta={t: -0.1 for t in out.params.beta}, gamma={g: 0.3 for g in out.params.gamma})
+    assert pipeline.parameters_at_bounds(inside, out.engine.config) == []
+    on_gamma = dc_replace(inside, gamma={g: out.engine.config.home_bounds[1] for g in inside.gamma})
+    assert pipeline.parameters_at_bounds(on_gamma, out.engine.config) == [f"gamma[{g.value}]" for g in inside.gamma]
+
+
+def test_fixture_with_unknown_team_is_skipped_not_fatal(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """A fixture naming a team (or girone) absent from the fit used to kill the run with KeyError
+    after the ranking was printed; like the dashboard, the console now skips it with a note.
+    (``main()`` re-installs the log handler on ``sys.stderr``, so warnings are read from ``capsys``.)"""
+    from src.common.schemas import Fixture, Girone
+
+    league = simulate_league(seed=9, n_rounds=12)
+    first = league.fixtures[0]
+    league.fixtures.append(Fixture("HAND-1", first.date, first.round, Girone.A, "Sampdoria", first.away_team))
+    girone_c_free = league.matches[league.matches["girone"] != "C"].reset_index(drop=True)
+    league.matches = girone_c_free  # girone C never harvested, but its fixtures are still listed
+    processed, fixtures, odds_dir = _save_league(tmp_path, league, odds=True)
+
+    out = pipeline.main(["--processed", str(processed), "--fixtures", str(fixtures), "--odds", str(odds_dir), "--no-export", "--log-level", "WARNING"])
+    captured, err = capsys.readouterr()
+    n_c = sum(1 for f in league.fixtures if f.girone == Girone.C)
+    assert n_c > 0
+    assert len(out.fixtures) == len(league.fixtures)
+    assert len(out.predictions) == len(league.fixtures) - n_c - 1
+    assert all(p.fixture.match_id != "HAND-1" and p.fixture.girone != Girone.C for p in out.predictions)
+    assert "Sampdoria - " in captured and "partita saltata, squadra non presente nello storico (Sampdoria)" in captured
+    assert "girone C" in captured
+    assert any(n.startswith(f"{n_c + 1} partite in programma saltate") for n in out.notes)
+    assert err.count("WARNING main: fixture not predictable") == n_c + 1 and "match_id=HAND-1" in err
+    # the remaining fixtures are still evaluated against the odds
+    assert out.opportunities and all(o.match_id != "HAND-1" for o in out.opportunities)
+    # the odds for the skipped fixtures are simply not evaluated (the value engine has no prediction for them)
+    assert "5) QUOTE BOOKMAKER" in captured and "6) ALERT REGRESSION_TRAP" in captured
+
+
+def test_missing_explicit_fixtures_or_odds_path_warns(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """A typo in --fixtures/--odds used to be indistinguishable from an empty season (exit 0, silence)."""
+    league = simulate_league(seed=9, n_rounds=12)
+    processed, _, _ = _save_league(tmp_path, league)
+    missing_fx, missing_odds = tmp_path / "nope" / "fixtures.csv", tmp_path / "nope" / "odds"
+    out = pipeline.main(["--processed", str(processed), "--fixtures", str(missing_fx), "--odds", str(missing_odds), "--no-export", "--log-level", "WARNING"])
+    captured, err = capsys.readouterr()
+    assert out.fixtures == [] and out.quotes == [] and out.predictions == []
+    assert f"ATTENZIONE: --fixtures {missing_fx} non trovato" in captured
+    assert f"ATTENZIONE: --odds {missing_odds} non trovato" in captured
+    assert [n for n in out.notes if "non trovato" in n] == [n for n in out.notes[:2]]
+    assert err.count("WARNING main: input path not found") == 2 and "option=--fixtures" in err and "option=--odds" in err
+    # ... while not passing them at all stays silent, as before
+    quiet = pipeline.main(["--processed", str(processed), "--no-export", "--log-level", "WARNING"])
+    quiet_out, quiet_err = capsys.readouterr()
+    assert "non trovato" not in quiet_out and "input path not found" not in quiet_err and quiet.notes == []
+    # a missing --processed is a hard error, not a traceback
+    with pytest.raises(SystemExit) as exc:
+        pipeline.main(["--processed", str(tmp_path / "nope.csv"), "--no-export"])
+    assert exc.value.code == 2 and "file non trovato" in capsys.readouterr().err
+
+
+def test_load_odds_dir_tolerates_empty_file_and_reports_blank_and_duplicate_rows(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    """``pd.read_csv`` on a zero-byte export raised EmptyDataError and aborted the run; the shared
+    loader skips it. Blank key cells and duplicated selections are reported instead of vanishing."""
+    import logging
+
+    good = {"match_id": "M1", "bookmaker": "Bet365", "market": "1X2"}
+    rows = [dict(good, selection=s, odds=o) for s, o in (("1", 2.1), ("X", 3.3), ("2", 3.4))]
+    rows.append(dict(good, selection="1", odds=2.2))  # same selection quoted twice: last price wins
+    rows.append({"match_id": "M1", "bookmaker": None, "market": "OU2.5", "selection": "Over 2.5", "odds": 1.9})  # blank bookmaker
+    rows.append({"match_id": "M1", "bookmaker": None, "market": "OU2.5", "selection": "Under 2.5", "odds": 1.9})
+    pd.DataFrame(rows).to_csv(tmp_path / "book.csv", index=False)
+    (tmp_path / "aborted_export.csv").write_bytes(b"")
+    notes: list[str] = []
+    with caplog.at_level(logging.WARNING):
+        quotes = pipeline.load_odds_dir(tmp_path, notes=notes)
+    assert [(q.match_id, q.bookmaker, q.market) for q in quotes] == [("M1", "Bet365", Market.MATCH_ODDS)]
+    assert quotes[0].odds["1"] == 2.2
+    messages = [r.getMessage() for r in caplog.records]
+    assert "odds file unreadable, skipped" in messages  # the empty CSV
+    assert "odds rows with empty key cells dropped" in messages
+    assert "duplicate odds rows: only the last price per selection is kept" in messages
+    assert len(notes) == 2 and "2 righe" in notes[0] and "M1/Bet365/1X2/1" in notes[1]
+    # same result through the CLI path, and the notes reach the console
+    assert pipeline.load_odds_dir(tmp_path) == quotes
+
+
+def test_console_value_table_names_the_bookmaker(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """With several books quoting the same selection the rows were indistinguishable."""
+    league = simulate_league(seed=9, n_rounds=12)
+    processed, fixtures, odds_dir = _save_league(tmp_path, league, odds=True)
+    second = pd.read_csv(odds_dir / "simbook.csv")
+    second["bookmaker"] = "OtherBook"
+    second["odds"] = (second["odds"] * 1.08).round(2)  # a better price everywhere
+    second.to_csv(odds_dir / "otherbook.csv", index=False)
+
+    out = pipeline.main(["--processed", str(processed), "--fixtures", str(fixtures), "--odds", str(odds_dir), "--no-export", "--log-level", "ERROR"])
+    captured = capsys.readouterr().out
+    value = [o for o in out.opportunities if o.value]
+    assert value and {o.bookmaker for o in value} >= {"OtherBook"}
+    table = captured.split("5) QUOTE BOOKMAKER")[1].split("riepilogo:")[0]
+    header = next(line for line in table.splitlines() if "book_odds" in line)
+    assert header.split().index("bookmaker") == header.split().index("book_odds") - 1
+    assert "OtherBook" in table

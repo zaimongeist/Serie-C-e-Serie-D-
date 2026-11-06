@@ -26,7 +26,7 @@ import time
 from dataclasses import dataclass, field, replace
 from datetime import date
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Final, Iterable, Sequence
 
 import numpy as np
 import pandas as pd
@@ -52,45 +52,143 @@ def _banner(title: str) -> None:
     print(f"\n{line}\n{title}\n{line}")
 
 
-def load_odds_dir(odds_dir: Path) -> list[OddsQuote]:
+#: Key columns of a bookmaker odds row; two rows sharing all four quote the same selection twice.
+ODDS_KEY_COLUMNS: Final[tuple[str, ...]] = ("match_id", "bookmaker", "market", "selection")
+
+
+def _audit_odds_file(csv_path: Path, notes: list[str]) -> None:
+    """Warn about rows the odds parser has to drop or collapse silently.
+
+    Rows with an empty ``match_id``/``bookmaker``/``market``/``selection`` cell
+    cannot be attributed to a quote and are dropped; two rows with the same
+    ``(match_id, bookmaker, market, selection)`` quote one selection twice and
+    only the last price survives. Both are almost always export mistakes, so
+    they are reported (log + console note) instead of vanishing. Unreadable
+    files and missing columns are left to the parser, which skips them with its
+    own warning.
+    """
+    try:
+        frame = pd.read_csv(csv_path, dtype="string")
+    except (pd.errors.EmptyDataError, pd.errors.ParserError, OSError, UnicodeDecodeError):
+        return
+    if any(c not in frame.columns for c in ODDS_KEY_COLUMNS):
+        return
+    keys = frame[list(ODDS_KEY_COLUMNS)]
+    blank = keys.isna().any(axis=1)
+    if blank.any():
+        n_blank = int(blank.sum())
+        log.warning("odds rows with empty key cells dropped", extra={"file": str(csv_path), "rows": n_blank})
+        notes.append(f"{csv_path.name}: {n_blank} righe con match_id/bookmaker/market/selection vuoti ignorate.")
+    duplicated = keys[~blank].duplicated(keep=False)
+    if duplicated.any():
+        dup_keys = keys[~blank][duplicated].drop_duplicates()
+        sample = ", ".join("/".join(map(str, row)) for row in dup_keys.head(3).itertuples(index=False))
+        log.warning(
+            "duplicate odds rows: only the last price per selection is kept",
+            extra={"file": str(csv_path), "rows": int(duplicated.sum()), "selections": len(dup_keys)},
+        )
+        notes.append(
+            f"{csv_path.name}: {len(dup_keys)} selezioni quotate più volte dallo stesso bookmaker "
+            f"(tengo l'ultima quota): {sample}" + (" ..." if len(dup_keys) > 3 else "")
+        )
+
+
+def load_odds_dir(odds_dir: Path, *, notes: list[str] | None = None) -> list[OddsQuote]:
     """Load bookmaker odds from ``odds_dir/*.csv``.
 
     Expected columns: ``match_id, bookmaker, market, selection, odds`` -- one row
     per selection. ``market`` uses the :class:`Market` values (``1X2``, ``OU2.5``,
     ``GG/NG`` ...). Rows belonging to the same (match, bookmaker, market) are
-    grouped into one :class:`OddsQuote`; incomplete groups are skipped with a
-    warning.
+    grouped into one :class:`OddsQuote`.
+
+    The parser is the dashboard's :func:`src.dashboard.state.load_odds_quotes`,
+    so the console and the Streamlit app read exactly the same files the same
+    way: an empty or unreadable CSV, a file with missing columns, an unknown
+    market, an incomplete selection set or odds ``<= 1`` are skipped with a
+    warning instead of aborting the run. On top of that, rows with empty key
+    cells and duplicated ``(match_id, bookmaker, market, selection)`` rows are
+    reported (see :func:`_audit_odds_file`); ``notes`` collects those messages
+    for the console.
     """
-    quotes: list[OddsQuote] = []
-    for csv in sorted(Path(odds_dir).glob("*.csv")):
-        df = pd.read_csv(csv)
-        required = {"match_id", "bookmaker", "market", "selection", "odds"}
-        if not required.issubset(df.columns):
-            log.warning("odds file skipped: missing columns", extra={"file": str(csv), "columns": list(df.columns)})
-            continue
-        for (match_id, bookmaker, market), grp in df.groupby(["match_id", "bookmaker", "market"], sort=False):
-            try:
-                quotes.append(
-                    OddsQuote(
-                        match_id=str(match_id),
-                        bookmaker=str(bookmaker),
-                        market=Market(str(market)),
-                        odds={str(r.selection): float(r.odds) for r in grp.itertuples(index=False)},
-                    )
-                )
-            except ValueError as exc:
-                log.warning("odds group skipped", extra={"match_id": match_id, "market": market, "error": str(exc)})
-    return quotes
+    from src.dashboard.state import load_odds_quotes
+
+    directory = Path(odds_dir)
+    notes = [] if notes is None else notes
+    for csv_path in sorted(directory.glob("*.csv")):
+        _audit_odds_file(csv_path, notes)
+    return load_odds_quotes(directory)
 
 
-def load_real_data(processed: Path, fixtures: Path | None, odds_dir: Path | None) -> tuple[pd.DataFrame, list[Fixture], list[OddsQuote]]:
-    """Load harvested data (see ``src/ingestion/harvester.py`` for the writers)."""
+def _missing_input(option: str, path: Path, fallback: str, notes: list[str]) -> None:
+    """A path the user typed explicitly does not exist: say so instead of pretending the input is empty."""
+    log.warning("input path not found", extra={"option": option, "path": str(path)})
+    notes.append(f"{option} {path} non trovato: {fallback}.")
+
+
+def load_real_data(
+    processed: Path,
+    fixtures: Path | None,
+    odds_dir: Path | None,
+    *,
+    notes: list[str] | None = None,
+) -> tuple[pd.DataFrame, list[Fixture], list[OddsQuote]]:
+    """Load harvested data (see ``src/ingestion/harvester.py`` for the writers).
+
+    ``fixtures``/``odds_dir`` are optional, but when a path *is* given and does
+    not exist the run must not look like a legitimate empty season: a warning is
+    logged and appended to ``notes`` (printed by :func:`main`) and the missing
+    input is treated as empty.
+    """
     from src.ingestion.harvester import load_fixtures, load_processed
 
+    notes = [] if notes is None else notes
     matches = load_processed(Path(processed))
-    fx = load_fixtures(Path(fixtures)) if fixtures and Path(fixtures).exists() else []
-    quotes = load_odds_dir(Path(odds_dir)) if odds_dir and Path(odds_dir).exists() else []
+    fx: list[Fixture] = []
+    if fixtures is not None:
+        if Path(fixtures).is_file():
+            fx = load_fixtures(Path(fixtures))
+        else:
+            _missing_input("--fixtures", Path(fixtures), "nessuna partita in programma da prevedere", notes)
+    quotes: list[OddsQuote] = []
+    if odds_dir is not None:
+        if Path(odds_dir).is_dir():
+            quotes = load_odds_dir(Path(odds_dir), notes=notes)
+        else:
+            _missing_input("--odds", Path(odds_dir), "nessuna quota bookmaker, salto il calcolo EV", notes)
     return matches, fx, quotes
+
+
+# ------------------------------------------------------------------ diagnostics
+#: ``--prior auto`` keeps the Gaussian prior on while the least-covered girone averages
+#: fewer than this many played matches per team (``2 * matches / teams``). A threshold on
+#: the *total* number of matches ignores the 60-team league: 100 matches are < 2 per team
+#: and the pure MLE then drives gamma and rho onto their bounds. In a parameter-recovery
+#: study on ``simulate_league`` (10 seeds per season length) the MLE still ended on a bound
+#: in 3/10 fits at 8 matches per team, 2/10 at 10 and 1/10 at 12; from 15 matches per team
+#: no fit hit a bound and the largest home-advantage error fell below 0.45.
+# ``--prior auto`` rule: shared with the dashboard so console and UI agree.
+from src.dashboard.state import PRIOR_MIN_MATCHES_PER_TEAM, matches_per_team, prior_recommended  # noqa: E402
+
+def parameters_at_bounds(params: FittedParams, config: DixonColesConfig, *, tol: float = 1e-3) -> list[str]:
+    """Names of the fitted parameters sitting on an optimiser bound.
+
+    A bound-constrained estimate (``alpha``/``beta`` at ``param_bounds``,
+    ``gamma`` at ``home_bounds``, ``rho`` at ``rho_bounds``) is the signature of
+    an under-determined fit: the data want to push the parameter further, the
+    reported value is just where the optimiser stopped, and every probability
+    derived from it (and every EV) inherits that bias.
+    """
+
+    def on_bound(value: float, bounds: tuple[float, float]) -> bool:
+        lo, hi = bounds
+        return value <= lo + tol or value >= hi - tol
+
+    hits = [f"alpha[{team}]" for team, v in params.alpha.items() if on_bound(v, config.param_bounds)]
+    hits += [f"beta[{team}]" for team, v in params.beta.items() if on_bound(v, config.param_bounds)]
+    hits += [f"gamma[{g.value}]" for g, v in params.gamma.items() if on_bound(v, config.home_bounds)]
+    if on_bound(params.rho, config.rho_bounds):
+        hits.append("rho")
+    return hits
 
 
 # ------------------------------------------------------------------------ pipeline
@@ -123,6 +221,7 @@ def run_pipeline(
     """Fit -> predict -> value, printing each step when ``verbose``."""
     matches = validate_matches_df(matches)
     say = print if verbose else (lambda *a, **k: None)
+    notes: list[str] = []
 
     # 1. dataset ---------------------------------------------------------------
     if verbose:
@@ -148,6 +247,16 @@ def run_pipeline(
     for g, gamma in params.gamma.items():
         alphas = [params.alpha[t] for t in params.teams_by_girone.get(g, ())]
         say(f"girone {g.value}: gamma (fattore campo) = {gamma:+.4f}  -> moltiplicatore casa x{np.exp(gamma):.3f} | somma alpha = {sum(alphas):+.2e} | squadre = {len(alphas)}")
+    at_bounds = parameters_at_bounds(params, config)
+    if at_bounds:
+        shown = ", ".join(at_bounds[:6]) + (" ..." if len(at_bounds) > 6 else "")
+        warning = (
+            f"ATTENZIONE: {len(at_bounds)} parametri sui limiti dell'ottimizzatore ({shown}): stima poco affidabile "
+            f"({matches_per_team(matches):.1f} partite per squadra nel girone meno coperto); usa --prior on o più partite."
+        )
+        say(warning)
+        log.warning("parameters at optimiser bounds", extra={"parameters": at_bounds, "n_matches": params.n_matches})
+        notes.append(warning)
 
     # 3. ranking ---------------------------------------------------------------
     if verbose:
@@ -160,7 +269,23 @@ def run_pipeline(
     # 4. predictions -----------------------------------------------------------
     if verbose:
         _banner("4) PREVISIONI PROSSIMO TURNO")
-    predictions = engine.predict_fixtures(fixtures)
+    predictions: list[MatchPrediction] = []
+    skipped: list[str] = []
+    for fx in fixtures:
+        try:
+            predictions.append(engine.predict(fx))
+        except (KeyError, ValueError) as exc:
+            # a team (or girone) without played matches in the dataset: early season, hand-edited
+            # fixtures.csv, girone not harvested ... skip the fixture instead of aborting the run.
+            skipped.append(fx.label)
+            unknown = [t for t in (fx.home_team, fx.away_team) if t not in params.alpha]
+            if fx.girone not in params.gamma:
+                unknown.append(f"girone {fx.girone.value}")
+            reason = ", ".join(unknown) if unknown else str(exc).splitlines()[0][:120]
+            log.warning("fixture not predictable", extra={"match_id": fx.match_id, "error": str(exc)})
+            say(f"[{fx.girone.value}] {fx.date} {fx.label}: partita saltata, squadra non presente nello storico ({reason})")
+    if skipped:
+        notes.append(f"{len(skipped)} partite in programma saltate (squadre non presenti nello storico): {', '.join(skipped[:5])}" + (" ..." if len(skipped) > 5 else "") + ".")
     for p in predictions:
         fx = p.fixture
         hs, as_, ps = p.most_likely_score()
@@ -176,7 +301,7 @@ def run_pipeline(
             f"O2.5={pou['Over 2.5']:.1%} GG={pgg['GG']:.1%} | risultato più probabile {hs}-{as_} ({ps:.1%})"
         )
     if not predictions:
-        say("nessuna partita in programma nel dataset.")
+        say("nessuna partita in programma nel dataset." if not skipped else "nessuna partita in programma prevedibile.")
 
     # 5-6. value + traps -------------------------------------------------------
     if verbose:
@@ -193,7 +318,7 @@ def run_pipeline(
     say(f"quote valutate: {len(opportunities)}   soglia EV: {value_engine.min_ev:+.1%}   Kelly frazionario: x{value_engine.kelly.fraction}   bankroll: {value_engine.kelly.bankroll_units:.0f} unità")
     if value:
         vf = value_engine.to_frame(value)
-        show = vf[["home_team", "away_team", "market", "selection", "book_odds", "fair_odds", "p_model", "p_implied_devig", "ev", "stake_units", "flags"]].copy()
+        show = vf[["home_team", "away_team", "market", "selection", "bookmaker", "book_odds", "fair_odds", "p_model", "p_implied_devig", "ev", "stake_units", "flags"]].copy()
         show["ev"] = (show["ev"] * 100).round(2).astype(str) + "%"
         show["p_model"] = (show["p_model"] * 100).round(1).astype(str) + "%"
         show["p_implied_devig"] = (show["p_implied_devig"] * 100).round(1).astype(str) + "%"
@@ -221,7 +346,7 @@ def run_pipeline(
         export_path = value_engine.export_csv(opportunities, Path(export))
         say(f"report CSV scritto in: {export_path}")
 
-    return PipelineOutput(matches, list(fixtures), list(quotes), params, engine, predictions, opportunities, traps, frame, export_path)
+    return PipelineOutput(matches, list(fixtures), list(quotes), params, engine, predictions, opportunities, traps, frame, export_path, notes=notes)
 
 
 def recovery_report(league: SimulatedLeague, params: FittedParams) -> pd.DataFrame:
@@ -261,7 +386,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--prior",
         choices=["auto", "on", "off"],
         default="auto",
-        help="Gaussian (MAP) prior on alpha/beta, home advantage and rho: auto = on below 100 matches (default), off = pure MLE",
+        help=(
+            "Gaussian (MAP) prior on alpha/beta, home advantage and rho: auto (default) = on while the least-covered "
+            f"girone has fewer than {PRIOR_MIN_MATCHES_PER_TEAM:g} played matches per team, on = always, off = pure MLE"
+        ),
     )
     p.add_argument("--l2", type=float, default=None, help="override the alpha/beta ridge strength (default from the prior)")
     p.add_argument("--kelly", type=float, choices=[0.125, 0.25], default=0.125, help="Kelly fraction")
@@ -290,8 +418,11 @@ def main(argv: Sequence[str] | None = None) -> PipelineOutput:
     configure_logging(args.log_level, json_output=args.log_json, force=True)
 
     league: SimulatedLeague | None = None
+    input_notes: list[str] = []
     if args.processed:
-        matches, fixtures, quotes = load_real_data(args.processed, args.fixtures, args.odds)
+        if not Path(args.processed).is_file():
+            build_parser().error(f"--processed {args.processed}: file non trovato")
+        matches, fixtures, quotes = load_real_data(args.processed, args.fixtures, args.odds, notes=input_notes)
         xi = 0.0018 if args.xi is None else args.xi
         source = f"dati reali: {args.processed}"
     else:
@@ -303,21 +434,28 @@ def main(argv: Sequence[str] | None = None) -> PipelineOutput:
         xi = 0.0 if args.xi is None else args.xi
         source = f"dataset simulato ({args.mode}, seed={args.seed})" + (f", trappola di regressione iniettata su {trap_team}" if trap_team else "")
 
-    use_prior = (len(matches) < 100) if args.prior == "auto" else (args.prior == "on")
+    use_prior = prior_recommended(matches) if args.prior == "auto" else (args.prior == "on")
     if use_prior:
-        # Small sample: a Gaussian prior (alpha/beta sd 0.30, home advantage 0.25 +- 0.15,
-        # rho sd 0.10) keeps gamma and rho off their bounds. With a full season the data
-        # dominate and the MAP estimate is practically the MLE.
+        # Thin sample (few matches per team, not few matches in total: 100 matches over 60
+        # teams are < 2 each): a Gaussian prior (alpha/beta sd 0.30, home advantage
+        # 0.25 +- 0.15, rho sd 0.10) keeps gamma and rho off their bounds. With a full season
+        # the data dominate and the MAP estimate is practically the MLE.
         config = DixonColesConfig.with_gaussian_prior(xi=xi, method=args.method)
-        source += " | stima MAP con prior gaussiana (campione piccolo)"
+        source += (
+            f" | stima MAP con prior gaussiana ({matches_per_team(matches):.1f} partite per squadra nel girone "
+            f"meno coperto, soglia {PRIOR_MIN_MATCHES_PER_TEAM:g})"
+        )
     else:
         config = DixonColesConfig(xi=xi, method=args.method)
     if args.l2 is not None:
         config = replace(config, l2_penalty=args.l2)
 
     _banner(f"SERIE C QUANT LAB -- {source}")
+    for note in input_notes:
+        print(f"ATTENZIONE: {note}")
     value_engine = ValueEngine(min_ev=args.min_ev, kelly=KellyConfig(fraction=args.kelly, bankroll_units=args.bankroll))
     out = run_pipeline(matches, fixtures, quotes, config=config, value_engine=value_engine, export=None if args.no_export else args.export)
+    out.notes = input_notes + out.notes
 
     if league is not None and args.mode == "full":
         _banner("VERIFICA: RECUPERO DEI PARAMETRI VERI DEL SIMULATORE")

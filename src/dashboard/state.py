@@ -8,7 +8,8 @@ dashboard can be unit-tested without a browser:
   :class:`PipelineState` snapshot;
 * the ``*_table`` helpers turn that snapshot into ``pandas`` frames with
   Italian column labels, ready for ``st.dataframe``;
-* :func:`heatmap_figure` builds the score-matrix Plotly figure;
+* :func:`heatmap_figure` builds the score-matrix Plotly figure (whole matrix
+  by default, or a compact view whose last row/column aggregate the tail);
 * :func:`export_csv_bytes` serialises any frame for ``st.download_button``.
 
 Bookmaker odds are read from ``odds_dir/*.csv`` in the same format
@@ -49,6 +50,9 @@ __all__ = [
     "MIN_SIM_ROUNDS",
     "ODDS_COLUMNS",
     "PRIOR_THRESHOLD_MATCHES",
+    "PRIOR_MIN_MATCHES_PER_TEAM",
+    "matches_per_team",
+    "prior_recommended",
     "RANKING_COLUMNS",
     "TRAPS_COLUMNS",
     "VALUE_COLUMNS",
@@ -75,7 +79,10 @@ log = get_logger(__name__)
 
 Source = Literal["processed", "simulated"]
 
-#: Below this many played matches the Gaussian (MAP) prior is switched on automatically.
+#: ``use_prior=None`` switches the Gaussian (MAP) prior on while the least-covered
+#: girone has fewer than this many played matches per team (same rule as ``main.py``).
+PRIOR_MIN_MATCHES_PER_TEAM: Final[float] = 15.0
+#: Kept for backwards compatibility: the old rule was a total-match threshold.
 PRIOR_THRESHOLD_MATCHES: Final[int] = 100
 
 #: Smallest number of played rounds a simulated league can have (the fit needs matches).
@@ -121,6 +128,7 @@ VALUE_COLUMNS: Final[tuple[str, ...]] = (
     "Partita",
     "Mercato",
     "Esito",
+    "Bookmaker",
     "Quota Book",
     "Quota Fair",
     "P. Modello (%)",
@@ -265,9 +273,29 @@ def _pick_trap_team(matches: pd.DataFrame, fixtures: Sequence[Fixture], girone: 
     return None
 
 
-def _model_config(n_matches: int, *, xi: float, use_prior: bool | None) -> tuple[DixonColesConfig, bool]:
+def matches_per_team(matches: pd.DataFrame) -> float:
+    """Average played matches per team in the least-covered girone (``2 * n / teams``), 0.0 when empty."""
+    if matches.empty:
+        return 0.0
+    coverage = []
+    for _, group in matches.groupby("girone", observed=True):
+        teams = set(group["home_team"]) | set(group["away_team"])
+        coverage.append(2.0 * len(group) / len(teams))
+    return float(min(coverage))
+
+
+def prior_recommended(matches: pd.DataFrame, *, min_matches_per_team: float = PRIOR_MIN_MATCHES_PER_TEAM) -> bool:
+    """Auto rule: MAP estimate while some girone has fewer than ``min_matches_per_team`` matches per team.
+
+    A total-match threshold is misleading for a 60-team league (100 matches are
+    fewer than 2 per team), so coverage is measured per team in the thinnest girone.
+    """
+    return matches_per_team(matches) < min_matches_per_team
+
+
+def _model_config(matches: pd.DataFrame, *, xi: float, use_prior: bool | None) -> tuple[DixonColesConfig, bool]:
     """Resolve the ``use_prior`` tri-state into a config; returns ``(config, prior_on)``."""
-    prior_on = (n_matches < PRIOR_THRESHOLD_MATCHES) if use_prior is None else bool(use_prior)
+    prior_on = prior_recommended(matches) if use_prior is None else bool(use_prior)
     if prior_on:
         return DixonColesConfig.with_gaussian_prior(xi=xi), True
     return DixonColesConfig(xi=xi), False
@@ -378,8 +406,9 @@ def build_state(
         ``n_rounds`` played rounds, the next round as fixtures) and a
         REGRESSION_TRAP is injected on one Girone A team of the next round.
     Model
-        ``use_prior=None`` enables the Gaussian prior when fewer than
-        :data:`PRIOR_THRESHOLD_MATCHES` matches are available; ``True`` forces
+        ``use_prior=None`` enables the Gaussian prior while the least-covered
+        girone has fewer than :data:`PRIOR_MIN_MATCHES_PER_TEAM` played matches
+        per team (see :func:`prior_recommended`); ``True`` forces
         :meth:`DixonColesConfig.with_gaussian_prior`, ``False`` the plain MLE.
         ``xi`` is the time-decay rate per day.
     Value
@@ -414,7 +443,7 @@ def build_state(
         source = "simulated"
         matches, fixtures, quotes = _simulated_inputs(seed, n_rounds, notes)
 
-    config, prior_on = _model_config(len(matches), xi=xi, use_prior=use_prior)
+    config, prior_on = _model_config(matches, xi=xi, use_prior=use_prior)
     engine = DixonColesEngine(config)
     params = engine.fit(matches)
     notes.append(
@@ -539,22 +568,61 @@ def no_odds_message(state: PipelineState) -> str:
     return "Nessuna quota del bookmaker sintetico per le partite in programma: il pannello EV resta vuoto."
 
 
-def heatmap_figure(prediction: MatchPrediction, max_goals_shown: int = 6) -> go.Figure:
+def _fold_matrix(matrix: np.ndarray, n: int) -> np.ndarray:
+    """``n x n`` copy of a score matrix whose last row/column collect the mass beyond ``n - 1`` goals.
+
+    ``n`` must be in ``[1, matrix.shape[0]]``. Cell ``(i, j)`` with ``i, j < n - 1``
+    is ``matrix[i, j]``; row ``n - 1`` holds ``P(home >= n - 1, away = j)``,
+    column ``n - 1`` holds ``P(home = i, away >= n - 1)`` and the corner holds
+    ``P(home >= n - 1, away >= n - 1)``, so the result sums to the same total
+    as ``matrix``. With ``n == matrix.shape[0]`` it is a plain copy.
+    """
+    m = np.asarray(matrix, dtype=float)
+    if not 1 <= n <= m.shape[0]:
+        raise ValueError(f"n must be in [1, {m.shape[0]}], got {n}")
+    folded = m[:n, :n].copy()
+    last = n - 1
+    folded[last, :last] = m[last:, :last].sum(axis=0)
+    folded[:last, last] = m[:last, last:].sum(axis=1)
+    folded[last, last] = m[last:, last:].sum()
+    return folded
+
+
+def heatmap_figure(prediction: MatchPrediction, max_goals_shown: int | None = None) -> go.Figure:
     """Score-matrix heatmap: home goals on the y axis, away goals on the x axis.
 
-    Exactly one :class:`plotly.graph_objects.Heatmap` trace holding
-    ``matrix[:max_goals_shown + 1, :max_goals_shown + 1] * 100`` (percentages),
-    annotated with one decimal, single-hue ``Blues`` colourscale, the most
-    likely score outlined with a rectangle. The ``plotly`` template is used so
-    Streamlit can re-theme it for light and dark modes; fixed height 520.
+    Exactly one :class:`plotly.graph_objects.Heatmap` trace holding the score
+    matrix in percentages, annotated with one decimal, single-hue ``Blues``
+    colourscale, the most likely score outlined with a rectangle. By default
+    (``max_goals_shown=None``) the **whole** ``prediction.matrix`` is drawn
+    (``11 x 11`` for the engine default ``max_goals=10``), so the cells add up
+    to 100%. A smaller ``max_goals_shown`` gives a compact
+    ``(max_goals_shown + 1)^2`` view whose last row and column, labelled
+    ``N+``, collect the probability of ``N`` or more goals: the displayed cells
+    still sum to 100% instead of silently dropping the tail (the outline is
+    skipped when the most likely score falls into an aggregated cell). Values
+    at or above the matrix size draw the full matrix; negative values raise
+    :class:`ValueError`. The ``plotly`` template is used so Streamlit can
+    re-theme it for light and dark modes; fixed height 520.
     """
-    if max_goals_shown < 0:
+    full = int(prediction.matrix.shape[0])
+    if max_goals_shown is None:
+        n = full
+    elif max_goals_shown < 0:
         raise ValueError("max_goals_shown must be >= 0")
+    else:
+        n = min(int(max_goals_shown) + 1, full)
+    folded = n < full
     fx = prediction.fixture
-    n = min(max_goals_shown + 1, prediction.matrix.shape[0])
-    z = np.asarray(prediction.matrix[:n, :n], dtype=float) * 100.0
+    z = _fold_matrix(prediction.matrix, n) * 100.0
     goals = list(range(n))
+    labels = [str(g) for g in goals]
+    if folded:
+        labels[-1] = f"{n - 1}+"
     text = [[f"{z[i, j]:.1f}%" for j in goals] for i in goals]
+    hover = [
+        [f"{fx.home_team} {labels[i]} - {labels[j]} {fx.away_team}<br>P = {z[i, j]:.2f}%" for j in goals] for i in goals
+    ]
     heat = go.Heatmap(
         z=z,
         x=goals,
@@ -566,13 +634,15 @@ def heatmap_figure(prediction: MatchPrediction, max_goals_shown: int = 6) -> go.
         zmin=0.0,
         zmax=float(z.max()) if z.size else 1.0,
         colorbar={"title": {"text": "%"}, "ticksuffix": "%", "thickness": 14},
-        hovertemplate=f"{fx.home_team} %{{y}} - %{{x}} {fx.away_team}<br>P = %{{z:.2f}}%<extra></extra>",
+        hovertext=hover,
+        hovertemplate="%{hovertext}<extra></extra>",
         xgap=2,
         ygap=2,
     )
     fig = go.Figure(data=[heat])
     home_goals, away_goals, p_top = prediction.most_likely_score()
-    if home_goals < n and away_goals < n:
+    exact = n - 1 if folded else n  # indices below this are single scores, not aggregated tails
+    if home_goals < exact and away_goals < exact:
         fig.add_shape(
             type="rect",
             x0=away_goals - 0.5,
@@ -582,17 +652,31 @@ def heatmap_figure(prediction: MatchPrediction, max_goals_shown: int = 6) -> go.
             line={"color": _HIGHLIGHT_COLOR, "width": 3},
             fillcolor="rgba(0,0,0,0)",
         )
+    subtitle = (
+        f"λ casa = {prediction.home_rate:.2f} · μ ospiti = {prediction.away_rate:.2f} · "
+        f"risultato più probabile {home_goals}-{away_goals} ({p_top:.1%})"
+    )
+    if folded:
+        subtitle += f" · {n - 1}+ = {n - 1} o più gol"
     fig.update_layout(
         template="plotly",
-        title={
-            "text": (
-                f"{fx.label} · Girone {fx.girone.value} · {fx.date.isoformat()}<br>"
-                f"<sup>λ casa = {prediction.home_rate:.2f} · μ ospiti = {prediction.away_rate:.2f} · "
-                f"risultato più probabile {home_goals}-{away_goals} ({p_top:.1%})</sup>"
-            )
+        title={"text": f"{fx.label} · Girone {fx.girone.value} · {fx.date.isoformat()}<br><sup>{subtitle}</sup>"},
+        xaxis={
+            "title": {"text": f"Gol {fx.away_team}"},
+            "tickmode": "array",
+            "tickvals": goals,
+            "ticktext": labels,
+            "side": "top",
+            "showgrid": False,
         },
-        xaxis={"title": {"text": f"Gol {fx.away_team}"}, "tickmode": "array", "tickvals": goals, "side": "top", "showgrid": False},
-        yaxis={"title": {"text": f"Gol {fx.home_team}"}, "tickmode": "array", "tickvals": goals, "autorange": "reversed", "showgrid": False},
+        yaxis={
+            "title": {"text": f"Gol {fx.home_team}"},
+            "tickmode": "array",
+            "tickvals": goals,
+            "ticktext": labels,
+            "autorange": "reversed",
+            "showgrid": False,
+        },
         height=520,
         margin={"l": 70, "r": 30, "t": 110, "b": 40},
     )
@@ -700,6 +784,7 @@ def value_table(state: PipelineState, min_ev: float, girone: Girone | None = Non
             "Partita": f"{o.home_team} - {o.away_team}",
             "Mercato": MARKET_LABELS[o.market],
             "Esito": o.selection,
+            "Bookmaker": o.bookmaker,
             "Quota Book": round(o.book_odds, 2),
             "Quota Fair": round(o.fair_odds, 2),
             "P. Modello (%)": round(o.p_model * 100.0, 1),
@@ -712,7 +797,7 @@ def value_table(state: PipelineState, min_ev: float, girone: Girone | None = Non
     ]
     frame = pd.DataFrame(rows, columns=list(VALUE_COLUMNS))
     frame = frame.assign(Data=pd.to_datetime(frame["Data"]).astype("datetime64[ns]"))
-    for c in ("Girone", "Partita", "Mercato", "Esito", "Flag"):
+    for c in ("Girone", "Partita", "Mercato", "Esito", "Bookmaker", "Flag"):
         frame[c] = frame[c].astype("string")
     for c in ("Quota Book", "Quota Fair", "P. Modello (%)", "EV (%)", "Stake (unità)"):
         frame[c] = frame[c].astype("float64")

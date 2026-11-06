@@ -38,6 +38,19 @@ intercept) is added to the objective to stabilise very small datasets; ``l2_pena
 home-advantage parameters towards ``home_prior`` and rho towards 0, which keeps a
 20-match sample from driving gamma or rho onto their bounds.
 
+Time-decay weights can *collapse*: one mistyped far-future date (which becomes
+the default reference date) or an explicit reference date far after the sample
+makes every other match weigh ``exp(-xi * thousands of days)``, so the
+optimiser "converges" on a handful of matches or on pure rounding noise. After
+computing the weights :meth:`DixonColesEngine.fit` therefore runs
+:func:`time_weight_diagnostics`: when ``effective_n`` (the sum of the weights)
+falls below ``min_effective_n_ratio * n_matches`` the fit is flagged as
+degenerate (``FittedParams.degenerate_weights``, ``converged=False`` and an
+explanatory ``message``), a warning is logged, or ``ValueError`` is raised with
+``on_weight_collapse='raise'``. A reference date before the first match (which
+silently turns the decay off) or far after the last one is logged and recorded
+in ``FittedParams.fit_warnings`` as well.
+
 Input frames are validated with :func:`src.common.schemas.validate_matches_df`
 and then range-checked: negative goals and rows with ``home_team == away_team``
 raise ``ValueError`` (the same rules :class:`src.common.schemas.MatchRecord`
@@ -51,7 +64,7 @@ from __future__ import annotations
 import json
 import math
 import time
-from dataclasses import asdict, dataclass, fields
+from dataclasses import MISSING, asdict, dataclass, fields
 from datetime import date, datetime
 from difflib import get_close_matches
 from pathlib import Path
@@ -79,6 +92,7 @@ __all__ = [
     "LikelihoodData",
     "NotFittedError",
     "TeamIndex",
+    "WeightDiagnostics",
     "build_team_index",
     "dixon_coles_pmf",
     "markets_from_matrix",
@@ -88,11 +102,13 @@ __all__ = [
     "pack_theta",
     "prepare_likelihood_data",
     "tau",
+    "time_weight_diagnostics",
     "time_weights",
     "unpack_theta",
     "TAU_FLOOR",
     "LOG_RATE_CLIP",
     "METHODS",
+    "WEIGHT_COLLAPSE_POLICIES",
 ]
 
 log = get_logger(__name__)
@@ -103,8 +119,11 @@ TAU_FLOOR: Final[float] = 1e-10
 LOG_RATE_CLIP: Final[float] = 50.0
 #: Supported scipy optimisers.
 METHODS: Final[tuple[str, ...]] = ("SLSQP", "L-BFGS-B")
+#: What :meth:`DixonColesEngine.fit` does when the time-decay weights collapse.
+WEIGHT_COLLAPSE_POLICIES: Final[tuple[str, ...]] = ("warn", "raise")
 
 MethodName = Literal["SLSQP", "L-BFGS-B"]
+WeightCollapsePolicy = Literal["warn", "raise"]
 
 _OU_LINES: Final[dict[Market, float]] = {
     Market.OVER_UNDER_15: 1.5,
@@ -212,6 +231,179 @@ def time_weights(
     age_days = (ref - series).dt.days.to_numpy(dtype=np.float64)
     age_days = np.clip(age_days, 0.0, None)
     return np.exp(-float(xi) * age_days)
+
+
+def _normalised_dates(dates: pd.Series | np.ndarray | Iterable[Any]) -> pd.Series:
+    """``dates`` as a naive, midnight-normalised datetime Series (``ValueError`` on NaT)."""
+    if isinstance(dates, pd.Series):
+        series = dates
+    elif isinstance(dates, np.ndarray):
+        series = pd.Series(dates)
+    else:
+        series = pd.Series(list(dates))
+    series = pd.to_datetime(series)
+    if series.dt.tz is not None:
+        series = series.dt.tz_localize(None)
+    series = series.dt.normalize().reset_index(drop=True)
+    if series.isna().any():
+        raise ValueError("dates contain missing values (NaT)")
+    return series
+
+
+@dataclass(frozen=True)
+class WeightDiagnostics:
+    """Health summary of the time-decay weights of one fit (see :func:`time_weight_diagnostics`).
+
+    ``effective_n`` is the sum of the weights and ``effective_n_ratio`` its share
+    of ``n_matches`` (1.0 when ``xi == 0``). ``lead_days`` is how many days the
+    reference date lies *after* the latest match (negative when it falls inside
+    or before the sample) and ``newest_weight`` the weight a match played on the
+    latest date receives. ``latest_gap_days`` is the distance between the latest
+    match date and the second most recent distinct date, and
+    ``second_latest_weight_ratio = exp(-xi * latest_gap_days)`` how much lighter
+    that second date is: a huge gap with a tiny ratio is the signature of a
+    mistyped far-future date. ``n_for_95pct`` is the smallest number of matches
+    whose weights add up to 95% of the total (1 when a single match carries
+    everything); ``heaviest_match_id``/``heaviest_date`` identify the match with
+    the largest weight.
+    """
+
+    n_matches: int
+    effective_n: float
+    effective_n_ratio: float
+    reference_date: date
+    earliest_date: date
+    latest_date: date
+    lead_days: int
+    newest_weight: float
+    latest_gap_days: int
+    second_latest_weight_ratio: float
+    n_for_95pct: int
+    heaviest_match_id: str | None
+    heaviest_date: date
+
+    def is_collapsed(self, min_effective_n_ratio: float) -> bool:
+        """True when ``effective_n < min_effective_n_ratio * n_matches`` (never when the ratio is 0)."""
+        if not min_effective_n_ratio > 0.0:
+            return False
+        return bool(self.effective_n < float(min_effective_n_ratio) * self.n_matches)
+
+    def describe(self, min_effective_n_ratio: float) -> str:
+        """Human-readable diagnosis of a collapse, naming the most likely cause."""
+        parts = [
+            (
+                f"time-decay weights collapsed: effective_n = {self.effective_n:.3g} of {self.n_matches} matches "
+                f"(ratio {self.effective_n_ratio:.2e} < min_effective_n_ratio {float(min_effective_n_ratio):g})"
+            )
+        ]
+        if self.lead_days > 0 and self.newest_weight < 0.5:
+            parts.append(
+                f"reference_date {self.reference_date.isoformat()} is {self.lead_days} days after the latest match "
+                f"({self.latest_date.isoformat()}), so even the newest match weighs only {self.newest_weight:.2e}"
+            )
+        if self.n_for_95pct < 0.5 * self.n_matches:
+            who = f"match_id {self.heaviest_match_id!r} " if self.heaviest_match_id is not None else ""
+            parts.append(
+                f"{self.n_for_95pct} match(es) carry 95% of the total weight "
+                f"(heaviest: {who}dated {self.heaviest_date.isoformat()})"
+            )
+            if self.latest_gap_days > 0 and self.second_latest_weight_ratio < 0.05:
+                parts.append(
+                    f"the latest match date is {self.latest_gap_days} days after the second most recent one, "
+                    f"which weighs {self.second_latest_weight_ratio:.2e} relative to it: probable mistyped date"
+                )
+        parts.append(
+            "the estimates are not reliable: fix mistyped dates, pass a reference_date inside or just after the sample, or lower xi"
+        )
+        return "; ".join(parts)
+
+    def to_dict(self) -> dict[str, Any]:
+        """JSON-friendly representation (dates ISO) for structured logging."""
+        payload = asdict(self)
+        for key in ("reference_date", "earliest_date", "latest_date", "heaviest_date"):
+            payload[key] = payload[key].isoformat()
+        return payload
+
+
+def time_weight_diagnostics(
+    dates: pd.Series | np.ndarray | Iterable[Any],
+    weights: np.ndarray | Iterable[float],
+    reference_date: date | datetime | pd.Timestamp,
+    xi: float,
+    *,
+    match_ids: pd.Series | np.ndarray | Iterable[Any] | None = None,
+) -> WeightDiagnostics:
+    """Summarise how the time-decay ``weights`` of ``dates`` are distributed.
+
+    ``weights`` are normally :func:`time_weights` of the same dates (passing
+    them avoids recomputing); ``match_ids`` (same length) lets the heaviest
+    match be named. ``ValueError`` for an empty sample or mismatched lengths.
+    """
+    series = _normalised_dates(dates)
+    w = np.asarray(list(weights) if not isinstance(weights, np.ndarray) else weights, dtype=float).ravel()
+    n = int(series.size)
+    if n == 0:
+        raise ValueError("no matches: cannot diagnose time-decay weights")
+    if w.shape != (n,):
+        raise ValueError(f"weights must have one entry per date ({n}), got shape {w.shape}")
+    if not np.all(np.isfinite(w)) or (w < 0).any():
+        raise ValueError("weights must be finite and non-negative")
+    ids: list[str] | None = None
+    if match_ids is not None:
+        ids = [str(m) for m in (match_ids.tolist() if hasattr(match_ids, "tolist") else list(match_ids))]
+        if len(ids) != n:
+            raise ValueError(f"match_ids must have one entry per date ({n}), got {len(ids)}")
+    ref = pd.Timestamp(reference_date)
+    if ref.tzinfo is not None:
+        ref = ref.tz_localize(None)
+    ref = ref.normalize()
+    latest = series.max()
+    earliest = series.min()
+    total = float(w.sum())
+    lead_days = int((ref - latest).days)
+    newest_weight = float(np.exp(-float(xi) * max(lead_days, 0)))
+    distinct = np.sort(series.unique())
+    latest_gap_days = int((distinct[-1] - distinct[-2]) / np.timedelta64(1, "D")) if distinct.size >= 2 else 0
+    second_ratio = float(np.exp(-float(xi) * latest_gap_days))
+    order = np.argsort(-w, kind="stable")
+    if total > 0.0:
+        cumulative = np.cumsum(w[order])
+        n_for_95 = int(min(np.searchsorted(cumulative, 0.95 * total, side="left") + 1, n))
+    else:
+        n_for_95 = n
+    heaviest = int(order[0])
+    return WeightDiagnostics(
+        n_matches=n,
+        effective_n=total,
+        effective_n_ratio=total / n,
+        reference_date=ref.date(),
+        earliest_date=earliest.date(),
+        latest_date=latest.date(),
+        lead_days=lead_days,
+        newest_weight=newest_weight,
+        latest_gap_days=latest_gap_days,
+        second_latest_weight_ratio=second_ratio,
+        n_for_95pct=n_for_95,
+        heaviest_match_id=ids[heaviest] if ids is not None else None,
+        heaviest_date=series.iloc[heaviest].date(),
+    )
+
+
+def _reference_date_note(diag: WeightDiagnostics, xi: float) -> str:
+    """Warning text for a reference date outside the sample (empty when there is nothing to say)."""
+    if diag.reference_date < diag.earliest_date:
+        return (
+            f"reference_date {diag.reference_date.isoformat()} precedes the earliest match ({diag.earliest_date.isoformat()}): "
+            f"every match gets weight 1 and xi={xi:g} has no effect (equivalent to xi=0)"
+        )
+    if diag.lead_days > 0 and diag.newest_weight < 0.5:
+        return (
+            f"reference_date {diag.reference_date.isoformat()} is {diag.lead_days} days after the latest match "
+            f"({diag.latest_date.isoformat()}): every match is discounted by at least {1.0 - diag.newest_weight:.0%} "
+            f"(newest weight {diag.newest_weight:.3g}), which makes an active Gaussian prior {1.0 / diag.newest_weight:.1f}x "
+            "stronger relative to the data; pass a reference_date closer to the sample unless this is intended"
+        )
+    return ""
 
 
 def _poisson_pmf(ks: np.ndarray, rate: float) -> np.ndarray:
@@ -647,6 +839,17 @@ class DixonColesConfig:
     off (0.0) by default so the estimator stays the pure weighted MLE. Use
     :meth:`with_gaussian_prior` to express the three strengths as prior standard
     deviations (``l2 = 1 / (2 sigma^2)``).
+
+    ``min_effective_n_ratio`` guards against collapsed time-decay weights: when
+    the sum of the weights is smaller than this fraction of the number of
+    matches (one far-future date typo, or a reference date decades after the
+    sample) the fit is degenerate. With ``on_weight_collapse='warn'`` (default)
+    it is still computed but reported with ``converged=False``,
+    ``degenerate_weights=True`` and a diagnosis in ``message``; with ``'raise'``
+    :meth:`DixonColesEngine.fit` raises ``ValueError`` before optimising. ``0.0``
+    disables the guard. The default 0.1 is far below what a legitimate long
+    window produces (five seasons at the default xi still keep about 30% of
+    the nominal sample).
     """
 
     xi: float = 0.0018
@@ -663,6 +866,8 @@ class DixonColesConfig:
     l2_penalty_home: float = 0.0
     home_prior: float = 0.0
     l2_penalty_rho: float = 0.0
+    min_effective_n_ratio: float = 0.1
+    on_weight_collapse: WeightCollapsePolicy = "warn"
 
     def __post_init__(self) -> None:
         if self.xi < 0:
@@ -671,6 +876,12 @@ class DixonColesConfig:
             raise ValueError(f"max_goals must be >= 1, got {self.max_goals}")
         if self.method not in METHODS:
             raise ValueError(f"method must be one of {METHODS}, got {self.method!r}")
+        ratio = self.min_effective_n_ratio
+        if not (isinstance(ratio, (int, float)) and np.isfinite(ratio) and 0.0 <= ratio <= 1.0):
+            raise ValueError(f"min_effective_n_ratio must be a number in [0, 1], got {ratio!r}")
+        object.__setattr__(self, "min_effective_n_ratio", float(ratio))
+        if self.on_weight_collapse not in WEIGHT_COLLAPSE_POLICIES:
+            raise ValueError(f"on_weight_collapse must be one of {WEIGHT_COLLAPSE_POLICIES}, got {self.on_weight_collapse!r}")
         for name in ("rho_bounds", "home_bounds", "param_bounds"):
             lo, hi = getattr(self, name)
             if not float(lo) < float(hi):
@@ -761,10 +972,19 @@ class FittedParams:
 
     ``log_likelihood`` is the weighted log-likelihood at the optimum *without*
     the ridge penalty (``penalty`` is reported separately); ``effective_n`` is
-    the sum of the time-decay weights. ``method`` is the optimiser that actually
-    produced the parameters: it differs from ``DixonColesConfig.method`` only when
-    an L-BFGS-B solution violated ``param_bounds`` and the engine re-solved with
+    the sum of the time-decay weights and :attr:`effective_n_ratio` its share of
+    ``n_matches``. ``method`` is the optimiser that actually produced the
+    parameters: it differs from ``DixonColesConfig.method`` only when an
+    L-BFGS-B solution violated ``param_bounds`` and the engine re-solved with
     SLSQP, in which case ``message`` documents the fallback.
+
+    ``converged`` is True only when the optimiser reported success *and* the
+    time-decay weights did not collapse; ``degenerate_weights`` is True when
+    they did (``effective_n`` below ``DixonColesConfig.min_effective_n_ratio``
+    times ``n_matches``), in which case ``message`` starts with the diagnosis.
+    ``fit_warnings`` collects every data-quality note raised during the fit
+    (collapsed weights, a reference date outside the sample); it is empty for a
+    clean fit.
     """
 
     alpha: dict[str, float]
@@ -784,6 +1004,8 @@ class FittedParams:
     fit_seconds: float
     method: str
     max_goals: int
+    degenerate_weights: bool = False
+    fit_warnings: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         self.alpha = {str(k): float(v) for k, v in self.alpha.items()}
@@ -792,8 +1014,15 @@ class FittedParams:
         self.teams_by_girone = {Girone.parse(k): tuple(str(t) for t in v) for k, v in self.teams_by_girone.items()}
         self.reference_date = _coerce_date(self.reference_date)
         self.rho = float(self.rho)
+        self.degenerate_weights = bool(self.degenerate_weights)
+        self.fit_warnings = tuple(str(w) for w in self.fit_warnings)
 
     # ----------------------------------------------------------------- views
+    @property
+    def effective_n_ratio(self) -> float:
+        """``effective_n / n_matches``: 1.0 for a stationary fit, near 0 when the weights collapsed."""
+        return self.effective_n / self.n_matches if self.n_matches > 0 else 0.0
+
     @property
     def teams(self) -> tuple[str, ...]:
         """All teams in girone order (A, B, C), alphabetical within a girone."""
@@ -848,12 +1077,18 @@ class FittedParams:
             "fit_seconds": self.fit_seconds,
             "method": self.method,
             "max_goals": self.max_goals,
+            "effective_n_ratio": self.effective_n_ratio,
+            "degenerate_weights": self.degenerate_weights,
+            "fit_warnings": list(self.fit_warnings),
         }
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> "FittedParams":
+        """Inverse of :meth:`to_dict`; fields with defaults (``degenerate_weights``,
+        ``fit_warnings``) may be absent, so payloads written before they existed load."""
         known = {f.name for f in fields(cls)}
-        missing = known - set(payload)
+        required = {f.name for f in fields(cls) if f.default is MISSING and f.default_factory is MISSING}
+        missing = required - set(payload)
         if missing:
             raise ValueError(f"fitted-parameter payload is missing fields: {sorted(missing)}")
         return cls(**{k: v for k, v in payload.items() if k in known})
@@ -974,6 +1209,14 @@ class DixonColesEngine:
         date for the time-decay defaults to the most recent match date.
         ``warm_start`` initialises the optimiser from a previous fit when its team
         set matches the current one (it is ignored, with a warning, otherwise).
+
+        The time-decay weights are checked with :func:`time_weight_diagnostics`:
+        when they collapse (``effective_n < min_effective_n_ratio * n_matches``)
+        the result carries ``degenerate_weights=True`` and ``converged=False``
+        with the diagnosis in ``message`` and ``fit_warnings``, or ``ValueError``
+        is raised when ``DixonColesConfig.on_weight_collapse == 'raise'``. A
+        reference date before the first match (decay switched off) or far after
+        the last one is logged and recorded in ``fit_warnings``.
         """
         started = time.perf_counter()
         cfg = self.config
@@ -993,10 +1236,30 @@ class DixonColesEngine:
             l2_penalty_rho=cfg.l2_penalty_rho,
         )
         effective_n = float(data.w.sum())
+        n_matches = len(data.x)
+        weights = data.w if len(data.w) == len(validated) else time_weights(validated["date"], ref_date, cfg.xi)
+        diag = time_weight_diagnostics(validated["date"], weights, ref_date, cfg.xi, match_ids=validated["match_id"])
+        collapsed = diag.is_collapsed(cfg.min_effective_n_ratio)
+        fit_warnings: list[str] = []
+        collapse_note = ""
+        if collapsed:
+            collapse_note = diag.describe(cfg.min_effective_n_ratio)
+            if cfg.on_weight_collapse == "raise":
+                raise ValueError(collapse_note)
+            log.warning(
+                "time-decay weights collapsed: the fit is degenerate",
+                extra={**diag.to_dict(), "min_effective_n_ratio": cfg.min_effective_n_ratio, "xi": cfg.xi},
+            )
+            fit_warnings.append(collapse_note)
+        elif cfg.xi > 0:
+            note = _reference_date_note(diag, cfg.xi)
+            if note:
+                log.warning("reference_date lies outside the match sample", extra={**diag.to_dict(), "xi": cfg.xi})
+                fit_warnings.append(note)
         log.info(
             "fitting Dixon-Coles",
             extra={
-                "n_matches": int(len(data.x)),
+                "n_matches": n_matches,
                 "n_teams": index.n_teams,
                 "gironi": [g.value for g in index.gironi],
                 "method": cfg.method,
@@ -1006,6 +1269,8 @@ class DixonColesEngine:
                 "l2_penalty_rho": cfg.l2_penalty_rho,
                 "reference_date": ref_date.isoformat(),
                 "effective_n": round(effective_n, 3),
+                "effective_n_ratio": round(diag.effective_n_ratio, 4),
+                "degenerate_weights": collapsed,
             },
         )
 
@@ -1048,8 +1313,10 @@ class DixonColesEngine:
             gamma_map = {g: float(gamma[i]) for i, g in enumerate(index.gironi)}
         else:
             gamma_map = {g: float(gamma[0]) for g in Girone}
-        converged = bool(result.success)
-        message = fallback_note + str(result.message)
+        optimizer_message = fallback_note + str(result.message)
+        # A collapsed weight vector makes the optimiser's own success flag meaningless.
+        converged = bool(result.success) and not collapsed
+        message = f"{collapse_note} [optimiser: {optimizer_message}]" if collapsed else optimizer_message
         n_iter = int(getattr(result, "nit", 0) or 0)
         seconds = time.perf_counter() - started
         params = FittedParams(
@@ -1062,7 +1329,7 @@ class DixonColesEngine:
             xi=cfg.xi,
             log_likelihood=float(ll),
             penalty=float(penalty),
-            n_matches=int(len(data.x)),
+            n_matches=n_matches,
             effective_n=effective_n,
             converged=converged,
             message=message,
@@ -1070,6 +1337,8 @@ class DixonColesEngine:
             fit_seconds=float(seconds),
             method=method_used,
             max_goals=cfg.max_goals,
+            degenerate_weights=collapsed,
+            fit_warnings=tuple(fit_warnings),
         )
         self._params = params
         self._index = index
@@ -1079,7 +1348,9 @@ class DixonColesEngine:
             extra={
                 "method": method_used,
                 "converged": converged,
-                "optimizer_message": message,
+                "degenerate_weights": collapsed,
+                "effective_n_ratio": round(diag.effective_n_ratio, 4),
+                "optimizer_message": optimizer_message,
                 "n_iter": n_iter,
                 "log_likelihood": round(float(ll), 4),
                 "penalty": round(float(penalty), 6),

@@ -1,9 +1,11 @@
 """Tests for the Streamlit dashboard: data layer (``src.dashboard.state``) and UI (``src.dashboard.app``)."""
 from __future__ import annotations
 
+import base64
 import dataclasses
 import inspect
 import io
+import json
 import os
 import socket
 import subprocess
@@ -12,6 +14,7 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import numpy as np
 import pandas as pd
@@ -48,6 +51,9 @@ from src.dashboard.state import (
 from src.ingestion.harvester import save_fixtures, save_processed
 from src.simulation.generator import simulate_league, simulate_mini_dataset
 
+if TYPE_CHECKING:
+    from streamlit.testing.v1 import AppTest
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 APP_PATH = REPO_ROOT / "src" / "dashboard" / "app.py"
 
@@ -63,6 +69,26 @@ def write_odds_csv(quotes: list[OddsQuote], path: Path) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     pd.DataFrame(rows, columns=["match_id", "bookmaker", "market", "selection", "odds"]).to_csv(path, index=False)
     return path
+
+
+def plotly_array(value: object) -> np.ndarray:
+    """Decode a Plotly JSON array (plain list or the ``{dtype, bdata, shape}`` typed-array encoding)."""
+    if isinstance(value, dict) and "bdata" in value:
+        arr = np.frombuffer(base64.b64decode(value["bdata"]), dtype=np.dtype(value["dtype"]))
+        if "shape" in value:
+            arr = arr.reshape([int(s) for s in str(value["shape"]).split(",")])
+        return arr
+    return np.asarray(value)
+
+
+def rendered_heatmap(at: AppTest) -> tuple[np.ndarray, dict]:
+    """``(z in %, layout)`` of the ``key="heatmap"`` chart as serialised to the Streamlit front end."""
+    charts = [c for c in at.get("plotly_chart") if c.proto.id.endswith("-heatmap")]
+    assert len(charts) == 1, [c.proto.id for c in at.get("plotly_chart")]
+    spec = json.loads(charts[0].proto.spec)
+    (trace,) = spec["data"]
+    assert trace["type"] == "heatmap"
+    return plotly_array(trace["z"]).astype(float), spec["layout"]
 
 
 @pytest.fixture(scope="module")
@@ -242,8 +268,8 @@ def test_heatmap_figure_shape(sim_state: PipelineState) -> None:
     assert isinstance(fig, go.Figure)
     assert len(fig.data) == 1 and fig.data[0].type == "heatmap"
     z = np.asarray(fig.data[0].z)
-    assert z.shape == (7, 7)
-    assert np.allclose(z, pred.matrix[:7, :7] * 100.0)
+    assert z.shape == pred.matrix.shape == (11, 11)
+    assert np.allclose(z, pred.matrix * 100.0)
     assert [list(stop) for stop in fig.data[0].colorscale] == [list(stop) for stop in pc.get_colorscale("Blues")]
     assert fig.layout.height == 520
     assert fig.layout.template == pio.templates["plotly"], "the 'plotly' template lets Streamlit re-theme the figure"
@@ -256,6 +282,71 @@ def test_heatmap_figure_shape(sim_state: PipelineState) -> None:
     assert shape.x0 == as_ - 0.5 and shape.y0 == hs - 0.5
     small = heatmap_figure(pred, max_goals_shown=3)
     assert np.asarray(small.data[0].z).shape == (4, 4)
+    with pytest.raises(ValueError):
+        heatmap_figure(pred, max_goals_shown=-1)
+
+
+def test_heatmap_figure_shows_whole_matrix_by_default(sim_state: PipelineState) -> None:
+    """Regression: the default view used to be a 7x7 corner (0..6 goals) of the 11x11 matrix.
+
+    The spec asks for a heatmap *of the matrix* (P(X, Y) up to 10 goals), so the
+    whole ``prediction.matrix`` must be drawn and the cells must add up to 100%,
+    also for the highest-scoring fixture, where the dropped tail was largest.
+    """
+    busiest = max(sim_state.predictions, key=lambda p: p.home_rate + p.away_rate)
+    for pred in (sim_state.predictions[0], busiest):
+        fig = heatmap_figure(pred)
+        z = np.asarray(fig.data[0].z, dtype=float)
+        assert z.shape == pred.matrix.shape
+        assert np.allclose(z, pred.matrix * 100.0)
+        assert abs(float(z.sum()) - 100.0) < 1e-6, "the complete distribution is displayed"
+        n = pred.matrix.shape[0]
+        assert list(fig.data[0].x) == list(range(n)) and list(fig.data[0].y) == list(range(n))
+        assert list(fig.layout.xaxis.ticktext) == [str(g) for g in range(n)]
+        assert list(fig.layout.yaxis.ticktext) == [str(g) for g in range(n)]
+        assert "+" not in "".join(fig.layout.xaxis.ticktext) and "o più gol" not in fig.layout.title.text
+        # the corner the old default showed is the same data, just no longer the whole story
+        assert np.allclose(z[:7, :7], pred.matrix[:7, :7] * 100.0)
+    # the old 7x7 corner really was incomplete for the busiest fixture
+    assert busiest.matrix[:7, :7].sum() < 1.0 - 1e-4
+    # explicit values at or above the matrix size are the same full view
+    for shown in (busiest.matrix.shape[0] - 1, busiest.matrix.shape[0] + 5):
+        full = heatmap_figure(busiest, max_goals_shown=shown)
+        assert np.allclose(np.asarray(full.data[0].z, dtype=float), busiest.matrix * 100.0)
+        assert "+" not in "".join(full.layout.xaxis.ticktext)
+
+
+def test_heatmap_figure_compact_view_folds_tail_into_last_cell(sim_state: PipelineState) -> None:
+    """A compact view aggregates the probability beyond N into an ``N+`` row/column (cells still sum to 100%)."""
+    pred = max(sim_state.predictions, key=lambda p: p.home_rate + p.away_rate)
+    m = pred.matrix
+    fig = heatmap_figure(pred, max_goals_shown=6)
+    z = np.asarray(fig.data[0].z, dtype=float)
+    assert z.shape == (7, 7)
+    assert abs(float(z.sum()) - 100.0) < 1e-6
+    assert np.allclose(z[:6, :6], m[:6, :6] * 100.0), "exact scores are untouched"
+    assert np.allclose(z[6, :6], m[6:, :6].sum(axis=0) * 100.0), "last row = P(home >= 6, away = j)"
+    assert np.allclose(z[:6, 6], m[:6, 6:].sum(axis=1) * 100.0), "last column = P(home = i, away >= 6)"
+    assert np.isclose(z[6, 6], m[6:, 6:].sum() * 100.0), "corner = P(home >= 6, away >= 6)"
+    assert z[6, 6] > m[6, 6] * 100.0, "the fold adds the dropped tail mass"
+    labels = ["0", "1", "2", "3", "4", "5", "6+"]
+    assert list(fig.layout.xaxis.ticktext) == labels and list(fig.layout.yaxis.ticktext) == labels
+    assert list(fig.layout.xaxis.tickvals) == list(range(7))
+    assert "6+ = 6 o più gol" in fig.layout.title.text
+    hover = np.asarray(fig.data[0].hovertext)
+    assert hover.shape == (7, 7)
+    assert hover[6, 0].startswith(f"{pred.fixture.home_team} 6+ - 0 {pred.fixture.away_team}")
+    assert hover[0, 6].startswith(f"{pred.fixture.home_team} 0 - 6+ {pred.fixture.away_team}")
+    assert fig.data[0].hovertemplate == "%{hovertext}<extra></extra>"
+    text = np.asarray(fig.data[0].text)
+    assert text[6, 6] == f"{z[6, 6]:.1f}%"
+    hs, as_, _ = pred.most_likely_score()
+    assert len(fig.layout.shapes) == (1 if hs < 6 and as_ < 6 else 0), "no outline on an aggregated cell"
+    # degenerate compact view: one '0+' cell holding everything, no misleading outline
+    single = heatmap_figure(pred, max_goals_shown=0)
+    z1 = np.asarray(single.data[0].z, dtype=float)
+    assert z1.shape == (1, 1) and np.isclose(z1[0, 0], 100.0)
+    assert list(single.layout.xaxis.ticktext) == ["0+"] and len(single.layout.shapes) == 0
 
 
 def test_markets_table_rows(sim_state: PipelineState) -> None:
@@ -477,3 +568,38 @@ def test_app_survives_out_of_range_env(monkeypatch: pytest.MonkeyPatch) -> None:
     assert not at.exception, [e.value for e in at.exception]
     assert len(at.selectbox(key="fixture").options) == 30
     assert any("seed=7, 15 giornate giocate" in m.value for m in at.markdown)
+
+
+def test_app_heatmap_renders_complete_matrix(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Regression: the rendered heatmap used to be a 7x7 corner summing to < 100%.
+
+    Decodes the Plotly spec actually sent to the front end: by default the full
+    11x11 matrix is drawn (cells sum to 100%); the 'Gol massimi nella matrice'
+    slider gives a compact view whose last row/column aggregate the tail, so the
+    cells still sum to 100%.
+    """
+    from streamlit.testing.v1 import AppTest
+
+    monkeypatch.setenv("SERIEC_FORCE_SIMULATE", "1")
+    monkeypatch.setenv("SERIEC_SIM_ROUNDS", "8")
+    at = AppTest.from_file(str(APP_PATH), default_timeout=240)
+    at.run()
+    assert not at.exception, [e.value for e in at.exception]
+    slider = at.slider(key="heatmap_max_goals")
+    assert slider.value == 10 and slider.min == 3 and slider.max == 10
+    z, layout = rendered_heatmap(at)
+    assert z.shape == (11, 11), "the whole score matrix (0..10 goals) is drawn"
+    assert abs(float(z.sum()) - 100.0) < 1e-6
+    assert list(layout["xaxis"]["tickvals"]) == list(range(11))
+    assert list(layout["xaxis"]["ticktext"]) == [str(g) for g in range(11)]
+    assert any("Matrice completa 0-10 gol" in c.value for c in at.caption)
+
+    slider.set_value(6).run()
+    assert not at.exception, [e.value for e in at.exception]
+    z6, layout6 = rendered_heatmap(at)
+    assert z6.shape == (7, 7)
+    assert abs(float(z6.sum()) - 100.0) < 1e-6, "the compact view folds the tail instead of dropping it"
+    assert np.allclose(z6[:6, :6], z[:6, :6])
+    assert np.isclose(z6[6, 6], z[6:, 6:].sum()) and np.allclose(z6[6, :6], z[6:, :6].sum(axis=0))
+    assert list(layout6["xaxis"]["ticktext"]) == ["0", "1", "2", "3", "4", "5", "6+"]
+    assert any("(6+)" in c.value and "100%" in c.value for c in at.caption)

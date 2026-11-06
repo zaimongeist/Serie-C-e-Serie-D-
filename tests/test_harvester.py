@@ -1264,3 +1264,60 @@ async def test_harvest_warns_when_a_metric_is_never_located(http_cfg: HttpConfig
             await SofaScoreProvider(client, base, matcher).harvest(Girone.A, season_id=SEASON_ID, rounds=[1])
     assert not [r for r in caplog.records if r.getMessage() == "statistics metrics never located"]  # xG present in one payload
     assert hv._warn_missing_metrics([], base.stat_keys, "sofascore") == []  # no payload fetched: nothing to judge
+
+
+# ============================================================================ review findings (python floor, fixture duplicates)
+def test_ingestion_package_parses_under_python_311_grammar() -> None:
+    """``pyproject.toml`` advertises ``requires-python = ">=3.11"``: no module in the
+    ingestion package may use syntax newer than 3.11 (``run_concurrently`` used to be
+    declared with PEP 695 ``def f[T]`` syntax, which made the harvester -- and every
+    importer such as ``main.py`` and the dashboard -- fail to even compile on 3.11)."""
+    import ast
+    import subprocess
+
+    package_dir = Path(hv.__file__).parent
+    sources = sorted(package_dir.glob("*.py"))
+    assert Path(hv.__file__) in sources and len(sources) >= 3
+    for source in sources:
+        ast.parse(source.read_text(encoding="utf-8"), filename=str(source), feature_version=(3, 11))
+    # The generic contract is preserved through a classic TypeVar.
+    assert isinstance(hv.T, __import__("typing").TypeVar)
+    assert "T" in hv.run_concurrently.__annotations__["coroutines"]
+    # Belt and braces: when a real 3.11 interpreter is present, let it parse the module too.
+    py311 = shutil.which("python3.11")
+    if py311:
+        proc = subprocess.run(
+            [py311, "-I", "-c", "import ast, sys; ast.parse(open(sys.argv[1], encoding='utf-8').read(), sys.argv[1])", str(hv.__file__)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert proc.returncode == 0, proc.stderr
+
+
+def test_load_fixtures_dedupes_by_match_id_keeps_first_and_warns(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    """A repeated line in ``fixtures.csv`` used to yield a duplicated prediction in
+    ``main.py`` and a duplicated selector entry / export row in the dashboard."""
+    first = Fixture("SS-1", date(2025, 9, 6), 3, Girone.A, "AlbinoLeffe", "Lumezzane")
+    second = Fixture("FM-2", date(2025, 9, 14), 4, Girone.B, "Rimini", "Pontedera")
+    third = Fixture("SS-3", date(2025, 9, 14), 4, Girone.C, "Catania", "Benevento")
+    conflicting = dataclasses.replace(first, home_team="Virtus Verona", away_team="Trento")  # same id, different content
+    path = Harvester.save_fixtures([first, second, first, conflicting, third, second], tmp_path / "fixtures.csv")
+    assert sum(1 for line in path.read_text(encoding="utf-8").splitlines() if line.strip()) == 7  # header + 6 rows on disk
+
+    with caplog.at_level(logging.WARNING, logger="src.ingestion.harvester"):
+        loaded = Harvester.load_fixtures(path)
+
+    assert loaded == [first, second, third]  # unique, first occurrence wins, file order preserved
+    assert len({f.match_id for f in loaded}) == len(loaded)
+    warnings = [r for r in caplog.records if r.getMessage() == "duplicate fixtures dropped, first occurrence kept"]
+    assert len(warnings) == 1
+    assert warnings[0].dropped == 3 and warnings[0].kept == 3 and warnings[0].match_ids == ["FM-2", "SS-1"]
+    assert warnings[0].path == str(path)
+    assert hv.load_fixtures(path) == loaded  # module-level alias used by main.py / dashboard shares the behaviour
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="src.ingestion.harvester"):
+        clean = Harvester.load_fixtures(Harvester.save_fixtures([first, second], tmp_path / "clean.csv"))
+    assert clean == [first, second]
+    assert not [r for r in caplog.records if "duplicate fixtures" in r.getMessage()]

@@ -38,7 +38,7 @@ from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
-from typing import Any, Final
+from typing import Any, Final, TypeVar
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import httpx
@@ -800,7 +800,13 @@ def _first_leaf(group: BaseExceptionGroup) -> BaseException:
     return leaves[0] if leaves else group
 
 
-async def run_concurrently[T](coroutines: Iterable[Coroutine[Any, Any, T]]) -> list[T]:
+#: Result type of the coroutines awaited by :func:`run_concurrently`. Declared
+#: with :class:`typing.TypeVar` rather than PEP 695 ``def f[T]`` syntax so the
+#: module keeps parsing on Python 3.11, the floor advertised in ``pyproject.toml``.
+T = TypeVar("T")
+
+
+async def run_concurrently(coroutines: Iterable[Coroutine[Any, Any, T]]) -> list[T]:
     """Await ``coroutines`` concurrently and return their results in order.
 
     Unlike a bare :func:`asyncio.gather`, the first failure cancels every
@@ -1568,7 +1574,14 @@ class Harvester:
 
     @staticmethod
     def load_fixtures(path: Path = PROCESSED_DIR / "fixtures.csv") -> list[Fixture]:
-        """Read fixtures written by :meth:`save_fixtures`."""
+        """Read fixtures written by :meth:`save_fixtures`.
+
+        Rows are deduplicated by ``match_id`` (first occurrence wins, file order
+        otherwise preserved), mirroring :meth:`harvest_all`. A hand-edited or
+        concatenated CSV with a repeated line would otherwise surface as a
+        duplicated prediction in ``main.py`` and as a duplicated entry in the
+        dashboard's match selector and CSV export; duplicates are logged.
+        """
         path = Path(path)
         try:
             raw = pd.read_csv(path, dtype="string", keep_default_na=False)
@@ -1578,16 +1591,33 @@ class Harvester:
         if missing:
             raise ValueError(f"fixtures file {path} is missing columns {missing}")
         out: list[Fixture] = []
+        seen: set[str] = set()
+        duplicates: dict[str, int] = {}
         for row in raw.itertuples(index=False):
+            match_id = str(row.match_id)
+            if match_id in seen:
+                duplicates[match_id] = duplicates.get(match_id, 0) + 1
+                continue
+            seen.add(match_id)
             out.append(
                 Fixture(
-                    match_id=str(row.match_id),
+                    match_id=match_id,
                     date=date.fromisoformat(str(row.date)[:10]),
                     round=_as_int(row.round, 0),
                     girone=Girone.parse(str(row.girone)),
                     home_team=str(row.home_team),
                     away_team=str(row.away_team),
                 )
+            )
+        if duplicates:
+            log.warning(
+                "duplicate fixtures dropped, first occurrence kept",
+                extra={
+                    "path": str(path),
+                    "dropped": int(sum(duplicates.values())),
+                    "match_ids": sorted(duplicates),
+                    "kept": len(out),
+                },
             )
         return out
 

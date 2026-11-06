@@ -9,6 +9,7 @@ on dtypes and column order.
 from __future__ import annotations
 
 import math
+import warnings
 from dataclasses import asdict, dataclass, field, fields
 from datetime import date, datetime
 from enum import Enum
@@ -16,6 +17,8 @@ from typing import Any, Final, Iterable, Mapping, Sequence
 
 import numpy as np
 import pandas as pd
+
+from src.common.logging_config import get_logger
 
 __all__ = [
     "Girone",
@@ -29,10 +32,14 @@ __all__ = [
     "MatchPrediction",
     "Market",
     "SELECTIONS",
+    "ValidationReport",
     "matches_to_frame",
     "validate_matches_df",
+    "validate_matches_report",
     "empty_matches_frame",
 ]
+
+log = get_logger(__name__)
 
 
 class Girone(str, Enum):
@@ -284,15 +291,154 @@ def matches_to_frame(records: Iterable[MatchRecord]) -> pd.DataFrame:
     return validate_matches_df(pd.DataFrame(rows))
 
 
+#: How many offending ``match_id`` values are quoted in log lines and errors.
+_MAX_IDS_IN_MESSAGE: Final[int] = 10
+
+
+@dataclass(frozen=True)
+class ValidationReport:
+    """What :func:`validate_matches_df` dropped, so callers can show it.
+
+    ``missing_required`` lists the rows (by ``match_id``, or ``row <label>`` when
+    the id itself is missing) dropped because a required cell was empty or could
+    not be parsed; ``missing_by_column`` counts the offending cells per column
+    (``{"date": 19}`` pinpoints a column-wide date problem at once).
+    ``duplicates`` lists the ``match_id`` values that occurred more than once;
+    only their last occurrence survives. The report is also attached to the
+    returned frame as ``frame.attrs["validation"]`` (see :meth:`to_dict`).
+    """
+
+    n_input: int
+    n_output: int
+    missing_required: tuple[str, ...] = ()
+    missing_by_column: dict[str, int] = field(default_factory=dict)
+    duplicates: tuple[str, ...] = ()
+    n_duplicates_dropped: int = 0
+
+    @property
+    def n_dropped(self) -> int:
+        return len(self.missing_required) + self.n_duplicates_dropped
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "n_input": self.n_input,
+            "n_output": self.n_output,
+            "n_dropped": self.n_dropped,
+            "missing_required": list(self.missing_required),
+            "missing_by_column": dict(self.missing_by_column),
+            "duplicates": list(self.duplicates),
+            "n_duplicates_dropped": self.n_duplicates_dropped,
+        }
+
+    def describe(self) -> str | None:
+        """One Italian sentence for console/dashboard notes, ``None`` when nothing was dropped."""
+        if not self.n_dropped:
+            return None
+        parts: list[str] = []
+        if self.missing_required:
+            cols = ", ".join(f"{c}: {n}" for c, n in self.missing_by_column.items())
+            parts.append(
+                f"{len(self.missing_required)} righe con valori obbligatori mancanti o non validi ({cols}; "
+                f"match_id: {_preview(self.missing_required)})"
+            )
+        if self.duplicates:
+            parts.append(
+                f"{self.n_duplicates_dropped} righe duplicate per match_id, tenuta l'ultima "
+                f"(match_id: {_preview(self.duplicates)})"
+            )
+        return f"{self.n_dropped} partite scartate su {self.n_input} in validazione: " + "; ".join(parts) + "."
+
+
+def _preview(ids: Sequence[str]) -> str:
+    shown = ", ".join(ids[:_MAX_IDS_IN_MESSAGE])
+    return shown + (", ..." if len(ids) > _MAX_IDS_IN_MESSAGE else "")
+
+
+def _blank_to_na(values: pd.Series) -> pd.Series:
+    """Coerce to the nullable ``string`` dtype, stripping whitespace; blanks become ``<NA>``."""
+    text = values.astype("string").str.strip()
+    return text.mask(text == "", pd.NA)
+
+
+def _parse_date_cell(text: str) -> pd.Timestamp:
+    """Parse one non-ISO date cell (``24/08/2025``, ``24.08.2025 18:00``, ...).
+
+    Day-first precedence, since the data is Italian; the time zone (if any) is
+    dropped keeping the local wall-clock day. Unparseable text yields ``NaT``.
+    """
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        try:
+            ts = pd.Timestamp(pd.to_datetime(text, dayfirst=True))
+        except (ValueError, TypeError, OverflowError):
+            return pd.NaT
+    if ts is pd.NaT:
+        return pd.NaT
+    if ts.tzinfo is not None:
+        ts = ts.tz_localize(None)
+    return ts.normalize()
+
+
+def _coerce_dates(values: pd.Series) -> pd.Series:
+    """Parse the ``date`` column into naive, midnight-normalised ``datetime64[ns]``.
+
+    ISO-8601 cells are parsed in one vectorised pass with an explicit format;
+    whatever is left is parsed cell by cell with :func:`_parse_date_cell`. With
+    pandas' default format inference one ``24/08/2025`` row in a hand-maintained
+    CSV decided the format for the whole column and turned every ISO date into
+    ``NaT``; here each cell stands on its own and only genuinely unparseable
+    cells (``TBD``) become ``NaT``.
+    """
+    if pd.api.types.is_datetime64_any_dtype(values):
+        parsed = values
+    else:
+        text = _blank_to_na(values)
+        try:
+            parsed = pd.to_datetime(text, errors="coerce", format="ISO8601")
+        except ValueError:  # mixed time zones within the column: parse every cell on its own
+            parsed = pd.Series(pd.NaT, index=values.index, dtype="datetime64[ns]")
+        if parsed.dt.tz is not None:
+            parsed = parsed.dt.tz_localize(None)
+        parsed = parsed.astype("datetime64[ns]")
+        rest = parsed.isna() & text.notna().fillna(False).astype(bool)
+        if rest.any():
+            parsed = parsed.copy()
+            parsed.loc[rest] = pd.to_datetime(text[rest].map(_parse_date_cell), errors="coerce")
+    if parsed.dt.tz is not None:
+        parsed = parsed.dt.tz_localize(None)
+    return parsed.dt.normalize().astype("datetime64[ns]")
+
+
+def _parse_girone_or_none(value: Any) -> str | None:
+    try:
+        return Girone.parse(value).value
+    except ValueError:
+        return None
+
+
 def validate_matches_df(df: pd.DataFrame, *, strict: bool = False) -> pd.DataFrame:
     """Return a copy of ``df`` coerced to the canonical schema.
 
     - Required columns must be present (``ValueError`` otherwise).
     - Missing optional columns are added as NaN.
-    - ``girone`` is normalised to ``'A' | 'B' | 'C'``.
-    - Rows with missing required values are dropped (or raise when ``strict``).
-    - Duplicate ``match_id`` keeps the last occurrence.
+    - Every required column is coerced *before* rows are judged: dates are parsed
+      per cell (ISO first, then day-first fallback), ``round`` and the goals are
+      parsed as numbers, blank ids/team names count as missing.
+    - Rows with a required value missing or unparseable (an empty goal cell, a
+      ``'pp'`` sentinel, a ``'TBD'`` date) are dropped with a logged warning that
+      names the columns and the ``match_id`` values (or raise when ``strict``).
+    - An unknown ``girone`` raises ``ValueError`` naming the rows.
+    - Duplicate ``match_id`` keeps the last occurrence (logged).
+
+    The drop counts are attached as ``frame.attrs["validation"]``; use
+    :func:`validate_matches_report` to get them as a :class:`ValidationReport`.
     """
+    frame, _ = validate_matches_report(df, strict=strict)
+    return frame
+
+
+def validate_matches_report(df: pd.DataFrame, *, strict: bool = False) -> tuple[pd.DataFrame, ValidationReport]:
+    """Like :func:`validate_matches_df`, also returning the :class:`ValidationReport`."""
     missing = [c for c in REQUIRED_MATCH_COLUMNS if c not in df.columns]
     if missing:
         raise ValueError(f"matches frame is missing required columns: {missing}")
@@ -302,26 +448,79 @@ def validate_matches_df(df: pd.DataFrame, *, strict: bool = False) -> pd.DataFra
             out[c] = float("nan")
     extra = [c for c in out.columns if c not in MATCH_COLUMNS]
     out = out.drop(columns=extra)
+    n_input = len(out)
 
-    bad = out[list(REQUIRED_MATCH_COLUMNS)].isna().any(axis=1)
+    # 1. coerce every required column first, so that an unparseable cell shows up
+    #    as missing in the row filter below instead of crashing a later astype.
+    out["match_id"] = _blank_to_na(out["match_id"])
+    out["date"] = _coerce_dates(out["date"])
+    out["round"] = pd.to_numeric(out["round"], errors="coerce")
+    out["girone"] = _blank_to_na(out["girone"])
+    out["home_team"] = _blank_to_na(out["home_team"])
+    out["away_team"] = _blank_to_na(out["away_team"])
+    out["home_goals"] = pd.to_numeric(out["home_goals"], errors="coerce")
+    out["away_goals"] = pd.to_numeric(out["away_goals"], errors="coerce")
+
+    # 2. rows with a required value missing/unparseable
+    na = out[list(REQUIRED_MATCH_COLUMNS)].isna()
+    bad = na.any(axis=1)
+    dropped_ids: tuple[str, ...] = ()
+    by_column: dict[str, int] = {}
     if bad.any():
+        by_column = {c: int(n) for c, n in na.sum().items() if n}
+        labels = out.loc[bad, "match_id"]
+        dropped_ids = tuple(
+            str(mid) if not pd.isna(mid) else f"row {idx}" for idx, mid in zip(labels.index, labels)
+        )
+        detail = f"columns: {by_column}; match_id: {_preview(dropped_ids)}"
         if strict:
-            raise ValueError(f"{int(bad.sum())} rows have missing required values")
+            raise ValueError(f"{int(bad.sum())} rows have missing required values ({detail})")
+        log.warning(
+            "rows dropped: missing required values",
+            extra={"n_dropped": int(bad.sum()), "n_input": n_input, "by_column": by_column, "match_ids": list(dropped_ids[:_MAX_IDS_IN_MESSAGE])},
+        )
         out = out.loc[~bad]
 
-    out["match_id"] = out["match_id"].astype(str)
-    out["date"] = pd.to_datetime(out["date"], errors="coerce").dt.tz_localize(None).dt.normalize().astype("datetime64[ns]")
-    out["round"] = pd.to_numeric(out["round"], errors="coerce").fillna(0).astype("int64")
-    out["girone"] = out["girone"].map(lambda g: Girone.parse(g).value)
-    out["home_team"] = out["home_team"].astype(str).str.strip()
-    out["away_team"] = out["away_team"].astype(str).str.strip()
-    out["home_goals"] = pd.to_numeric(out["home_goals"], errors="coerce").astype("int64")
-    out["away_goals"] = pd.to_numeric(out["away_goals"], errors="coerce").astype("int64")
+    # 3. value coercions that can only run on complete rows
+    girone = out["girone"].map(_parse_girone_or_none)
+    unknown = girone.isna()
+    if unknown.any():
+        ids = out.loc[unknown, "match_id"].astype(str).tolist()
+        values = sorted(set(out.loc[unknown, "girone"].astype(str)))
+        raise ValueError(
+            f"{int(unknown.sum())} rows have an unknown girone {values[:_MAX_IDS_IN_MESSAGE]} "
+            f"(expected A, B or C; match_id: {_preview(ids)})"
+        )
+    out["girone"] = girone
+    out["round"] = out["round"].astype("int64")
+    out["home_goals"] = out["home_goals"].astype("int64")
+    out["away_goals"] = out["away_goals"].astype("int64")
     for c in OPTIONAL_MATCH_COLUMNS:
         out[c] = pd.to_numeric(out[c], errors="coerce").astype("float64")
-    out = out.drop_duplicates(subset="match_id", keep="last")
+
+    # 4. duplicate ids: the last occurrence wins (an update overrides the earlier line)
+    duplicated = out["match_id"].duplicated(keep="last")
+    dup_ids: tuple[str, ...] = ()
+    if duplicated.any():
+        dup_ids = tuple(dict.fromkeys(out.loc[duplicated, "match_id"].astype(str)))
+        log.warning(
+            "duplicate match_id: last occurrence kept",
+            extra={"n_dropped": int(duplicated.sum()), "n_ids": len(dup_ids), "match_ids": list(dup_ids[:_MAX_IDS_IN_MESSAGE])},
+        )
+        out = out.loc[~duplicated]
+
     out = out.sort_values(["date", "girone", "match_id"], kind="stable").reset_index(drop=True)
     for c, t in MATCH_DTYPES.items():
         if t == "string":
             out[c] = out[c].astype("string")
-    return out[list(MATCH_COLUMNS)]
+    out = out[list(MATCH_COLUMNS)]
+    report = ValidationReport(
+        n_input=n_input,
+        n_output=len(out),
+        missing_required=dropped_ids,
+        missing_by_column=by_column,
+        duplicates=dup_ids,
+        n_duplicates_dropped=int(duplicated.sum()),
+    )
+    out.attrs["validation"] = report.to_dict()
+    return out, report

@@ -34,6 +34,7 @@ from src.engine.model import (
     pack_theta,
     prepare_likelihood_data,
     tau,
+    time_weight_diagnostics,
     time_weights,
     unpack_theta,
 )
@@ -782,3 +783,193 @@ def test_bounds_are_respected(mini, half_width):
         assert all(lo - 1e-9 <= a <= hi + 1e-9 for a in params.alpha.values()), (method, min(params.alpha.values()), max(params.alpha.values()))
         for g, teams in params.teams_by_girone.items():
             assert abs(sum(params.alpha[t] for t in teams)) < 1e-6
+
+
+# =============================================================================
+# time-decay weight collapse guard
+# =============================================================================
+def _with_mistyped_date(matches: pd.DataFrame, when: str = "2099-03-01") -> tuple[pd.DataFrame, str]:
+    """Copy of ``matches`` with one row dated far in the future; returns the frame and that match id."""
+    typo = matches.copy()
+    pos = typo.index[len(typo) // 2]
+    typo.loc[pos, "date"] = pd.Timestamp(when)
+    return typo, str(typo.loc[pos, "match_id"])
+
+
+def test_time_weight_diagnostics_clean_sample(league12):
+    dates = league12.matches["date"]
+    ref = dates.max()
+    w = time_weights(dates, ref, 0.0018)
+    diag = time_weight_diagnostics(dates, w, ref, 0.0018, match_ids=league12.matches["match_id"])
+    assert diag.n_matches == len(dates)
+    assert diag.effective_n == pytest.approx(float(w.sum()))
+    assert 0.5 < diag.effective_n_ratio <= 1.0
+    assert diag.lead_days == 0 and diag.newest_weight == 1.0
+    assert 0 < diag.latest_gap_days <= 7
+    assert diag.second_latest_weight_ratio == pytest.approx(math.exp(-0.0018 * diag.latest_gap_days))
+    assert diag.n_for_95pct > 0.5 * diag.n_matches
+    assert diag.heaviest_date == dates.max().date() and diag.heaviest_match_id in set(league12.matches["match_id"])
+    assert diag.earliest_date == dates.min().date() and diag.latest_date == dates.max().date()
+    assert not diag.is_collapsed(0.1)
+    assert diag.is_collapsed(0.0) is False  # a zero threshold disables the check
+    payload = diag.to_dict()
+    assert payload["latest_date"] == dates.max().date().isoformat() and payload["n_for_95pct"] == diag.n_for_95pct
+    flat = time_weight_diagnostics(dates, np.ones(len(dates)), ref, 0.0)
+    assert flat.effective_n_ratio == 1.0 and flat.heaviest_match_id is None and flat.n_for_95pct == len(dates) - len(dates) // 20
+
+
+def test_time_weight_diagnostics_detects_a_mistyped_date(league12):
+    typo, bad_id = _with_mistyped_date(league12.matches)
+    ref = typo["date"].max()  # the typo becomes the default reference date
+    w = time_weights(typo["date"], ref, 0.0018)
+    diag = time_weight_diagnostics(typo["date"], w, ref, 0.0018, match_ids=typo["match_id"])
+    assert diag.effective_n == pytest.approx(1.0, abs=1e-6)
+    assert diag.effective_n_ratio < 0.01
+    assert diag.is_collapsed(0.1)
+    assert diag.n_for_95pct == 1
+    assert diag.heaviest_match_id == bad_id and diag.heaviest_date == date(2099, 3, 1)
+    assert diag.latest_gap_days > 20_000 and diag.second_latest_weight_ratio < 1e-15
+    text = diag.describe(0.1)
+    assert text.startswith("time-decay weights collapsed") and bad_id in text and "probable mistyped date" in text
+    # far-future reference date on a clean sample: uniform but microscopic weights
+    far_ref = date(2050, 1, 1)
+    clean_dates = league12.matches["date"]
+    far = time_weight_diagnostics(clean_dates, time_weights(clean_dates, far_ref, 0.0018), far_ref, 0.0018)
+    assert far.lead_days > 8000 and far.newest_weight < 1e-6 and far.is_collapsed(0.1)
+    assert far.n_for_95pct > 0.5 * far.n_matches  # not concentrated: the reference date, not a typo, is the cause
+    assert "after the latest match" in far.describe(0.1) and "probable mistyped date" not in far.describe(0.1)
+
+
+def test_time_weight_diagnostics_rejects_bad_inputs(league12):
+    dates = league12.matches["date"]
+    with pytest.raises(ValueError):
+        time_weight_diagnostics([], [], date(2025, 1, 1), 0.0018)
+    with pytest.raises(ValueError):
+        time_weight_diagnostics(dates, np.ones(len(dates) - 1), dates.max(), 0.0018)
+    with pytest.raises(ValueError):
+        time_weight_diagnostics(dates, np.ones(len(dates)), dates.max(), 0.0018, match_ids=["x"])
+    with pytest.raises(ValueError):
+        time_weight_diagnostics(dates, np.full(len(dates), np.nan), dates.max(), 0.0018)
+
+
+def test_fit_flags_collapsed_weights_from_a_mistyped_date(league12, caplog):
+    """One hand-edited far-future date in a season used to yield converged=True with
+    alpha == 0, gamma == 0 and rho at its bound; the fit is now flagged as degenerate."""
+    typo, bad_id = _with_mistyped_date(league12.matches)
+    engine = DixonColesEngine(DixonColesConfig(xi=0.0018))
+    with caplog.at_level(logging.WARNING, logger="src.engine.model"):
+        params = engine.fit(typo)
+    assert params.degenerate_weights is True
+    assert params.converged is False
+    assert params.effective_n == pytest.approx(1.0, abs=1e-6)
+    assert params.effective_n_ratio < 0.01
+    assert params.message.startswith("time-decay weights collapsed")
+    assert bad_id in params.message and "probable mistyped date" in params.message
+    assert "[optimiser: " in params.message  # the optimiser's own verdict is kept for the record
+    assert len(params.fit_warnings) == 1 and params.fit_warnings[0] == params.message.split(" [optimiser:")[0]
+    assert any("weights collapsed" in rec.getMessage() for rec in caplog.records)
+    # the engine is still usable under the default 'warn' policy, so the degenerate fit can be inspected
+    assert engine.is_fitted and engine.predict(league12.fixtures[0]).matrix.sum() == pytest.approx(1.0)
+    # the same data without the typo is clean and silent
+    clean = DixonColesEngine(DixonColesConfig(xi=0.0018)).fit(league12.matches)
+    assert clean.converged and not clean.degenerate_weights and clean.fit_warnings == ()
+    assert clean.effective_n_ratio > 0.5 and "[optimiser" not in clean.message
+
+
+def test_fit_raises_on_collapsed_weights_when_configured(league12, mini):
+    typo, bad_id = _with_mistyped_date(league12.matches)
+    engine = DixonColesEngine(DixonColesConfig(xi=0.0018, on_weight_collapse="raise"))
+    with pytest.raises(ValueError, match="time-decay weights collapsed") as excinfo:
+        engine.fit(typo)
+    assert bad_id in str(excinfo.value)
+    assert not engine.is_fitted  # raised before optimising
+    # explicit far-future reference date, prior on, 20 matches: the reported scenario
+    strict = DixonColesEngine(DixonColesConfig.with_gaussian_prior(xi=0.0018, on_weight_collapse="raise"))
+    with pytest.raises(ValueError, match="after the latest match"):
+        strict.fit(mini.matches, reference_date=date(2050, 1, 1))
+    # the guard can be switched off explicitly
+    off = DixonColesEngine(DixonColesConfig(xi=0.0018, min_effective_n_ratio=0.0, on_weight_collapse="raise")).fit(typo)
+    assert off.converged and not off.degenerate_weights and off.effective_n_ratio < 0.01
+    # a clean sample never trips the strict policy
+    assert DixonColesEngine(DixonColesConfig(xi=0.0018, on_weight_collapse="raise")).fit(league12.matches).converged
+
+
+def test_far_future_reference_date_is_flagged(mini):
+    with_prior = DixonColesEngine(DixonColesConfig.with_gaussian_prior(xi=0.0018))
+    far = with_prior.fit(mini.matches, reference_date=date(2050, 1, 1))
+    assert far.degenerate_weights and not far.converged
+    assert far.effective_n_ratio < 1e-5
+    assert "reference_date 2050-01-01" in far.message and "after the latest match" in far.message
+    assert "probable mistyped date" not in far.message  # uniform weights: the reference date, not a date typo, is blamed
+    very_far = DixonColesEngine(DixonColesConfig(xi=0.0018)).fit(mini.matches, reference_date=date(2200, 1, 1))
+    assert very_far.degenerate_weights and not very_far.converged
+    assert all(v == 0.0 for v in very_far.alpha.values())  # the all-zero garbage the flag protects against
+    # a reference date just after the sample is a normal fit
+    ok = with_prior.fit(mini.matches, reference_date=mini.matches["date"].max().date() + timedelta(days=3))
+    assert ok.converged and not ok.degenerate_weights and ok.fit_warnings == ()
+
+
+def test_reference_date_outside_the_sample_is_logged(league12, caplog):
+    engine = DixonColesEngine(DixonColesConfig(xi=0.0018))
+    first = league12.matches["date"].min().date()
+    with caplog.at_level(logging.WARNING, logger="src.engine.model"):
+        before = engine.fit(league12.matches, reference_date=first - timedelta(days=30))
+    assert before.converged and not before.degenerate_weights
+    assert before.effective_n == pytest.approx(before.n_matches)  # xi is a no-op here ...
+    assert len(before.fit_warnings) == 1 and "precedes the earliest match" in before.fit_warnings[0]  # ... and now says so
+    assert any("outside the match sample" in rec.getMessage() for rec in caplog.records)
+    assert "precedes" not in before.message  # the optimiser message is untouched for a non-degenerate fit
+    caplog.clear()
+    # more than a year after the data: every match is discounted and an active prior gets relatively stronger
+    with caplog.at_level(logging.WARNING, logger="src.engine.model"):
+        later = engine.fit(league12.matches, reference_date=date(2026, 12, 31))
+    assert later.converged and not later.degenerate_weights
+    assert 0.1 < later.effective_n_ratio < 0.5
+    assert len(later.fit_warnings) == 1 and "after the latest match" in later.fit_warnings[0]
+    assert any("outside the match sample" in rec.getMessage() for rec in caplog.records)
+    # the reference date is irrelevant without time decay: no warnings at all
+    flat = DixonColesEngine(DixonColesConfig(xi=0.0)).fit(league12.matches, reference_date=date(2200, 1, 1))
+    assert flat.converged and flat.fit_warnings == () and flat.effective_n_ratio == 1.0
+    # inside the sample: documented behaviour (later matches get weight 1), silent
+    inside = engine.fit(league12.matches, reference_date=first + timedelta(days=30))
+    assert inside.converged and inside.fit_warnings == ()
+
+
+def test_weight_guard_config_validation_and_serialisation():
+    cfg = DixonColesConfig()
+    assert cfg.min_effective_n_ratio == 0.1 and cfg.on_weight_collapse == "warn"
+    for bad in (-0.1, 1.5, float("nan"), "0.1"):
+        with pytest.raises(ValueError):
+            DixonColesConfig(min_effective_n_ratio=bad)  # type: ignore[arg-type]
+    with pytest.raises(ValueError):
+        DixonColesConfig(on_weight_collapse="ignore")  # type: ignore[arg-type]
+    strict = DixonColesConfig(min_effective_n_ratio=0.25, on_weight_collapse="raise")
+    assert DixonColesConfig.from_dict(strict.to_dict()) == strict
+    assert DixonColesConfig.with_gaussian_prior(on_weight_collapse="raise").on_weight_collapse == "raise"
+    # an old config payload without the new keys loads with the defaults
+    old = {k: v for k, v in strict.to_dict().items() if k not in ("min_effective_n_ratio", "on_weight_collapse")}
+    loaded = DixonColesConfig.from_dict(old)
+    assert loaded.min_effective_n_ratio == 0.1 and loaded.on_weight_collapse == "warn"
+
+
+def test_fitted_params_weight_fields_roundtrip_and_old_payloads_load(tmp_path, fit12_slsqp, league12):
+    _, params = fit12_slsqp
+    payload = params.to_dict()
+    assert payload["degenerate_weights"] is False and payload["fit_warnings"] == []
+    assert payload["effective_n_ratio"] == pytest.approx(1.0)  # derived field, xi = 0
+    # payloads written before the guard existed have none of the new keys and still load
+    old = {k: v for k, v in payload.items() if k not in ("degenerate_weights", "fit_warnings", "effective_n_ratio")}
+    restored = FittedParams.from_dict(old)
+    assert restored == params and restored.fit_warnings == () and restored.degenerate_weights is False
+    with pytest.raises(ValueError, match="missing fields"):
+        FittedParams.from_dict({k: v for k, v in payload.items() if k != "rho"})
+    # a degenerate fit keeps its diagnosis across save/load
+    typo, bad_id = _with_mistyped_date(league12.matches)
+    engine = DixonColesEngine(DixonColesConfig(xi=0.0018))
+    bad = engine.fit(typo)
+    path = engine.save(tmp_path / "degenerate.json")
+    loaded = DixonColesEngine.load(path)
+    assert loaded.params_ == bad
+    assert loaded.params_.degenerate_weights and not loaded.params_.converged
+    assert bad_id in loaded.params_.fit_warnings[0]
+    assert loaded.config.min_effective_n_ratio == 0.1 and loaded.config.on_weight_collapse == "warn"

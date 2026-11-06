@@ -1,3 +1,5 @@
+# Pinned, stable releases. numpy >= 2.3 and scipy >= 1.16 ship wheels for Python >= 3.12 only,
+# so the project requires Python 3.12+ (see README). Run from the repo root: python main.py
 # Core numerics
 numpy==2.5.3
 scipy==1.18.1
@@ -9,7 +11,6 @@ rapidfuzz==3.14.6
 # Dashboard
 streamlit==1.66.1
 plotly==7.1.0
-# Tests
+# Tests (HTTP is mocked with httpx.MockTransport, no extra library)
 pytest==9.2.0
 pytest-asyncio==1.4.1.post1
-respx==0.23.1
