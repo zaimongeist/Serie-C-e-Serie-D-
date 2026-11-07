@@ -1,0 +1,27 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+# secrets: the FootyStats key lives in .env (local) or in the Streamlit Cloud app Secrets, never in git
+.env
+.streamlit/secrets.toml
+# FootyStats data are licensed to the key holder and this repository is PUBLIC: everything the
+# harvest writes stays local (raw cache, processed CSVs, odds, the team-id mapping). Keep the folders.
+data/raw/*
+!data/raw/.gitkeep
+data/processed/*
+!data/processed/.gitkeep
+data/odds/*
+!data/odds/.gitkeep
+data/*.json
+# local output of the calendar check (python -m src.ingestion.calendar_snapshot / the CI step)
+ci/
+snapshot/
+reports/
+*.log

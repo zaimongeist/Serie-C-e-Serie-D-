@@ -1,0 +1,36 @@
+{
+  "statistics": [
+    {
+      "period": "ALL",
+      "groups": [
+        {
+          "groupName": "Match overview",
+          "statisticsItems": [
+            {"name": "Ball possession", "home": "61%", "away": "39%", "compareCode": 1, "statisticsType": "positive", "valueType": "event", "homeValue": 61, "awayValue": 39, "renderType": 2, "key": "ballPossession"},
+            {"name": "Expected goals", "home": "2.41", "away": "0.52", "compareCode": 1, "statisticsType": "positive", "valueType": "event", "homeValue": 2.41, "awayValue": 0.52, "renderType": 1, "key": "expectedGoals"},
+            {"name": "Total shots", "home": "18", "away": "6", "compareCode": 1, "statisticsType": "positive", "valueType": "event", "homeValue": 18, "awayValue": 6, "renderType": 1, "key": "totalShotsOnGoal"},
+            {"name": "Corner kicks", "home": "8", "away": "1", "compareCode": 1, "statisticsType": "positive", "valueType": "event", "homeValue": 8, "awayValue": 1, "renderType": 1, "key": "cornerKicks"}
+          ]
+        },
+        {
+          "groupName": "Shots",
+          "statisticsItems": [
+            {"name": "Shots on target", "home": "8", "away": "2", "compareCode": 1, "statisticsType": "positive", "valueType": "event", "homeValue": 8, "awayValue": 2, "renderType": 1, "key": "shotsOnGoal"}
+          ]
+        }
+      ]
+    },
+    {
+      "period": "1ST",
+      "groups": [
+        {
+          "groupName": "Match overview",
+          "statisticsItems": [
+            {"name": "Expected goals", "home": "1.30", "away": "0.20", "homeValue": 1.3, "awayValue": 0.2, "key": "expectedGoals"},
+            {"name": "Total shots", "home": "10", "away": "2", "homeValue": 10, "awayValue": 2, "key": "totalShotsOnGoal"}
+          ]
+        }
+      ]
+    }
+  ]
+}
