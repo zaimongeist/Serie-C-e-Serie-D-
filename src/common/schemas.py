@@ -12,9 +12,10 @@ import math
 import re
 import warnings
 from dataclasses import asdict, dataclass, field, fields
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from enum import Enum
-from typing import Any, Final, Iterable, Mapping, Sequence
+from typing import Any, Final, Iterable, Literal, Mapping, Sequence
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
@@ -33,6 +34,9 @@ __all__ = [
     "SEASON_START_MONTH",
     "MatchRecord",
     "Fixture",
+    "FixtureStatus",
+    "FIXTURE_STATUSES",
+    "LOCAL_TIMEZONE",
     "OddsQuote",
     "MatchPrediction",
     "Market",
@@ -336,9 +340,68 @@ class MatchRecord:
         return cls(**{k: v for k, v in m.items() if k in known})
 
 
+#: Status of a :class:`Fixture`: ``'scheduled'`` (kick-off ahead) or ``'postponed'`` (the
+#: original kick-off is in the past and the match was not played: rinviata, still to be recovered).
+FixtureStatus = Literal["scheduled", "postponed"]
+
+#: The statuses a :class:`Fixture` accepts, in display order.
+FIXTURE_STATUSES: Final[tuple[str, ...]] = ("scheduled", "postponed")
+
+#: Time zone the kick-off times are shown in (:attr:`Fixture.kickoff_local`).
+LOCAL_TIMEZONE: Final[ZoneInfo] = ZoneInfo("Europe/Rome")
+
+
+def _utc_kickoff(value: Any) -> datetime | None:
+    """A kick-off as a timezone-aware UTC ``datetime`` (``None`` stays ``None``).
+
+    Accepts ``datetime`` (a naive value is read as UTC), ``pandas.Timestamp``,
+    ``numpy.datetime64`` and ISO-8601 strings (``'2026-11-07T14:30:00Z'``,
+    ``'2026-11-07 15:30+01:00'``). A blank string or a missing timestamp
+    (``pd.NaT``, ``numpy.datetime64('NaT')``) is ``None``; anything else raises
+    :class:`TypeError` / :class:`ValueError`.
+    """
+    if value is None or value is pd.NaT:
+        return None
+    if isinstance(value, np.datetime64):
+        if np.isnat(value):
+            return None
+        value = pd.Timestamp(value)
+    if isinstance(value, datetime) and pd.isna(value):  # pd.NaT subclasses datetime, not pd.Timestamp
+        return None
+    if isinstance(value, pd.Timestamp):
+        if pd.isna(value):
+            return None
+        value = value.to_pydatetime()
+    elif isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        value = datetime.fromisoformat(text.replace("Z", "+00:00") if text.endswith("Z") else text)
+    elif not isinstance(value, datetime):
+        if value is pd.NaT:
+            return None
+        raise TypeError(f"kickoff must be a datetime, Timestamp or ISO string, got {type(value).__name__}")
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
 @dataclass(frozen=True, slots=True)
 class Fixture:
-    """An upcoming (not yet played) match."""
+    """A match of the calendar that has not been played (yet).
+
+    ``date`` is the UTC day of the kick-off, ``round`` the official round
+    (FootyStats ``game_week``). ``kickoff`` is the kick-off instant as a
+    timezone-aware UTC ``datetime`` when the source provides it (``None`` for
+    sources that only give a day, such as the simulator); a naive value is read
+    as UTC, an ISO string is parsed. ``status`` is ``'scheduled'`` for a match
+    still to be played and ``'postponed'`` for a match whose original kick-off is
+    in the past but that was not played (rinviata): it keeps its original
+    ``date``/``kickoff`` until the source publishes the recovery date. Both new
+    fields default so every positional constructor call of the six-field
+    version keeps working; :attr:`kickoff_local` gives the time in
+    ``Europe/Rome``.
+    """
 
     match_id: str
     date: date
@@ -346,6 +409,8 @@ class Fixture:
     girone: Girone
     home_team: str
     away_team: str
+    kickoff: datetime | None = None
+    status: FixtureStatus = "scheduled"
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "girone", Girone.parse(self.girone))
@@ -353,10 +418,25 @@ class Fixture:
             object.__setattr__(self, "date", self.date.date())
         elif isinstance(self.date, str):
             object.__setattr__(self, "date", date.fromisoformat(self.date[:10]))
+        object.__setattr__(self, "kickoff", _utc_kickoff(self.kickoff))
+        status = str(self.status or "scheduled").strip().lower()
+        if status not in FIXTURE_STATUSES:
+            raise ValueError(f"fixture status must be one of {FIXTURE_STATUSES}, got {self.status!r}")
+        object.__setattr__(self, "status", status)
 
     @property
     def label(self) -> str:
         return f"{self.home_team} - {self.away_team}"
+
+    @property
+    def kickoff_local(self) -> datetime | None:
+        """The kick-off in ``Europe/Rome`` (``None`` when the source gave no time)."""
+        return self.kickoff.astimezone(LOCAL_TIMEZONE) if self.kickoff is not None else None
+
+    @property
+    def is_postponed(self) -> bool:
+        """``True`` for a match whose original kick-off passed without it being played."""
+        return self.status == "postponed"
 
 
 class Market(str, Enum):

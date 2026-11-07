@@ -34,6 +34,10 @@ from src.dashboard.legend import legend_terms
 from src.dashboard.state import (
     ALL_MATCHDAYS,
     DEFAULT_SECTION,
+    DEMO_BADGE,
+    DEMO_EXPORT_COLUMN,
+    DEMO_EXPORT_TEXT,
+    DEMO_WARNING,
     MARKETS_COLUMNS,
     MATCHDAY_COLUMNS,
     MATCHDAY_TABLE_KEY_PREFIX,
@@ -123,9 +127,80 @@ if TYPE_CHECKING:
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 APP_PATH = REPO_ROOT / "src" / "dashboard" / "app.py"
-#: The competitions of the shipped 2026/27 dictionary (Serie C A/B/C and Serie B): the Serie D gironi of
-#: ``config/competitions.toml`` ship without teams, so the simulated perimeter never contains them.
-PERIMETER_GIRONI = tuple(load_registry().gironi)
+#: Tab labels of the dashboard, in order.
+TAB_LABELS = ("Classifica Forza", "Giornata", "Risultati", "Opportunità di Valore", "Selezioni di giornata", "Export", "Legenda")
+#: Families of the Serie B e Serie C section: the simulated perimeter of these tests (80 teams, one fit in seconds;
+#: the shipped dictionary also holds the 162 Serie D clubs, whose joint simulation takes minutes).
+BC_FAMILIES = ("Serie C", "Serie B")
+#: The calendar position of the processed-data tests: their fixtures are simulated rounds dated in October 2026, so the
+#: official-round rule is evaluated before them (as the dashboard would have on 1 September).
+PROCESSED_AS_OF = date(2026, 9, 1)
+
+
+def bc_registry(season: str = DEFAULT_SEASON) -> TeamRegistry:
+    """The Serie B and Serie C part of the shipped dictionary of ``season`` (Serie D left out)."""
+    full = load_registry(season)
+    return TeamRegistry.from_teams(full.season, {g.value: full.teams_by_girone[g] for g in full.gironi if g.family in BC_FAMILIES})
+
+
+BC_REGISTRY = bc_registry()
+#: The competitions of the simulated perimeter (Serie C A/B/C and Serie B).
+PERIMETER_GIRONI = tuple(BC_REGISTRY.gironi)
+
+
+def build_bc(**kwargs) -> PipelineState:  # noqa: ANN003
+    """:func:`build_state` on the Serie B / Serie C perimeter; real-data runs read the calendar as of :data:`PROCESSED_AS_OF`."""
+    kwargs.setdefault("registry", bc_registry(kwargs.get("season", DEFAULT_SEASON)))
+    if not kwargs.get("simulate"):
+        kwargs.setdefault("as_of", PROCESSED_AS_OF)
+    return build_state(**kwargs)
+
+
+def bc_build_state(original):  # noqa: ANN001, ANN201
+    """Wrap ``build_state`` for the AppTests: the demo runs on the Serie B / Serie C perimeter of the requested season."""
+
+    def wrapper(**kwargs):  # noqa: ANN003, ANN202
+        if kwargs.get("simulate") and kwargs.get("registry") is None:
+            from src.common.teams import list_seasons, season_file_stem
+
+            season = season_file_stem(kwargs.get("season", DEFAULT_SEASON))
+            kwargs["registry"] = bc_registry(season if season in list_seasons() else DEFAULT_SEASON)
+        return original(**kwargs)
+
+    return wrapper
+
+
+def demo_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``SERIEC_DEMO=1`` with the Serie B / Serie C perimeter, no FootyStats key and no real data directory."""
+    import src.dashboard.data_refresh as refresh_module
+    import src.dashboard.state as state_module
+
+    monkeypatch.setenv("SERIEC_DEMO", "1")
+    monkeypatch.delenv("SERIEC_FORCE_SIMULATE", raising=False)
+    monkeypatch.setattr(state_module, "build_state", bc_build_state(state_module.build_state))
+    monkeypatch.setattr(refresh_module, "locate_key", lambda **_: None)
+
+
+def real_env(monkeypatch: pytest.MonkeyPatch, processed: Path, odds: Path, *, as_of: date | None = PROCESSED_AS_OF) -> None:
+    """Real-data mode on ``processed`` / ``odds``: no demo, no FootyStats key (no download), calendar as of ``as_of``."""
+    import src.dashboard.data_refresh as refresh_module
+    import src.dashboard.state as state_module
+
+    for name in ("SERIEC_DEMO", "SERIEC_FORCE_SIMULATE", "SERIEC_SIM_ROUNDS"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("SERIEC_PROCESSED_DIR", str(processed))
+    monkeypatch.setenv("SERIEC_ODDS_DIR", str(odds))
+    if as_of is not None:
+        monkeypatch.setenv("SERIEC_AS_OF", as_of.isoformat())
+    monkeypatch.setattr(refresh_module, "locate_key", lambda **_: None)
+
+    original = state_module.build_state
+
+    def wrapper(**kwargs):  # noqa: ANN003, ANN202
+        kwargs.setdefault("registry", BC_REGISTRY)
+        return original(**kwargs)
+
+    monkeypatch.setattr(state_module, "build_state", wrapper)
 #: The configured Serie D competitions (empty when the configuration has no 'Serie D' family).
 SERIE_D = serie_d_gironi()
 needs_serie_d = pytest.mark.skipif(not SERIE_D, reason="no competition of family 'Serie D' in config/competitions.toml")
@@ -214,7 +289,7 @@ def assert_example_is_the_panel_row(at: AppTest) -> None:
 @pytest.fixture(scope="module")
 def sim_state() -> PipelineState:
     """One simulated pipeline run shared by the view tests (seed 7, 15 rounds, stationary)."""
-    return build_state(simulate=True, seed=7, xi=0.0, n_rounds=15)
+    return build_bc(simulate=True, seed=7, xi=0.0, n_rounds=15)
 
 
 def multi_round_processed_dir(tmp_path: Path, *, seed: int = 11, played: int = 8, sb_rounds: int = 2) -> tuple[Path, Path, dict[int, list[Fixture]]]:
@@ -225,14 +300,14 @@ def multi_round_processed_dir(tmp_path: Path, *, seed: int = 11, played: int = 8
     rounds ``played + 1 .. played + 3`` of one calendar; the matches come from the
     first league only. Returns ``(processed_dir, odds_dir, fixtures_by_round)``.
     """
-    base = simulate_league(seed=seed, n_rounds=played)
+    base = simulate_league(seed=seed, registry=BC_REGISTRY, n_rounds=played)
     processed, odds_dir = tmp_path / "processed", tmp_path / "odds"
     save_processed(base.matches, processed / "matches.csv")
     fixtures: list[Fixture] = []
     quotes: list[OddsQuote] = []
     by_round: dict[int, list[Fixture]] = {}
     for k in range(3):
-        league = simulate_league(seed=seed, n_rounds=played + k)
+        league = simulate_league(seed=seed, registry=BC_REGISTRY, n_rounds=played + k)
         keep = [f for f in league.fixtures if f.girone != Girone.SB or k < sb_rounds]
         by_round[played + 1 + k] = keep
         fixtures += keep
@@ -269,14 +344,14 @@ def test_build_state_simulated_injects_trap(sim_state: PipelineState) -> None:
 
 
 def test_build_state_processed_with_odds(tmp_path: Path) -> None:
-    league = simulate_league(seed=11, n_rounds=8)
+    league = simulate_league(seed=11, registry=BC_REGISTRY, n_rounds=8)
     processed = tmp_path / "processed"
     odds_dir = tmp_path / "odds"
     save_processed(league.matches, processed / "matches.csv")
     save_fixtures(league.fixtures, processed / "fixtures.csv")
     write_odds_csv(league.odds, odds_dir / "simbook.csv")
 
-    state = build_state(processed_dir=processed, odds_dir=odds_dir, xi=0.0)
+    state = build_bc(processed_dir=processed, odds_dir=odds_dir, xi=0.0)
     assert state.source == "processed"
     assert state.n_matches == len(league.matches)
     assert len(state.fixtures) == len(league.fixtures)
@@ -288,12 +363,12 @@ def test_build_state_processed_with_odds(tmp_path: Path) -> None:
 
 
 def test_build_state_processed_without_odds(tmp_path: Path) -> None:
-    league = simulate_league(seed=11, n_rounds=8)
+    league = simulate_league(seed=11, registry=BC_REGISTRY, n_rounds=8)
     processed = tmp_path / "processed"
     save_processed(league.matches, processed / "matches.csv")
     save_fixtures(league.fixtures, processed / "fixtures.csv")
 
-    state = build_state(processed_dir=processed, odds_dir=tmp_path / "missing_odds", xi=0.0)
+    state = build_bc(processed_dir=processed, odds_dir=tmp_path / "missing_odds", xi=0.0)
     assert state.source == "processed"
     assert state.quotes == []
     assert state.opportunities == []
@@ -304,10 +379,10 @@ def test_build_state_processed_without_odds(tmp_path: Path) -> None:
 
 
 def test_build_state_processed_without_fixtures(tmp_path: Path) -> None:
-    league = simulate_league(seed=11, n_rounds=8)
+    league = simulate_league(seed=11, registry=BC_REGISTRY, n_rounds=8)
     processed = tmp_path / "processed"
     save_processed(league.matches, processed / "matches.csv")
-    state = build_state(processed_dir=processed, odds_dir=tmp_path / "odds", xi=0.0)
+    state = build_bc(processed_dir=processed, odds_dir=tmp_path / "odds", xi=0.0)
     assert state.source == "processed"
     assert state.fixtures == [] and state.predictions == [] and state.opportunities == []
     assert predictions_table(state).empty
@@ -325,7 +400,7 @@ def test_small_sample_uses_prior(tmp_path: Path) -> None:
     save_fixtures(mini.fixtures, processed / "fixtures.csv")
     write_odds_csv(mini.odds, tmp_path / "odds" / "book.csv")
 
-    state = build_state(processed_dir=processed, odds_dir=tmp_path / "odds", xi=0.0)
+    state = build_bc(processed_dir=processed, odds_dir=tmp_path / "odds", xi=0.0)
     assert state.source == "processed"
     assert state.n_matches == 20
     assert state.prior_enabled
@@ -336,7 +411,7 @@ def test_small_sample_uses_prior(tmp_path: Path) -> None:
     assert any("prior gaussiana attiva" in n for n in state.notes)
 
     # explicit override: no prior even on a small sample
-    mle = build_state(processed_dir=processed, odds_dir=tmp_path / "odds", xi=0.0, use_prior=False)
+    mle = build_bc(processed_dir=processed, odds_dir=tmp_path / "odds", xi=0.0, use_prior=False)
     assert not mle.prior_enabled and mle.params.penalty == 0.0
 
 
@@ -402,14 +477,14 @@ def test_fixtures_for_sorted_and_filtered(sim_state: PipelineState) -> None:
     assert len(sim_state.matchdays) == 1 and sim_state.next_matchday is not None
     assert sim_state.next_matchday.rounds == {g: 16 for g in PERIMETER_GIRONI} and sim_state.next_matchday.n_fixtures == 40
     assert fixtures_for(sim_state, None, sim_state.next_matchday) == all_preds == fixtures_for(sim_state, None, ALL_MATCHDAYS)
-    assert any("raggruppate in 1 giornata" in n for n in sim_state.notes)
+    assert any(n.startswith("Calendario: giornata corrente Giornata del") and "0 giornate successive" in n for n in sim_state.notes)
 
 
 def test_matchday_defaults_with_a_season_long_fixture_list(tmp_path: Path) -> None:
     """With FootyStats the fixture list is the whole remaining season: the selector, the value panel and the picks
     must default to the next matchday (the sum of the next rounds), while the exports keep every fixture."""
     processed, odds_dir, by_round = multi_round_processed_dir(tmp_path)
-    state = build_state(processed_dir=processed, odds_dir=odds_dir, xi=0.0)
+    state = build_bc(processed_dir=processed, odds_dir=odds_dir, xi=0.0)
     assert state.source == "processed" and len(state.fixtures) == 110 == len(state.predictions)  # 40 + 40 + 30 (Serie B has two rounds left)
     assert [m.n_fixtures for m in state.matchdays] == [40, 40, 30]
     first, second, third = state.matchdays
@@ -469,7 +544,7 @@ def test_matchday_defaults_with_a_season_long_fixture_list(tmp_path: Path) -> No
     assert list(parsed.columns) == list(PICKS_EXPORT_COLUMNS) and len(parsed) == 17 and parsed["Data"].iloc[0] == second.start.isoformat()
     empty = picks_export_frame(draw_picks_table(state, third, n=0), btts_picks_table(state, third, n=0))
     assert list(empty.columns) == list(PICKS_EXPORT_COLUMNS) and empty.empty
-    assert any("raggruppate in 3 giornate" in n for n in state.notes)
+    assert any("giornata corrente Giornata del" in n and "2 giornate successive" in n for n in state.notes)
 
 
 def test_value_table_threshold_and_order(sim_state: PipelineState) -> None:
@@ -658,8 +733,10 @@ def test_matchday_table_for_and_results_table_for(sim_state: PipelineState) -> N
     frame = sim_state.team_matches_frame()
     assert frame is sim_state.team_matches_frame() and len(frame) == 2 * sim_state.n_current_matches
     assert dataclasses.replace(sim_state, quotes=[])._team_matches is None, "a copy of the state starts a fresh cache"
+    # the demo state's exports say they are simulated: first column AVVISO on every row
     parsed = pd.read_csv(io.BytesIO(matchday_csv_bytes(sim_state)))
-    assert list(parsed.columns) == list(MATCHDAY_COLUMNS) and len(parsed) == 40 and parsed["Data"].iloc[0] == table["Data"].iloc[0].strftime("%Y-%m-%d")
+    assert list(parsed.columns) == [DEMO_EXPORT_COLUMN, *MATCHDAY_COLUMNS] and len(parsed) == 40 and parsed["Data"].iloc[0] == table["Data"].iloc[0].strftime("%Y-%m-%d")
+    assert parsed[DEMO_EXPORT_COLUMN].eq(DEMO_EXPORT_TEXT).all()
     assert len(pd.read_csv(io.BytesIO(matchday_csv_bytes(sim_state, None, Girone.C)))) == 10
     # results: the current season by default, any season of the history on request, one competition, one team
     results = results_table_for(sim_state)
@@ -686,7 +763,7 @@ def test_matchday_table_for_and_results_table_for(sim_state: PipelineState) -> N
     assert len(rows) > 0 and ((rows["Casa"] == hist) | (rows["Ospiti"] == hist)).all() and rows["λ"].notna().all()
     assert results_table_for(sim_state, team=hist).empty, "not in the current season"
     parsed = pd.read_csv(io.BytesIO(results_csv_bytes(sim_state, team=team)))
-    assert len(parsed) == 15 and list(parsed.columns) == list(RESULTS_MODEL_COLUMNS)
+    assert len(parsed) == 15 and list(parsed.columns) == [DEMO_EXPORT_COLUMN, *RESULTS_MODEL_COLUMNS] and parsed[DEMO_EXPORT_COLUMN].eq(DEMO_EXPORT_TEXT).all()
 
 
 def test_fixture_label_and_selected_row_match_id(sim_state: PipelineState) -> None:
@@ -786,7 +863,7 @@ def test_results_team_options_offer_only_teams_with_rows(sim_state: PipelineStat
 def test_app_renders_with_apptest(monkeypatch: pytest.MonkeyPatch) -> None:
     from streamlit.testing.v1 import AppTest
 
-    monkeypatch.setenv("SERIEC_FORCE_SIMULATE", "1")
+    demo_env(monkeypatch)
     monkeypatch.setenv("SERIEC_SIM_ROUNDS", "8")
     at = AppTest.from_file(str(APP_PATH), default_timeout=240)
     at.run()
@@ -800,7 +877,13 @@ def test_app_renders_with_apptest(monkeypatch: pytest.MonkeyPatch) -> None:
     fixture_box = at.selectbox(key="fixture")
     assert fixture_box.label == "Partita" and len(fixture_box.options) == 40
     assert {o.split(" · ")[1].split(" - ")[0] for o in fixture_box.options} == set(matchday_table["Casa"])
-    assert any("Clicca una riga per aprire la partita" in c.value for c in at.caption)
+    assert any("Clicca una partita da giocare per aprirla qui sotto" in c.value for c in at.caption)
+    assert matchday_table["Stato"].eq("da giocare").all() and matchday_table["Calcio d'inizio"].eq("dom 18/10").all()
+    # demo mode: the red banner at the top of the page and of every tab, the sidebar badge says Demo
+    assert sum(e.value == DEMO_WARNING for e in at.error) == 1 + len(TAB_LABELS)
+    for tab in at.tabs:
+        assert tab.error and tab.error[0].value == DEMO_WARNING, tab.label
+    assert any(e.value.startswith(f"**{DEMO_BADGE}**") and DEMO_WARNING in e.value for e in at.sidebar.error)
     # Risultati: season (current first) and team filters, the played matches of the current season with the model's reading
     season_box = at.selectbox(key="results_season")
     assert season_box.options == ["2026/27", "2025/26", "2024/25"] and season_box.value == "2026/27"
@@ -809,7 +892,7 @@ def test_app_renders_with_apptest(monkeypatch: pytest.MonkeyPatch) -> None:
     results = results_table_shown(at)
     assert list(results.columns) == list(RESULTS_MODEL_COLUMNS) and len(results) == 320  # 8 rounds x 40 matches
     assert any(c.value.startswith("P esito (%) = probabilità") and "Sorpresa" in c.value for c in at.caption)
-    assert any("Dati simulati" in i.value for i in at.sidebar.info)
+    assert not at.sidebar.success, "the demo never shows the real-data badge"
     # Selezioni di giornata: one matchday (the simulated league has one round), N controls, two picks tables, one CSV
     matchday_box = at.selectbox(key="matchday")
     assert len(matchday_box.options) == 1 and matchday_box.options[0].startswith("Giornata del 18 ott 2026 · Girone A g.9")
@@ -844,9 +927,9 @@ def test_app_renders_with_apptest(monkeypatch: pytest.MonkeyPatch) -> None:
     assert any(c.value.startswith("Tutte le partite in programma") for c in at.caption)
     # the badge and the subtitle state the perimeter: season, teams, current-season vs historical matches
     perimeter = "Perimetro: Serie C 2026/27 Gironi A/B/C + Serie B (80 squadre) · 320 partite stagione corrente · 3040 partite storiche (2024/25-2025/26)"
-    assert any(perimeter in i.value for i in at.sidebar.info)
+    assert any(perimeter in e.value for e in at.sidebar.error)
     assert any(perimeter in c.value for c in at.caption)
-    assert any("squadre storiche escluse" in i.value for i in at.sidebar.info)
+    assert any("squadre storiche escluse" in e.value for e in at.sidebar.error)
     assert at.metric, "the match tab shows the metrics row"
     assert any("EV = P_modello" in c.value for c in at.caption)
 
@@ -927,7 +1010,7 @@ def test_app_row_click_opens_the_fixture_and_dies_with_its_table(monkeypatch: py
         return result
 
     monkeypatch.setattr(streamlit, "dataframe", fake_dataframe)
-    monkeypatch.setenv("SERIEC_FORCE_SIMULATE", "1")
+    demo_env(monkeypatch)
     monkeypatch.setenv("SERIEC_SIM_ROUNDS", "8")
     at = AppTest.from_file(str(APP_PATH), default_timeout=240)
     at.run()
@@ -974,7 +1057,7 @@ def test_app_row_click_opens_the_fixture_and_dies_with_its_table(monkeypatch: py
     assert not at.exception, [e.value for e in at.exception]
     sb_element = matchday_table_element(at)
     sb_table = sb_element.value
-    assert sb_element.key == f"{MATCHDAY_TABLE_KEY_PREFIX}_2026-10-18_SB" != element.key and len(sb_table) == 10
+    assert sb_element.key == f"{MATCHDAY_TABLE_KEY_PREFIX}_g9_SB" != element.key and len(sb_table) == 10  # one competition: its round 9
     sb_labels = at.selectbox(key="fixture").options
     assert len(sb_labels) == 10 and at.selectbox(key="fixture").value == sb_labels[0]
     assert not at.selectbox(key="fixture").value.endswith(f" · {sb_table.iloc[k]['Casa']} - {sb_table.iloc[k]['Ospiti']}")
@@ -1006,18 +1089,8 @@ def test_app_matchday_selector_drives_match_value_and_picks_tabs(monkeypatch: py
     """With a season-long fixture list the three matchday-aware tabs show the next matchday and follow the selector."""
     from streamlit.testing.v1 import AppTest
 
-    import src.dashboard.state as state_module
-
     processed, odds_dir, by_round = multi_round_processed_dir(tmp_path, seed=23)
-    original = state_module.build_state
-
-    def processed_build_state(**kwargs):
-        return original(processed_dir=processed, odds_dir=odds_dir, **kwargs)
-
-    monkeypatch.setattr(state_module, "build_state", processed_build_state)
-    monkeypatch.delenv("SERIEC_FORCE_SIMULATE", raising=False)
-    monkeypatch.delenv("SERIEC_SIM_ROUNDS", raising=False)
-    monkeypatch.setenv("SERIEC_SEED", "23")  # a cache key no other test uses
+    real_env(monkeypatch, processed, odds_dir)  # the data directories are part of the cache key
     at = AppTest.from_file(str(APP_PATH), default_timeout=240)
     at.run()
     assert not at.exception, [e.value for e in at.exception]
@@ -1083,7 +1156,7 @@ def free_port() -> int:
 def test_streamlit_server_healthz() -> None:
     """Launch the real server once (headless) on a free port and check /healthz, then stop it."""
     port = free_port()
-    env = {**os.environ, "SERIEC_FORCE_SIMULATE": "1", "SERIEC_SIM_ROUNDS": "6"}
+    env = {**os.environ, "SERIEC_DEMO": "1", "SERIEC_SIM_ROUNDS": "6"}
     proc = subprocess.Popen(
         [sys.executable, "-m", "streamlit", "run", str(APP_PATH), "--server.headless", "true", "--server.port", str(port), "--browser.gatherUsageStats", "false"],
         cwd=str(REPO_ROOT),
@@ -1120,11 +1193,11 @@ def test_streamlit_server_healthz() -> None:
 def test_build_state_rejects_negative_seed_and_zero_rounds() -> None:
     """A negative seed or a non-positive number of rounds fails fast with an actionable message."""
     with pytest.raises(ValueError, match=r"seed must be >= 0 \(got -1\)"):
-        build_state(simulate=True, seed=-1, xi=0.0)
+        build_bc(simulate=True, seed=-1, xi=0.0)
     with pytest.raises(ValueError, match=r"n_rounds must be >= 1 \(got 0\)"):
-        build_state(simulate=True, n_rounds=0, xi=0.0)
+        build_bc(simulate=True, n_rounds=0, xi=0.0)
     with pytest.raises(ValueError, match="n_rounds must be >= 1"):
-        build_state(simulate=True, n_rounds=-5, xi=0.0)
+        build_bc(simulate=True, n_rounds=-5, xi=0.0)
 
 
 def test_build_state_clamps_full_season_rounds() -> None:
@@ -1132,7 +1205,7 @@ def test_build_state_clamps_full_season_rounds() -> None:
     upper = max_sim_rounds()
     assert upper == 37  # 20-team gironi -> 38 double round-robin rounds; the last one stays as fixtures
     assert MIN_SIM_ROUNDS == 1
-    state = build_state(simulate=True, seed=3, xi=0.0, n_rounds=50)
+    state = build_bc(simulate=True, seed=3, xi=0.0, n_rounds=50)
     assert state.source == "simulated"
     assert state.n_current_matches == upper * 40  # 4 competitions (3 Serie C gironi + Serie B) x 10 matches per round
     assert state.n_matches == state.n_current_matches + state.n_history_matches
@@ -1142,11 +1215,11 @@ def test_build_state_clamps_full_season_rounds() -> None:
     joined = "\n".join(state.notes)
     assert "richieste: 50" in joined and f"limitato a {upper}" in joined
     # a value inside the range is used verbatim and leaves no clamp note
-    plain = build_state(simulate=True, seed=3, xi=0.0, n_rounds=upper)
+    plain = build_bc(simulate=True, seed=3, xi=0.0, n_rounds=upper)
     assert plain.n_matches == state.n_matches
     assert not any("limitato a" in n for n in plain.notes)
     # the lower bound is valid too: one played round, prior on (history does not count as coverage), next round predicted
-    tiny = build_state(simulate=True, seed=3, xi=0.0, n_rounds=MIN_SIM_ROUNDS)
+    tiny = build_bc(simulate=True, seed=3, xi=0.0, n_rounds=MIN_SIM_ROUNDS)
     assert tiny.n_current_matches == 40 and tiny.n_history_matches > 0 and len(tiny.predictions) == 40 and tiny.prior_enabled
 
 
@@ -1195,15 +1268,15 @@ def test_app_survives_out_of_range_env(monkeypatch: pytest.MonkeyPatch) -> None:
     """Negative seed and full-season rounds render a complete page instead of a stack trace."""
     from streamlit.testing.v1 import AppTest
 
-    monkeypatch.setenv("SERIEC_FORCE_SIMULATE", "1")
+    demo_env(monkeypatch)
     monkeypatch.setenv("SERIEC_SEED", "-1")  # negative seed -> default seed, no crash
     monkeypatch.setenv("SERIEC_SIM_ROUNDS", "99")  # full season -> clamped, fixtures still present
     monkeypatch.setenv("SERIEC_AS_OF", "2026-11-06")  # deterministic calendar position
     at = AppTest.from_file(str(APP_PATH), default_timeout=240)
     at.run()
     assert not at.exception, [e.value for e in at.exception]
-    assert any("Dati simulati" in i.value for i in at.sidebar.info)
-    assert not any("0 partite in programma" in i.value for i in at.sidebar.info)
+    assert any(e.value.startswith(f"**{DEMO_BADGE}**") for e in at.sidebar.error)
+    assert not any("0 partite in programma" in e.value for e in at.sidebar.error)
     assert at.metric, "fixtures exist, so the match tab shows its metrics"
     assert len(at.selectbox(key="fixture").options) == 40
     assert any("limitato a 37" in m.value for m in at.markdown), "the clamp is reported in 'Dettagli pipeline'"
@@ -1216,14 +1289,14 @@ def test_app_survives_out_of_range_env(monkeypatch: pytest.MonkeyPatch) -> None:
     assert not at.exception, [e.value for e in at.exception]
     assert len(at.selectbox(key="fixture").options) == 40
     assert any("seed=7, 11 giornate giocate" in m.value for m in at.markdown)  # 2026-08-23 .. 2026-11-01 played
-    assert any("Perimetro: Serie C 2026/27 Gironi A/B/C + Serie B (80 squadre) · 440 partite stagione corrente · 3040 partite storiche (2024/25-2025/26)" in i.value for i in at.sidebar.info)
+    assert any("Perimetro: Serie C 2026/27 Gironi A/B/C + Serie B (80 squadre) · 440 partite stagione corrente · 3040 partite storiche (2024/25-2025/26)" in i.value for i in at.sidebar.error)
 
     monkeypatch.setenv("SERIEC_AS_OF", "not-a-date")  # unparseable -> today, page still renders
     monkeypatch.setenv("SERIEC_SEASON", "1999_00")  # unknown season file -> default 2026/27
     monkeypatch.setenv("SERIEC_HISTORY", "0")
     at.run()
     assert not at.exception, [e.value for e in at.exception]
-    assert any("Perimetro: Serie C 2026/27 Gironi A/B/C + Serie B (80 squadre)" in i.value and "0 partite storiche" in i.value for i in at.sidebar.info)
+    assert any("Perimetro: Serie C 2026/27 Gironi A/B/C + Serie B (80 squadre)" in i.value and "0 partite storiche" in i.value for i in at.sidebar.error)
 
 
 def test_app_heatmap_renders_complete_matrix(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1236,7 +1309,7 @@ def test_app_heatmap_renders_complete_matrix(monkeypatch: pytest.MonkeyPatch) ->
     """
     from streamlit.testing.v1 import AppTest
 
-    monkeypatch.setenv("SERIEC_FORCE_SIMULATE", "1")
+    demo_env(monkeypatch)
     monkeypatch.setenv("SERIEC_SIM_ROUNDS", "8")
     at = AppTest.from_file(str(APP_PATH), default_timeout=240)
     at.run()
@@ -1266,15 +1339,15 @@ def test_app_non_default_season_renders_on_its_own_calendar(monkeypatch: pytest.
     exhausted' and, had it not, would have simulated the 2025/26 perimeter on the 2026/27 calendar."""
     from streamlit.testing.v1 import AppTest
 
-    monkeypatch.setenv("SERIEC_FORCE_SIMULATE", "1")
+    demo_env(monkeypatch)
     monkeypatch.setenv("SERIEC_SEASON", "2025_26")
     monkeypatch.setenv("SERIEC_AS_OF", "2025-11-06")
     at = AppTest.from_file(str(APP_PATH), default_timeout=240)
     at.run()
     assert not at.exception, [e.value for e in at.exception]
-    assert not at.error, [e.value for e in at.error]
+    assert all(e.value == DEMO_WARNING or e.value.startswith(f"**{DEMO_BADGE}**") for e in at.error), [e.value for e in at.error]
     perimeter = "Perimetro: Serie C 2025/26 Gironi A/B/C + Serie B (80 squadre) · 440 partite stagione corrente · 3040 partite storiche (2023/24-2024/25)"
-    assert any(perimeter in i.value for i in at.sidebar.info)
+    assert any(perimeter in i.value for i in at.sidebar.error)
     options = at.selectbox(key="fixture").options
     assert len(options) == 40 and all("2025-11-09" in o for o in options)
     assert any("Calendario simulato al 2025-11-06" in m.value for m in at.markdown)
@@ -1298,6 +1371,7 @@ def test_app_resolves_today_on_every_run_and_survives_a_pipeline_error(monkeypat
 
     import src.dashboard.state as state_module
 
+    demo_env(monkeypatch)
     original = state_module.build_state
     received: list[date | None] = []
 
@@ -1308,7 +1382,6 @@ def test_app_resolves_today_on_every_run_and_survives_a_pipeline_error(monkeypat
         return original(**kwargs)
 
     monkeypatch.setattr(state_module, "build_state", recording_build_state)
-    monkeypatch.setenv("SERIEC_FORCE_SIMULATE", "1")
     monkeypatch.setenv("SERIEC_SEED", "11")  # a seed no other test uses: the cache cannot answer for us
     monkeypatch.delenv("SERIEC_AS_OF", raising=False)
     monkeypatch.delenv("SERIEC_SIM_ROUNDS", raising=False)
@@ -1324,7 +1397,7 @@ def test_app_resolves_today_on_every_run_and_survives_a_pipeline_error(monkeypat
     assert not at.exception, [e.value for e in at.exception]
     assert any("Pipeline non eseguibile con i parametri richiesti" in e.value and "stagione 2026/27" in e.value for e in at.error)
     assert received and received[0] == date.today()  # the refused call (the fallback may be served by the cache)
-    assert any("Perimetro: Serie C 2026/27 Gironi A/B/C + Serie B (80 squadre)" in i.value for i in at.sidebar.info)
+    assert any("Perimetro: Serie C 2026/27 Gironi A/B/C + Serie B (80 squadre)" in i.value for i in at.sidebar.error)
     assert at.metric, "the fallback state renders the match tab"
 
 
@@ -1343,7 +1416,7 @@ def serie_d_state() -> PipelineState:
     """A simulated perimeter with Serie D initialised: 242 teams, 4 rounds, no history (one joint fit)."""
     if not SERIE_D:
         pytest.skip("no competition of family 'Serie D' in config/competitions.toml")
-    return build_state(simulate=True, seed=7, xi=0.0, n_rounds=4, history_seasons=0, registry=serie_d_registry())
+    return build_bc(simulate=True, seed=7, xi=0.0, n_rounds=4, history_seasons=0, registry=serie_d_registry())
 
 
 def test_section_helpers_are_configuration_driven() -> None:
@@ -1517,7 +1590,8 @@ def test_app_section_radio_switches_to_serie_d(monkeypatch: pytest.MonkeyPatch) 
         return original(registry=registry, **kwargs)
 
     monkeypatch.setattr(state_module, "build_state", serie_d_build_state)
-    monkeypatch.setenv("SERIEC_FORCE_SIMULATE", "1")
+    monkeypatch.setenv("SERIEC_DEMO", "1")
+    monkeypatch.setattr(__import__("src.dashboard.data_refresh", fromlist=["locate_key"]), "locate_key", lambda **_: None)
     monkeypatch.setenv("SERIEC_SIM_ROUNDS", "4")
     monkeypatch.setenv("SERIEC_HISTORY", "0")
     monkeypatch.setenv("SERIEC_SEED", "29")  # a cache key no other test uses
@@ -1530,8 +1604,8 @@ def test_app_section_radio_switches_to_serie_d(monkeypatch: pytest.MonkeyPatch) 
     rankings = [d.value for d in at.dataframe if list(d.value.columns) == list(RANKING_COLUMNS)]
     assert len(rankings) == 1 and len(rankings[0]) == 80, "the default section ranks the 80 Serie B / Serie C teams only"
     assert len(matchday_table_shown(at)) == 40 and len(at.selectbox(key="fixture").options) == 40
-    assert any("Perimetro: Serie C 2026/27 Gironi A/B/C + Serie B (80 squadre) · 160 partite stagione corrente" in i.value for i in at.sidebar.info)
-    assert any("Serie D: inizializzata: 162 squadre, 324 partite" in i.value for i in at.sidebar.info)
+    assert any("Perimetro: Serie C 2026/27 Gironi A/B/C + Serie B (80 squadre) · 160 partite stagione corrente" in i.value for i in at.sidebar.error)
+    assert any("Serie D: inizializzata: 162 squadre, 324 partite" in i.value for i in at.sidebar.error)
     assert "matchday" in at.session_state and "matchday_d" not in at.session_state
 
     # switch to Serie D: competition options, ranking, matchday table, picks, perimeter, keys
@@ -1543,7 +1617,7 @@ def test_app_section_radio_switches_to_serie_d(monkeypatch: pytest.MonkeyPatch) 
     assert len(rankings) == 1 and len(rankings[0]) == 162 and rankings[0]["Competizione"].str.startswith("D-").all()
     assert any(h.value.startswith("Classifica di forza · Serie D") for h in at.subheader)
     assert any("sezione: Serie D" in c.value for c in at.caption)
-    assert any("Perimetro: Serie D 2026/27 Gironi A-I (162 squadre) · 324 partite stagione corrente · 0 partite storiche" in i.value for i in at.sidebar.info)
+    assert any("Perimetro: Serie D 2026/27 Gironi A-I (162 squadre) · 324 partite stagione corrente · 0 partite storiche" in i.value for i in at.sidebar.error)
     assert any("Perimetro: Serie D 2026/27 Gironi A-I (162 squadre)" in c.value for c in at.caption)
     d_table = matchday_table_shown(at)
     assert len(d_table) == 81 and d_table["Competizione"].str.startswith("D-").all()
@@ -1581,13 +1655,13 @@ def test_app_serie_d_not_initialised_shows_the_notice_in_every_tab(monkeypatch: 
     """With the shipped dictionary Serie D has no teams: the section is offered and every tab shows the status and the command."""
     from streamlit.testing.v1 import AppTest
 
-    monkeypatch.setenv("SERIEC_FORCE_SIMULATE", "1")
+    demo_env(monkeypatch)
     monkeypatch.setenv("SERIEC_SIM_ROUNDS", "8")
     at = AppTest.from_file(str(APP_PATH), default_timeout=240)
     at.run()
     assert not at.exception, [e.value for e in at.exception]
     assert at.radio(key="section").options == ["Serie B e Serie C", "Serie D"]
-    assert any("Serie D: non inizializzata: esegui la raccolta FootyStats con la chiave" in i.value for i in at.sidebar.info)
+    assert any("Serie D: non inizializzata: esegui la raccolta FootyStats con la chiave" in i.value for i in at.sidebar.error)
     at.radio(key="section").set_value("Serie D").run()
     assert not at.exception, [e.value for e in at.exception]
     assert at.selectbox(key="girone").options == ["Tutti", "D-A", "D-B", "D-C", "D-D", "D-E", "D-F", "D-G", "D-H", "D-I"]
@@ -1599,9 +1673,406 @@ def test_app_serie_d_not_initialised_shows_the_notice_in_every_tab(monkeypatch: 
     assert not any(list(d.value.columns) == list(RANKING_COLUMNS) for d in at.dataframe), "no Serie D table is rendered"
     assert not any(list(d.value.columns) == list(MATCHDAY_COLUMNS) for d in at.dataframe)
     assert "matchday_d" not in at.session_state and "fixture_d" not in at.session_state
-    assert any("Perimetro: Serie D 2026/27 (nessuna squadra)" in i.value for i in at.sidebar.info)
+    assert any("Perimetro: Serie D 2026/27 (nessuna squadra)" in i.value for i in at.sidebar.error)
     assert any("## Legenda" in m.value for m in at.markdown), "the glossary is still shown"
     # back to the default section: everything renders as before
     at.radio(key="section").set_value("Serie B e Serie C").run()
     assert not at.exception, [e.value for e in at.exception]
     assert len(matchday_table_shown(at)) == 40 and at.selectbox(key="girone").options == ["Tutti", "Girone A", "Girone B", "Girone C", "Serie B"]
+
+
+# ----------------------------------------------------------------------------- no silent simulation, demo switch
+def test_build_state_without_real_data_raises_no_data_error_and_never_simulates(tmp_path: Path) -> None:
+    """Missing, empty or unreadable ``matches.csv``: :class:`NoDataError` with the reasons, whatever ``simulate`` says (but True)."""
+    from src.dashboard.state import NoDataError
+
+    missing = tmp_path / "missing"
+    for simulate in (False, None):
+        with pytest.raises(NoDataError) as info:
+            build_bc(processed_dir=missing, odds_dir=tmp_path / "odds", simulate=simulate)
+        assert info.value.processed_dir == missing and "non esiste" in info.value.reasons[0] and "Nessun dato reale" in str(info.value)
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    (empty / "matches.csv").write_text(",".join(["match_id", "date", "round", "girone", "home_team", "away_team", "home_goals", "away_goals"]) + "\n", encoding="utf-8")
+    with pytest.raises(NoDataError, match="non contiene partite"):
+        build_bc(processed_dir=empty, odds_dir=tmp_path / "odds")
+    broken = tmp_path / "broken"
+    broken.mkdir()
+    (broken / "matches.csv").write_text("foo,bar\n1,2\n", encoding="utf-8")
+    with pytest.raises(NoDataError, match="non è leggibile"):
+        build_bc(processed_dir=broken, odds_dir=tmp_path / "odds")
+    # the default of build_state is real data: without files it raises instead of simulating
+    with pytest.raises(NoDataError):
+        build_state(processed_dir=missing, odds_dir=tmp_path / "odds", registry=BC_REGISTRY)
+    # the explicit demo still works, and says so in its first note
+    demo = build_bc(simulate=True, seed=7, xi=0.0, n_rounds=3, history_seasons=0)
+    assert demo.is_demo and demo.notes[0] == DEMO_WARNING and demo.demo_warning == DEMO_WARNING and demo.now is None
+
+
+def test_demo_requested_reads_the_demo_switch_and_its_deprecated_alias(caplog: pytest.LogCaptureFixture) -> None:
+    from src.dashboard.state import DEMO_ENV_VAR, LEGACY_DEMO_ENV_VAR, demo_requested
+
+    assert DEMO_ENV_VAR == "SERIEC_DEMO" and LEGACY_DEMO_ENV_VAR == "SERIEC_FORCE_SIMULATE"
+    assert not demo_requested({}) and not demo_requested({"SERIEC_DEMO": "0"}) and not demo_requested({"SERIEC_DEMO": ""})
+    assert demo_requested({"SERIEC_DEMO": "1"}) and demo_requested({"SERIEC_DEMO": "true"}) and demo_requested({"SERIEC_DEMO": " Sì "})
+    with caplog.at_level("WARNING"):
+        assert demo_requested({"SERIEC_FORCE_SIMULATE": "1"})
+    assert "deprecated" in caplog.text
+
+
+def friday_round_processed_dir(tmp_path: Path, *, seed: int = 31) -> tuple[Path, Path, list[Fixture], list[Fixture]]:
+    """Real-data files where round 9 has two matches played on Friday 16/10, 38 to play with kick-off times and one postponed round-7 match.
+
+    Returns ``(processed_dir, odds_dir, played_friday, to_play)``.
+    """
+    from datetime import UTC, datetime
+
+    league = simulate_league(seed=seed, registry=BC_REGISTRY, n_rounds=8)
+    round9 = sorted(league.fixtures, key=lambda f: f.match_id)
+    friday = [f for f in round9 if f.girone == Girone.A][:2]
+    played_rows = pd.DataFrame(
+        [
+            {"match_id": f.match_id, "date": pd.Timestamp(2026, 10, 16), "round": 9, "girone": f.girone.value, "home_team": f.home_team, "away_team": f.away_team, "home_goals": 2, "away_goals": 1}
+            for f in friday
+        ]
+    )
+    matches = pd.concat([league.matches, played_rows], ignore_index=True)
+    to_play = [
+        Fixture(f.match_id, f.date, f.round, f.girone, f.home_team, f.away_team, kickoff=datetime(2026, 10, 17 + (i % 2), 13, 30, tzinfo=UTC))
+        for i, f in enumerate(f for f in round9 if f not in friday)
+    ]
+    postponed_source = league.matches[(league.matches["girone"] == "B") & (league.matches["round"] == 7)].iloc[0]
+    postponed = Fixture(
+        "POSTPONED-B7",
+        date(2026, 10, 4),
+        7,
+        Girone.B,
+        str(postponed_source["home_team"]),
+        str(postponed_source["away_team"]),
+        kickoff=datetime(2026, 10, 4, 12, 30, tzinfo=UTC),
+        status="postponed",
+    )
+    matches = matches[matches["match_id"] != postponed_source["match_id"]]
+    processed, odds_dir = tmp_path / "processed", tmp_path / "odds"
+    save_processed(matches, processed / "matches.csv")
+    save_fixtures([*to_play, postponed], processed / "fixtures.csv")
+    write_odds_csv([q for q in league.odds if q.match_id in {f.match_id for f in to_play}], odds_dir / "simbook.csv")
+    return processed, odds_dir, friday, to_play
+
+
+def test_current_round_keeps_the_friday_matches_and_lists_the_postponed_one(tmp_path: Path) -> None:
+    """Real data on Saturday 17/10: round 9 is current with its two Friday matches; the postponed round-7 match is a recovery."""
+    from datetime import UTC, datetime
+
+    from src.dashboard.state import (
+        competition_rounds,
+        current_round_for,
+        recoveries_for,
+        recoveries_table_for,
+        round_table_for,
+        round_view_for,
+        state_at,
+    )
+
+    processed, odds_dir, friday, to_play = friday_round_processed_dir(tmp_path)
+    saturday = datetime(2026, 10, 16, 22, 0, tzinfo=UTC)  # midnight of Saturday 17/10 in Rome (CEST)
+    state = build_bc(processed_dir=processed, odds_dir=odds_dir, xi=0.0, now=saturday)
+    assert state.now == saturday and not state.is_demo and len(state.calendar_fixtures) == 39
+    first = state.next_matchday
+    assert first is not None and first.rounds == {g: 9 for g in PERIMETER_GIRONI}
+    assert first.n_fixtures == 38 and first.n_played == 2 and first.n_matches == 40 and first.key == "2026-10-16"
+    assert first.label.startswith("Giornata del 16-18 ott 2026 · Girone A g.9")
+    table = matchday_table_for(state)
+    assert list(table.columns) == list(MATCHDAY_COLUMNS) and len(table) == 40
+    played = table[table["Stato"].str.startswith("giocata")]
+    assert set(played["match_id"]) == {f.match_id for f in friday} and played["Stato"].eq("giocata 2-1").all()
+    assert played["P1 (%)"].isna().all() and played["Calcio d'inizio"].eq("ven 16/10").all()
+    upcoming = table[table["Stato"] == "da giocare"]
+    assert len(upcoming) == 38 and upcoming["P1 (%)"].notna().all() and set(upcoming["Calcio d'inizio"]) == {"sab 17/10 15:30", "dom 18/10 15:30"}
+    assert table["Stato"].tolist()[:2] == ["giocata 2-1", "giocata 2-1"], "Friday first"
+    # the picks and the match selector see only the matches to play
+    assert len(fixtures_for(state, None)) == 38 and not set(draw_picks_table(state, None)["Partita"]) & {f.label for f in friday}
+    # one competition, any official round: the Giornata n. selector
+    assert competition_rounds(state, Girone.A) == list(range(1, 10)) and current_round_for(state, Girone.A).round == 9
+    eight = round_view_for(state, Girone.A, 8)
+    assert eight.is_complete and eight.n_matches == 10
+    eight_table = matchday_table_for(state, None, Girone.A, round_number=8)
+    assert len(eight_table) == 10 and eight_table["Stato"].str.startswith("giocata").all() and eight_table["P1 (%)"].isna().all()
+    assert round_table_for(state, eight).equals(eight_table)
+    assert matchday_table_for(state, None, Girone.A, SECTION_D, round_number=8).empty, "a competition outside the section"
+    assert matchday_table_key(None, Girone.A, round_number=8) == f"{MATCHDAY_TABLE_KEY_PREFIX}_g8_A"
+    # the postponed match of round 7: in its round as 'rinviata', in the recoveries with its original date
+    seven = round_view_for(state, Girone.B, 7)
+    assert seven.n_postponed == 1 and seven.n_played == 9
+    rec = recoveries_for(state)
+    assert [m.match_id for m in rec] == ["POSTPONED-B7"] and rec[0].original_date == date(2026, 10, 4)
+    assert recoveries_for(state, SECTION_D) == [] and recoveries_for(state, None, Girone.A) == [] and recoveries_for(state, SECTION_D, Girone.B) == []
+    rec_table = recoveries_table_for(state)
+    assert rec_table["Stato"].tolist() == ["rinviata"] and rec_table["Nuova data"].tolist() == ["da definire"] and rec_table["Data originale"].tolist() == ["dom 04/10"]
+    # Sunday night: round 9 is over, the calendar regroups without a refit (no round left to play in these files)
+    later = state_at(state, datetime(2026, 10, 18, 22, 0, tzinfo=UTC))
+    assert later is not state and later.params is state.params and later.matchdays == [] and state.next_matchday is first
+    assert state_at(state, saturday) is state
+    assert any(n.startswith("Calendario al 17/10/2026 00:00: giornata corrente Giornata del 16-18 ott 2026") for n in state.notes)
+
+
+# ----------------------------------------------------------------------------- setup page, runtime refresh, Giornata rows
+def test_app_without_data_shows_the_setup_page_and_no_tabs(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    from streamlit.testing.v1 import AppTest
+
+    import src.dashboard.data_refresh as refresh_module
+
+    real_env(monkeypatch, tmp_path / "nothing", tmp_path / "odds")
+    at = AppTest.from_file(str(APP_PATH), default_timeout=240)
+    at.run()
+    assert not at.exception, [e.value for e in at.exception]
+    assert not at.tabs, "no tab with invented numbers"
+    assert any("Nessun dato reale disponibile" in e.value for e in at.error)
+    assert not any(DEMO_WARNING in e.value for e in at.error)
+    assert any("Cosa manca" in m.value and "non esiste" in m.value for m in at.markdown)
+    assert any("App settings → Secrets" in m.value and 'FOOTYSTATS_API_KEY = "..."' in m.value and ".env" in m.value for m in at.markdown)
+    assert any("Nessuna chiave FootyStats trovata" in i.value for i in at.info)
+    assert not [b for b in at.button if b.label == "Scarica i dati da FootyStats adesso"], "no download button without a key"
+    assert any("Nessun dato reale" in w.value for w in at.sidebar.warning)
+    assert any("SERIEC_DEMO=1" in c.value for c in at.caption)
+
+    # with a key: the page offers the download; clicking it downloads (fake), then the dashboard shows the real data
+    secret = "fake-footystats-key-987"
+    calls: list[str] = []
+    league = simulate_league(seed=13, registry=BC_REGISTRY, n_rounds=6)
+
+    def fake_refresh(processed_dir, odds_dir, *, key=None, progress=None, **_):  # noqa: ANN001, ANN003, ANN202
+        from datetime import UTC, datetime
+
+        calls.append(key)
+        progress(0.5, "Scarico da FootyStats… 10 richieste")
+        save_processed(league.matches, Path(processed_dir) / "matches.csv")
+        save_fixtures(league.fixtures, Path(processed_dir) / "fixtures.csv")
+        stamp = datetime(2026, 11, 7, 13, 5, tzinfo=UTC)
+        result = refresh_module.RefreshResult(stamp, stamp, ("A", "B", "C", "SB", "DA"), Path(processed_dir), Path(odds_dir))
+        result.per_competition = {c: {"partite": 60, "in_calendario": 10, "quote": 0} for c in ("A", "B", "C", "SB")}
+        result.errors, result.not_chosen = {"DA": "not chosen"}, {"DA": "Italy Serie D Group A"}
+        result.registry_sync = ("Dizionario squadre 2026/27 sincronizzato con FootyStats: 2 variazioni.",)
+        result.n_matches, result.n_fixtures, result.written = len(league.matches), len(league.fixtures), True
+        progress(1.0, "Dati aggiornati.")
+        return result
+
+    monkeypatch.setattr(refresh_module, "locate_key", lambda **_: refresh_module.KeyLocation(secret, "Streamlit secrets"))
+    monkeypatch.setattr(refresh_module, "refresh", fake_refresh)
+    monkeypatch.setattr(refresh_module, "needs_refresh", lambda *a, **k: False)  # no automatic download: the button does it
+    monkeypatch.setenv("SERIEC_SEED", "41")
+    at.run()
+    assert not at.exception, [e.value for e in at.exception]
+    assert not at.tabs and any("Chiave FootyStats trovata (Streamlit secrets)" in s.value for s in at.success)
+    button = next(b for b in at.button if b.label == "Scarica i dati da FootyStats adesso")
+    button.click().run()
+    assert not at.exception, [e.value for e in at.exception]
+    assert calls == [secret]
+    at.run()
+    assert not at.exception, [e.value for e in at.exception]
+    assert [t.label for t in at.tabs] == list(TAB_LABELS) and any("Dati reali FootyStats" in s.value for s in at.sidebar.success)
+    assert any(b.label == "Aggiorna dati ora" for b in at.sidebar.button)
+    # the key never reaches the page
+    texts = [e.value for kind in ("markdown", "caption", "success", "info", "warning", "error") for e in at.get(kind)]
+    assert texts and not any(secret in str(t) for t in texts)
+
+
+def test_app_refreshes_stale_data_at_start_once_and_reports_skipped_competitions(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    from streamlit.testing.v1 import AppTest
+
+    import src.dashboard.data_refresh as refresh_module
+
+    league = simulate_league(seed=17, registry=BC_REGISTRY, n_rounds=6)
+    processed, odds_dir = tmp_path / "processed", tmp_path / "odds"
+    real_env(monkeypatch, processed, odds_dir)
+    runs: list[bool] = []
+
+    def fake_refresh(processed_dir, odds_dir, *, key=None, progress=None, **_):  # noqa: ANN001, ANN003, ANN202
+        from datetime import UTC, datetime
+
+        runs.append(True)
+        save_processed(league.matches, Path(processed_dir) / "matches.csv")
+        save_fixtures(league.fixtures, Path(processed_dir) / "fixtures.csv")
+        stamp = datetime(2026, 11, 7, 13, 5, tzinfo=UTC)
+        result = refresh_module.RefreshResult(stamp, stamp, ("A", "SB", "DG"), Path(processed_dir), Path(odds_dir))
+        result.per_competition = {"A": {"partite": 60, "in_calendario": 10, "quote": 0}, "SB": {"partite": 60, "in_calendario": 10, "quote": 0}}
+        result.errors, result.not_chosen = {"DG": "league not chosen"}, {"DG": "Italy Serie D Group G"}
+        result.registry_sync = ("Girone B: aggiunta Nuova Monterosi, rimossa Guidonia Montecelio",)
+        result.n_matches, result.written = len(league.matches), True
+        return result
+
+    monkeypatch.setattr(refresh_module, "locate_key", lambda **_: refresh_module.KeyLocation("k-123", "ambiente"))
+    monkeypatch.setattr(refresh_module, "refresh", fake_refresh)
+    monkeypatch.setenv("SERIEC_SEED", "43")
+    at = AppTest.from_file(str(APP_PATH), default_timeout=240)
+    at.run()
+    assert not at.exception, [e.value for e in at.exception]
+    assert runs == [True], "missing data + a key: downloaded at start"
+    assert any("Serie D Girone G" in w.value and "Italy Serie D Group G" in w.value for w in at.warning)
+    assert any(s.value.startswith("Dati FootyStats aggiornati alle 14:05 del 07/11") for s in at.success)
+    assert [t.label for t in at.tabs] == list(TAB_LABELS)
+    assert any("Dizionario squadre: Girone B: aggiunta Nuova Monterosi" in m.value for m in at.markdown), "registry differences in Dettagli pipeline"
+    # the next run: the data is fresh (the stamp of the files just written), nothing is downloaded again
+    at.run()
+    assert not at.exception and runs == [True]
+    # 'Aggiorna dati ora' forces a download
+    next(b for b in at.sidebar.button if b.label == "Aggiorna dati ora").click().run()
+    assert not at.exception, [e.value for e in at.exception]
+    assert runs == [True, True]
+
+
+def test_app_giornata_tab_shows_played_and_upcoming_rows_and_the_recoveries(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    from streamlit.testing.v1 import AppTest
+
+    processed, odds_dir, friday, to_play = friday_round_processed_dir(tmp_path, seed=37)
+    real_env(monkeypatch, processed, odds_dir, as_of=date(2026, 10, 17))
+    monkeypatch.setenv("SERIEC_SEED", "47")
+    at = AppTest.from_file(str(APP_PATH), default_timeout=240)
+    at.run()
+    assert not at.exception, [e.value for e in at.exception]
+    assert not any(DEMO_WARNING in e.value for e in at.error), "real data: no demo banner"
+    table = matchday_table_shown(at)
+    assert len(table) == 40 and (table["Stato"] == "giocata 2-1").sum() == 2 and (table["Stato"] == "da giocare").sum() == 38
+    assert table.loc[table["Stato"] == "giocata 2-1", "P1 (%)"].isna().all() and table.loc[table["Stato"] == "da giocare", "P1 (%)"].notna().all()
+    assert set(table.loc[table["Stato"] == "da giocare", "Calcio d'inizio"]) == {"sab 17/10 15:30", "dom 18/10 15:30"}
+    assert len(at.selectbox(key="fixture").options) == 38, "the detail offers the matches to play only"
+    assert any(c.value.startswith("Giornata del 16-18 ott 2026") and "2 giocate, 38 da giocare" in c.value for c in at.caption)
+    assert any(e.label == "Recuperi e rinvii (1)" for e in at.expander)
+    rec = next(d.value for d in at.dataframe if "Data originale" in d.value.columns)
+    assert rec["Stato"].tolist() == ["rinviata"] and rec["Data originale"].tolist() == ["dom 04/10"]
+    assert any("Chiave FootyStats non configurata" in c.value for c in at.sidebar.caption)
+    # one competition: the Giornata n. selector, the current round by default, any other round on request
+    at.selectbox(key="girone").select("Girone A").run()
+    assert not at.exception, [e.value for e in at.exception]
+    box = at.selectbox(key="round_A")
+    assert box.options == [f"Giornata {r}" for r in range(1, 9)] + ["Giornata 9 (corrente)"] and box.value == 9
+    assert len(matchday_table_shown(at)) == 10 and len(at.selectbox(key="fixture").options) == 8
+    box.select(8).run()
+    assert not at.exception, [e.value for e in at.exception]
+    eight = matchday_table_shown(at)
+    assert len(eight) == 10 and eight["Stato"].str.startswith("giocata").all() and eight["P1 (%)"].isna().all()
+    assert any("Nessuna partita da giocare con una previsione" in i.value for i in at.info)
+    assert matchday_table_element(at).key == f"{MATCHDAY_TABLE_KEY_PREFIX}_g8_A"
+    assert any(e.label == "Recuperi e rinvii (0)" for e in at.expander)
+
+
+# ----------------------------------------------------------------------------- review fixes: kicked-off matches, demo exports, old data
+def test_kicked_off_fixtures_are_in_play_and_leave_every_pre_match_view(tmp_path: Path) -> None:
+    """Regression: data of Saturday morning, page at 16:00: the 15:30 kick-offs stayed in the picks, in the value panel
+    (also with 'Mostra tutte le giornate') and in the predictions export, priced with pre-match EV."""
+    from datetime import UTC, datetime
+
+    from src.engine.calendar import IN_PLAY_TEXT
+    from src.dashboard.state import predictions_table, recoveries_for, state_at
+
+    processed, odds_dir, friday, to_play = friday_round_processed_dir(tmp_path, seed=53)
+    state = build_bc(processed_dir=processed, odds_dir=odds_dir, xi=0.0, now=datetime(2026, 10, 17, 8, 0, tzinfo=UTC))
+    assert state.next_matchday.n_fixtures == 38 and state.next_matchday.n_in_play == 0
+    started = {f.match_id for f in to_play if f.kickoff.day == 17}
+    assert len(started) == 19
+    later = state_at(state, datetime(2026, 10, 17, 14, 0, tzinfo=UTC))  # 16:00 in Rome: the Saturday matches kicked off
+    first = later.next_matchday
+    assert first is not None and first.n_fixtures == 19 and first.n_in_play == 19 and first.n_played == 2 and not first.fixture_ids & started
+    table = matchday_table_for(later)
+    in_play = table[table["Stato"] == IN_PLAY_TEXT]
+    assert len(table) == 40 and set(in_play["match_id"]) == started and in_play["P1 (%)"].isna().all() and in_play["EV max (%)"].isna().all()
+    assert set(in_play["Calcio d'inizio"]) == {"sab 17/10 15:30"}
+    labels = {f.label for f in to_play if f.match_id in started}
+    assert not set(draw_picks_table(later, None, n=40)["Partita"]) & labels and not set(btts_picks_table(later, None, n=40)["Partita"]) & labels
+    assert len(fixtures_for(later, None)) == 19
+    every = value_table(later, -1.0, matchday=ALL_MATCHDAYS)
+    assert len(every) and not set(every["Partita"]) & labels, "no pre-match price for a match under way, whatever the matchday filter"
+    assert set(value_table(state, -1.0, matchday=ALL_MATCHDAYS)["Partita"]) & labels, "before the kick-off they were priced"
+    assert not set(predictions_table(later)["match_id"]) & started and len(predictions_table(later)) == 19
+    assert recoveries_for(later) and all(m.match_id not in started for m in recoveries_for(later)), "never a recovery"
+
+
+def test_demo_exports_are_marked_and_named_demo() -> None:
+    """Regression: CSVs downloaded from the demo carried no mark: invented numbers could reach a betting decision."""
+    from src.dashboard.state import DEMO_FILE_PREFIX, demo_file_name, mark_demo_frame
+
+    frame = pd.DataFrame({"Partita": ["A - B", "C - D"], "EV (%)": [4.2, -1.0]})
+    marked = pd.read_csv(io.BytesIO(export_csv_bytes(frame, demo=True)))
+    assert list(marked.columns) == [DEMO_EXPORT_COLUMN, "Partita", "EV (%)"] and marked[DEMO_EXPORT_COLUMN].eq(DEMO_EXPORT_TEXT).all()
+    assert DEMO_EXPORT_TEXT == "DATI SIMULATI - NON USARE PER SCOMMETTERE" and list(frame.columns) == ["Partita", "EV (%)"], "input untouched"
+    assert pd.read_csv(io.BytesIO(export_csv_bytes(frame))).columns.tolist() == ["Partita", "EV (%)"], "real data: no mark"
+    empty = pd.read_csv(io.BytesIO(export_csv_bytes(frame.iloc[0:0], demo=True)))
+    assert len(empty) == 1 and empty[DEMO_EXPORT_COLUMN].tolist() == [DEMO_EXPORT_TEXT], "even an empty demo file says so"
+    assert mark_demo_frame(mark_demo_frame(frame)).columns.tolist().count(DEMO_EXPORT_COLUMN) == 1
+    assert demo_file_name("selezioni_bc_2026-11-07.csv", True) == f"{DEMO_FILE_PREFIX}selezioni_bc_2026-11-07.csv" == "DEMO_selezioni_bc_2026-11-07.csv"
+    assert demo_file_name("DEMO_x.csv", True) == "DEMO_x.csv" and demo_file_name("x.csv", False) == "x.csv"
+    picks = pd.read_csv(io.BytesIO(picks_csv_bytes(picks_frame_empty(), picks_frame_empty(), demo=True)))
+    assert picks.columns[0] == DEMO_EXPORT_COLUMN and picks[DEMO_EXPORT_COLUMN].tolist() == [DEMO_EXPORT_TEXT]
+
+
+def picks_frame_empty() -> pd.DataFrame:
+    from src.engine.picks import picks_frame
+
+    return picks_frame([])
+
+
+def test_app_warns_on_every_run_while_the_data_is_old(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Regression: without a key, or after a failed download, days-old calendars were shown as current with only the
+    sidebar caption; the failure's warning appeared in one script run only."""
+    from datetime import UTC, datetime
+
+    from streamlit.testing.v1 import AppTest
+
+    import src.dashboard.data_refresh as refresh_module
+
+    league = simulate_league(seed=19, registry=BC_REGISTRY, n_rounds=6)
+    processed, odds_dir = tmp_path / "processed", tmp_path / "odds"
+    save_processed(league.matches, processed / "matches.csv")
+    save_fixtures(league.fixtures, processed / "fixtures.csv")
+    old = time.time() - 2 * 86400 - 600
+    for name in ("matches.csv", "fixtures.csv"):
+        os.utime(processed / name, (old, old))
+    real_env(monkeypatch, processed, odds_dir)
+    monkeypatch.setenv("SERIEC_SEED", "59")
+    at = AppTest.from_file(str(APP_PATH), default_timeout=240)
+    at.run()
+    assert not at.exception, [e.value for e in at.exception]
+    stale = [w.value for w in at.warning if w.value.startswith("Dati vecchi di 2 giorni")]
+    assert len(stale) == 1 and "chiave FootyStats mancante" in stale[0] and "/2026)" in stale[0], stale
+    assert [t.label for t in at.tabs] == list(TAB_LABELS), "old real data is still shown, flagged"
+    at.run()
+    assert any(w.value.startswith("Dati vecchi di 2 giorni") for w in at.warning), "on every run, not once"
+
+    # a key whose download fails: the error joins the age, and stays on the next runs while the guard blocks retries
+    calls: list[str] = []
+
+    def failing(processed_dir, odds_dir, *, key=None, progress=None, **_):  # noqa: ANN001, ANN003, ANN202
+        calls.append(key)
+        moment = datetime.now(UTC)
+        result = refresh_module.RefreshResult(moment, moment, ("A",), Path(processed_dir), Path(odds_dir))
+        result.error = "aggiornamento non riuscito: ConnectError: rete assente"
+        return result
+
+    monkeypatch.setattr(refresh_module, "locate_key", lambda **_: refresh_module.KeyLocation("k-old", "ambiente"))
+    monkeypatch.setattr(refresh_module, "refresh", failing)
+    for _ in range(2):
+        at.run()
+        assert not at.exception, [e.value for e in at.exception]
+        stale = [w.value for w in at.warning if w.value.startswith("Dati vecchi di 2 giorni")]
+        assert len(stale) == 1 and "aggiornamento non riuscito: ConnectError: rete assente" in stale[0], stale
+    assert calls == ["k-old"], "one attempt per 6 hours, the failure is remembered for every session"
+    assert not any("k-old" in w.value for w in at.warning)
+
+    # fresh data, but one competition still carries the data of an earlier download (its current season failed)
+    now = time.time()
+    for name in ("matches.csv", "fixtures.csv"):
+        os.utime(processed / name, (now, now))
+    stamp = {
+        "refreshed_at": datetime.now(UTC).isoformat(),
+        "matches_mtime": (processed / "matches.csv").stat().st_mtime,
+        "kept": {"A": {"stagioni": ["2026/27"], "partite": 60, "in_calendario": 10, "motivo": "HTTP 503"}},
+    }
+    (processed / refresh_module.STAMP_FILE).write_text(json.dumps(stamp), encoding="utf-8")
+    at.run()
+    assert not at.exception, [e.value for e in at.exception]
+    assert not any(w.value.startswith("Dati vecchi") for w in at.warning)
+    assert any(
+        w.value.startswith("Serie C Girone A, stagione 2026/27: non aggiornata all'ultimo download (HTTP 503)") and "60 partite, 10 in calendario" in w.value
+        for w in at.warning
+    )
+    assert calls == ["k-old"]

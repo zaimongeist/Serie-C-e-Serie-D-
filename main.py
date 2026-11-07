@@ -45,15 +45,38 @@ at ``--export`` always covers the whole perimeter. In the simulated full mode
 ``--serie-d-demo`` adds a synthetic Serie D registry (nine gironi of 18 clubs)
 so the section can be shown offline.
 
+Real data and demo
+------------------
+``--footystats`` downloads the FootyStats data first with the user's key
+(:func:`src.dashboard.data_refresh.refresh`: ``FOOTYSTATS_API_KEY`` from the
+environment or ``.env``; the data is saved only locally in ``data/processed`` /
+``data/odds``, never committed) and then runs on it; ``--processed`` runs on CSVs
+already harvested. Without either the console runs a **simulated** league
+(``--mode mini`` / ``--mode full``): its first and last output line is the
+warning :data:`~src.simulation.generator.DEMO_WARNING` (invented results, dates
+and odds: never to be used for betting), and every CSV it writes with
+``--export`` is named ``DEMO_<name>`` and starts with the column ``AVVISO`` =
+``DATI SIMULATI - NON USARE PER SCOMMETTERE``.
+
+Rounds: the matchday table of section 4 and the picks of section 8 follow the
+**official rounds** (:mod:`src.engine.calendar`): the current round of every
+competition with every one of its matches -- played ones with the score
+(``Stato`` ``giocata 2-1``), the ones that have kicked off without a result in
+the data (``in corso / risultato in attesa``, no prediction and no pick), the
+ones to play with the kick-off in Europe/Rome and the model's numbers, the
+postponed ones -- evaluated at ``--as-of`` (midnight, Europe/Rome) or now for
+real data.
+
 Calendar of the simulated modes: ``--mode full`` plays the rounds dated before
 ``--as-of`` (today by default) and predicts the first round on/after it, like
-the dashboard; ``--rounds N`` fixes the played rounds instead (e.g. 30 for the
+the dashboard demo; ``--rounds N`` fixes the played rounds instead (e.g. 30 for the
 parameter-recovery report). ``--mode mini`` is a fixed early-season snapshot
 (the first 20 matches, rounds 1-3, and round 4 as fixtures) and says so.
 
 Examples::
 
-    python main.py                       # 20-match simulated mini dataset + 2 synthetic past seasons (default)
+    python main.py --footystats          # download the real data with the key in .env, then run on it
+    python main.py                       # DEMO: 20-match simulated mini dataset + 2 synthetic past seasons (default)
     python main.py --mode full --history 0   # simulated 2026/27 season as of today, with parameter-recovery report
     python main.py --mode full --rounds 30   # 30 played rounds whatever the date
     python main.py --mode full --as-of 2026-12-20 --history 1
@@ -65,8 +88,9 @@ Examples::
 from __future__ import annotations
 
 import argparse
+import sys
 from dataclasses import dataclass, field, replace
-from datetime import date
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Callable, Final, Sequence
 
@@ -74,7 +98,7 @@ import numpy as np
 import pandas as pd
 
 from src.common.logging_config import configure_logging, get_logger
-from src.common.paths import ROOT
+from src.common.paths import ODDS_DIR, PROCESSED_DIR, ROOT
 from src.common.competitions import describe_competitions
 from src.common.schemas import (
     Fixture,
@@ -86,11 +110,13 @@ from src.common.schemas import (
     validate_matches_df,
 )
 from src.common.teams import DEFAULT_SEASON, TeamRegistry, list_seasons, load_registry
+from src.engine.calendar import IN_PLAY_TEXT, STATUS_TO_PLAY, kicked_off, rome_midnight
 from src.engine.model import DixonColesConfig, DixonColesEngine, FittedParams
 from src.engine.picks import DEFAULT_N_BTTS, DEFAULT_N_DRAWS, Matchday, Pick, btts_picks, draw_picks, matchdays, picks_frame
 from src.engine.tables import matchday_table, results_table
 from src.engine.value import KellyConfig, RegressionTrap, ValueEngine, ValueOpportunity, detect_regression_traps
 from src.simulation.generator import (
+    DEMO_WARNING,
     SimulatedLeague,
     history_seasons_for,
     inject_regression_trap,
@@ -241,6 +267,7 @@ from src.dashboard.state import (  # noqa: E402
     CoverageReport,
     configured_gironi,
     coverage_report,
+    demo_file_name,
     export_csv_bytes,
     history_label,
     in_section,
@@ -250,6 +277,7 @@ from src.dashboard.state import (  # noqa: E402
     picks_csv_bytes,
     prior_recommended,
     section_matches,
+    season_fixtures,
     section_slug,
     sections_for,
     serie_d_gironi,
@@ -270,8 +298,10 @@ LEGEND_POINTER: Final[str] = "Legenda: tab Legenda della dashboard oppure README
 CONSOLE_MATCHDAY_COLUMNS: Final[tuple[str, ...]] = (
     "Competizione",
     "Data",
+    "Calcio d'inizio",
     "Casa",
     "Ospiti",
+    "Stato",
     "λ",
     "μ",
     "P1 (%)",
@@ -286,7 +316,9 @@ CONSOLE_MATCHDAY_COLUMNS: Final[tuple[str, ...]] = (
 )
 #: One-line reading guide of the compact table, printed under it.
 MATCHDAY_CONSOLE_LEGEND: Final[str] = (
-    "colonne: λ/μ gol attesi casa/ospiti · P1 PX P2 O2.5 GG probabilità % del modello · Fair X quota fair del pareggio · "
+    "colonne: Calcio d'inizio in ora italiana · Stato giocata (con il risultato, senza previsione) / da giocare / "
+    "in corso / risultato in attesa (iniziata, risultato non ancora nei dati: senza previsione) / rinviata · "
+    "λ/μ gol attesi casa/ospiti · P1 PX P2 O2.5 GG probabilità % del modello · Fair X quota fair del pareggio · "
     "Book X miglior quota book della X · EV max miglior valore atteso % fra le selezioni quotate · Flag unione dei flag "
     "della partita (tabella completa con forma, α/β, tutte le quote e match_id nel CSV <export>_giornata.csv)"
 )
@@ -304,6 +336,12 @@ def section_export_stem(export: Path, section: str | None, *, multi: bool) -> Pa
     if section is None or not multi:
         return export
     return export.with_name(f"{export.stem}_{section_slug(section)}{export.suffix}")
+
+
+def demo_export_path(export: Path) -> Path:
+    """``export`` with its file name prefixed by ``DEMO_`` (the base path of every CSV of the simulated modes)."""
+    export = Path(export)
+    return export.with_name(demo_file_name(export.name, True))
 
 
 def picks_export_path(export: Path) -> Path:
@@ -563,6 +601,8 @@ def run_pipeline(
     n_draws: int = DEFAULT_N_DRAWS,
     n_btts: int = DEFAULT_N_BTTS,
     sections: Sequence[str] | None = None,
+    now: datetime | None = None,
+    demo: bool = False,
 ) -> PipelineOutput:
     """Fit -> predict -> value, printing each step when ``verbose``.
 
@@ -588,7 +628,20 @@ def run_pipeline(
     whole perimeter, the pre-Serie-D behaviour; an empty sequence prints only
     steps 1-2 (and writes the value report). The value engine runs once for the
     whole perimeter whatever the sections.
+
+    The matchdays follow the official rounds (:func:`src.engine.picks.matchdays`
+    on the fixtures of the current season and its played matches) at the
+    reference instant ``now`` (aware; ``None`` = the fixture list already is the
+    upcoming schedule, the simulated modes): the section-4 table lists every
+    match of the current rounds, played ones with their score.
+
+    ``demo`` marks the data as simulated: every CSV written with ``export``
+    goes to :func:`demo_export_path` (``DEMO_<name>``) and starts with the
+    column ``AVVISO`` = ``DATI SIMULATI - NON USARE PER SCOMMETTERE``
+    (:func:`src.dashboard.state.mark_demo_frame`).
     """
+    if demo and export is not None:
+        export = demo_export_path(Path(export))
     matches = validate_matches_df(matches)
     say = print if verbose else (lambda *a, **k: None)
     notes: list[str] = []
@@ -717,11 +770,17 @@ def run_pipeline(
     ]
     opportunities = value_engine.evaluate(predictions, quotes, matches=trap_frame, traps=traps)
     frame = value_engine.to_frame(opportunities)
-    giornate = matchdays(p.fixture for p in predictions)
+    calendar = season_fixtures(fixtures, label)
+    giornate = matchdays(calendar, played=current, now=now)
     log.info("predictions and value computed", extra={"n_predictions": len(predictions), "n_opportunities": len(opportunities), "n_traps": len(traps), "n_matchdays": len(giornate)})
 
     export_path: Path | None = None
-    if export is not None:
+    if export is not None and demo:
+        export_path = Path(export)
+        export_path.parent.mkdir(parents=True, exist_ok=True)
+        export_path.write_bytes(export_csv_bytes(frame, demo=True))
+        log.info("value report exported (demo)", extra={"path": str(export_path), "rows": len(frame)})
+    elif export is not None:
         export_path = value_engine.export_csv(opportunities, Path(export))
     passes: list[str | None] = [None] if sections is None else [str(sec) for sec in sections]
     multi = len(passes) > 1
@@ -746,9 +805,12 @@ def run_pipeline(
             skip_lines=skip_lines,
             n_draws=n_draws,
             n_btts=n_btts,
+            calendar=calendar,
+            now=now,
             export=None if export is None else section_export_stem(Path(export), sec, multi=multi),
             value_report=export_path if position == 0 else None,
             first=position == 0,
+            demo=demo,
         )
         if sec is not None:
             section_outputs[sec] = result
@@ -822,6 +884,9 @@ def _run_section(
     export: Path | None,
     value_report: Path | None,
     first: bool = True,
+    calendar: Sequence[Fixture] = (),
+    now: datetime | None = None,
+    demo: bool = False,
 ) -> SectionOutput:
     """Steps 3-8 of :func:`run_pipeline` for one section (``None`` = the whole perimeter); see :class:`SectionOutput`.
 
@@ -830,6 +895,9 @@ def _run_section(
     value report written by the caller, named in the export step of the first
     section only; ``first`` marks the first pass, the only one that prints the
     perimeter-wide list of historical teams excluded from the rankings.
+    ``calendar`` (the current-season fixtures) and ``now`` build the section's
+    matchdays from the official rounds. ``demo`` marks every CSV written as
+    simulated (first column ``AVVISO``, see :func:`run_pipeline`).
     """
     gironi = configured_gironi(section)
     suffix = "" if section is None else f" · {section}"
@@ -862,17 +930,25 @@ def _run_section(
     for g, line in skip_lines:
         if in_section(g, section):
             say(line)
-    giornate = matchdays((p.fixture for p in preds), gironi=gironi if section is not None else None)
+    giornate = matchdays(calendar, gironi=gironi if section is not None else None, played=current, now=now)
     next_day = giornate[0] if giornate else None
     trap_frame = current if len(current) else matches
     matchday_frame = matchday_table(preds, params=params, matches=trap_frame, opportunities=opps, traps=section_traps, matchday=next_day)
     if next_day is None:
         say("nessuna partita in programma nel dataset." if not any(in_section(g, section) for g, _ in skip_lines) else "nessuna partita in programma prevedibile.")
     else:
-        others = len(preds) - len(matchday_frame)
+        status = matchday_frame["Stato"].astype(str)
+        n_played = int(status.str.startswith("giocata").sum())
+        n_to_play = int((status == STATUS_TO_PLAY).sum())
+        n_in_play = int((status == IN_PLAY_TEXT).sum())
+        n_postponed = len(matchday_frame) - n_played - n_to_play - n_in_play
+        others = sum(1 for p in preds if not next_day.contains(p))
         say(
-            f"{next_day.label} · {len(matchday_frame)} partite"
-            + (f" · altre {others} partite nelle {len(giornate) - 1} giornate successive (solo nel CSV delle previsioni)" if others else "")
+            f"{next_day.label} · {len(matchday_frame)} partite ({n_played} giocate, {n_to_play} da giocare"
+            + (f", {n_in_play} in corso o in attesa del risultato" if n_in_play else "")
+            + (f", {n_postponed} rinviate" if n_postponed else "")
+            + ")"
+            + (f" · altre {others} partite fuori dalla giornata corrente (solo nel CSV delle previsioni)" if others else "")
         )
         say(format_matchday_console(matchday_frame))
         say(MATCHDAY_CONSOLE_LEGEND)
@@ -885,8 +961,12 @@ def _run_section(
     # 5-6. value + traps -------------------------------------------------------
     if verbose:
         _banner(f"5) QUOTE BOOKMAKER DE-VIGGATE, EV E KELLY FRAZIONARIO{suffix}")
-    value = value_engine.value_bets(opps)
-    say(f"quote valutate: {len(opps)}   soglia EV: {value_engine.min_ev:+.1%}   Kelly frazionario: x{value_engine.kelly.fraction}   bankroll: {value_engine.kelly.bankroll_units:.0f} unità")
+    started = {p.fixture.match_id for p in preds if kicked_off(p.fixture, now)}
+    pre_match = [o for o in opps if o.match_id not in started]
+    value = value_engine.value_bets(pre_match)
+    say(f"quote valutate: {len(pre_match)}   soglia EV: {value_engine.min_ev:+.1%}   Kelly frazionario: x{value_engine.kelly.fraction}   bankroll: {value_engine.kelly.bankroll_units:.0f} unità")
+    if len(pre_match) < len(opps):
+        say(f"{len(opps) - len(pre_match)} quote di partite già iniziate (o rinviate) escluse: nessuna giocata pre-partita su una partita in corso.")
     if value:
         vf = value_engine.to_frame(value)
         show = vf[["home_team", "away_team", "market", "selection", "bookmaker", "book_odds", "fair_odds", "p_model", "p_implied_devig", "ev", "stake_units", "flags"]].copy()
@@ -900,7 +980,7 @@ def _run_section(
         say("nessuna quota bookmaker per le partite di Serie D (su FootyStats la copertura delle quote di Serie D è parziale): salto il calcolo EV.")
     else:
         say("nessuna quota bookmaker fornita: salto il calcolo EV.")
-    summary = value_engine.summary(opps)
+    summary = value_engine.summary(pre_match)
     say(f"\nriepilogo: {summary}")
 
     if verbose:
@@ -948,15 +1028,15 @@ def _run_section(
             say(f"report CSV scritto in: {value_report}")
         picks_path = picks_export_path(Path(export))
         picks_path.parent.mkdir(parents=True, exist_ok=True)
-        picks_path.write_bytes(picks_csv_bytes(draws_frame, btts_frame, next_day))
+        picks_path.write_bytes(picks_csv_bytes(draws_frame, btts_frame, next_day, demo=demo))
         log.info("matchday picks exported", extra={"section": section, "path": str(picks_path), "rows": len(draws_frame) + len(btts_frame)})
         say(f"selezioni di giornata scritte in: {picks_path}")
         matchday_path = matchday_export_path(Path(export))
-        matchday_path.write_bytes(export_csv_bytes(matchday_frame))
+        matchday_path.write_bytes(export_csv_bytes(matchday_frame, demo=demo))
         log.info("matchday table exported", extra={"section": section, "path": str(matchday_path), "rows": len(matchday_frame)})
         say(f"tabella giornata scritta in: {matchday_path}")
         results_path = results_export_path(Path(export))
-        results_path.write_bytes(export_csv_bytes(results_frame))
+        results_path.write_bytes(export_csv_bytes(results_frame, demo=demo))
         log.info("results table exported", extra={"section": section, "path": str(results_path), "rows": len(results_frame)})
         say(f"risultati giocati scritti in: {results_path}")
 
@@ -1029,7 +1109,8 @@ def build_parser() -> argparse.ArgumentParser:
         type=_iso_date,
         default=None,
         metavar="AAAA-MM-GG",
-        help="simulated full mode: calendar position (default today): rounds dated before it are played, the first round on/after it is predicted",
+        help="simulated full mode: calendar position (default today): rounds dated before it are played, the first round on/after it is predicted; "
+        "real data: the current rounds are those of that day (midnight Europe/Rome, default now)",
     )
     p.add_argument(
         "--rounds",
@@ -1049,6 +1130,12 @@ def build_parser() -> argparse.ArgumentParser:
         choices=[0, 1, 2],
         default=2,
         help="simulated modes: number of synthetic seasons before the registry season (2024/25, 2025/26 for 2026/27) prepended to the current one (default 2)",
+    )
+    p.add_argument(
+        "--footystats",
+        action="store_true",
+        help="download the real data from FootyStats first (key FOOTYSTATS_API_KEY in the environment or .env; saved only "
+        "locally in data/processed and data/odds), then run on it instead of a simulated league",
     )
     p.add_argument("--processed", type=Path, help="harvested matches CSV, possibly several seasons (overrides simulation)")
     p.add_argument("--fixtures", type=Path, help="fixtures CSV (with --processed)")
@@ -1103,9 +1190,54 @@ def _pick_trap_team(league: SimulatedLeague) -> str | None:
     return None
 
 
+def refresh_footystats(*, processed_dir: Path | None = None, odds_dir: Path | None = None) -> tuple[Path, Path, Path]:
+    """``--footystats``: download the real data with the user's key, print the outcome; returns ``(matches, fixtures, odds dir)``.
+
+    ``processed_dir`` / ``odds_dir`` default to ``data/processed`` / ``data/odds``
+    (the module's :data:`PROCESSED_DIR` / :data:`ODDS_DIR`, read at call time).
+
+    A competition that could not be downloaded is printed as a warning (the
+    others are saved, its previous data is kept). When nothing could be
+    downloaded and no earlier data exists the run stops with exit code 2 and
+    the instructions to configure the key: the console never falls back to a
+    simulated league silently. The key is never printed.
+    """
+    from src.dashboard import data_refresh
+
+    processed_dir = PROCESSED_DIR if processed_dir is None else Path(processed_dir)
+    odds_dir = ODDS_DIR if odds_dir is None else Path(odds_dir)
+
+    def progress(fraction: float, message: str) -> None:
+        print(f"  [{fraction:4.0%}] {message}", flush=True)
+
+    print("Aggiornamento dati FootyStats (chiave da FOOTYSTATS_API_KEY o .env; i dati restano solo in locale)...")
+    result = data_refresh.refresh(processed_dir, odds_dir, progress=progress)
+    print(result.summary_text())
+    for line in result.warnings():
+        print(f"ATTENZIONE: {line}")
+    for line in result.registry_sync:
+        print(f"Dizionario squadre: {line}")
+    matches = Path(processed_dir) / "matches.csv"
+    if not matches.is_file():
+        print(
+            "Nessun dato reale disponibile: configura la chiave (copia .env.example in .env e scrivi FOOTYSTATS_API_KEY=...) "
+            "e scegli le leghe sull'account footystats.org, poi riprova con --footystats.",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
+    if not result.written:
+        print(f"Uso i dati FootyStats già scaricati in {processed_dir} ({data_refresh.refresh_label(processed_dir) or 'data sconosciuta'}).")
+    return matches, Path(processed_dir) / "fixtures.csv", Path(odds_dir)
+
+
 def main(argv: Sequence[str] | None = None) -> PipelineOutput:
     args = build_parser().parse_args(argv)
     configure_logging(args.log_level, json_output=args.log_json, force=True)
+    if args.footystats and args.processed:
+        build_parser().error("--footystats scarica i dati in data/processed: non va usato insieme a --processed")
+    demo = not args.footystats and not args.processed
+    if demo:
+        print(DEMO_WARNING)
     try:
         registry = load_registry(args.season)
     except FileNotFoundError:
@@ -1116,7 +1248,7 @@ def main(argv: Sequence[str] | None = None) -> PipelineOutput:
     for option, value in (("--n-draws", args.n_draws), ("--n-btts", args.n_btts)):
         if value < 1:
             build_parser().error(f"{option} {value}: serve almeno 1 partita")
-    if args.serie_d_demo and (args.processed or args.mode != "full"):
+    if args.serie_d_demo and (args.processed or args.footystats or args.mode != "full"):
         build_parser().error("--serie-d-demo vale solo per la lega simulata di --mode full (senza --processed)")
     if args.serie_d_demo and not serie_d_gironi():
         build_parser().error("--serie-d-demo: nessuna competizione con family 'Serie D' in config/competitions.toml")
@@ -1126,12 +1258,17 @@ def main(argv: Sequence[str] | None = None) -> PipelineOutput:
     history_matches = empty_matches_frame()
     input_notes: list[str] = []
     sim_notes: list[str] = []
+    now: datetime | None = None
+    if args.footystats:
+        processed, fixtures_path, odds_path = refresh_footystats()
+        args.processed, args.fixtures, args.odds = processed, args.fixtures or fixtures_path, args.odds or odds_path
     if args.processed:
         if not Path(args.processed).is_file():
             build_parser().error(f"--processed {args.processed}: file non trovato")
         matches, fixtures, quotes = load_real_data(args.processed, args.fixtures, args.odds, notes=input_notes)
         xi = 0.0018 if args.xi is None else args.xi
-        source = f"dati reali: {args.processed}"
+        source = f"dati reali{' FootyStats' if args.footystats else ''}: {args.processed}"
+        now = rome_midnight(args.as_of) if args.as_of is not None else datetime.now(UTC)
     else:
         if args.mode == "mini":
             league = simulate_mini_dataset(seed=args.seed, season=registry.season_label)
@@ -1221,6 +1358,8 @@ def main(argv: Sequence[str] | None = None) -> PipelineOutput:
         n_draws=args.n_draws,
         n_btts=args.n_btts,
         sections=runnable,
+        now=now,
+        demo=demo,
     )
     out.notes = input_notes + sim_notes + out.notes
     for sec in unavailable:
@@ -1244,6 +1383,8 @@ def main(argv: Sequence[str] | None = None) -> PipelineOutput:
         _banner(f"VERIFICA: RECUPERO DEI PARAMETRI VERI DEL SIMULATORE (squadre {season_label})")
         out.recovery = recovery_report(league, out.params)
         print(out.recovery.to_string(index=False))
+    if demo:
+        print(DEMO_WARNING)
     return out
 
 

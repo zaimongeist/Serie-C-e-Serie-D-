@@ -1,9 +1,22 @@
 """Synthetic Serie C data with *known* Dixon-Coles parameters.
 
 Used by the test-suite (parameter-recovery tests), by ``main.py`` (console demo
-on a 20-match mini dataset) and by the dashboard as an offline fallback. The
+on a 20-match mini dataset) and by the dashboard's explicit demo mode
+(``SERIEC_DEMO=1``) -- never as a silent fallback for missing real data. The
 sampler implements the Dixon-Coles bivariate pmf independently from the engine
 so the engine can be validated against it.
+
+Demo data
+---------
+Everything this module produces is **invented**: the results, the dates and
+the pairings of the simulated rounds, the xG and the odds of the synthetic
+bookmaker ``SimBook`` (the team names are real, nothing else is). Match ids
+start with :data:`SIMULATED_ID_PREFIX` (``'SIM-...'``; the synthetic past seasons
+with :data:`HISTORY_ID_PREFIX`, ``'HIST2526-...'``) and every consumer that
+shows simulated data prints :data:`DEMO_WARNING` (the dashboard as a red
+banner on every page, ``main.py`` as the first and last line of the simulated
+modes); :attr:`SimulatedLeague.is_demo` / :attr:`SimulatedLeague.demo_warning`
+carry the same mark on the objects.
 
 Seasons
 -------
@@ -33,9 +46,10 @@ exercised offline. One :class:`TrueParams` drives every season, with a home
 advantage per competition (:data:`DEFAULT_HOME_ADVANTAGE`); the strengths of
 the historical clubs are drawn from the same distribution as the current ones.
 
-Only the competitions that **have teams** in the registry are simulated: the
-Serie D gironi ship empty (their composition is initialised from FootyStats),
-so the default fallback league stays Serie C + Serie B until then.
+Only the competitions that **have teams** in the registry are simulated: a
+dictionary whose Serie D gironi are still empty yields a Serie C + Serie B
+league, the full 2026/27 dictionary (synchronised with FootyStats) the whole
+perimeter.
 :func:`simulate_serie_d_registry` builds a synthetic nine-girone Serie D
 registry (``'Squadra DA 01'`` ...) for tests and demos of the Serie D section.
 """
@@ -62,18 +76,21 @@ from src.common.schemas import (
     season_bounds,
     season_of,
 )
-from src.common.teams import DEFAULT_SEASON, TeamRegistry, load_registry
+from src.common.teams import DEFAULT_SEASON, TeamRegistry, load_registry, normalize_name
 
 __all__ = [
     "DEFAULT_HOME_ADVANTAGE",
+    "DEMO_WARNING",
     "FALLBACK_HOME_ADVANTAGE",
     "HISTORICAL_ABSENCES",
     "HISTORICAL_MOVES",
     "HISTORICAL_TEAMS",
+    "HISTORY_ID_PREFIX",
     "HISTORY_SEASONS",
     "MINI_TEAMS",
     "SEASON_2026_27_START",
     "SERIE_D_TEAM_PREFIX",
+    "SIMULATED_ID_PREFIX",
     "SYNTHETIC_HISTORICAL_PREFIX",
     "SimulatedLeague",
     "TrueParams",
@@ -81,6 +98,7 @@ __all__ = [
     "dixon_coles_matrix",
     "history_seasons_for",
     "inject_regression_trap",
+    "is_simulated_match_id",
     "market_probabilities",
     "previous_seasons",
     "round_robin",
@@ -96,6 +114,18 @@ __all__ = [
 log = get_logger(__name__)
 
 MAX_GOALS = 10
+
+#: The warning every consumer prints next to simulated data (dashboard banner, console first and last line).
+DEMO_WARNING: Final[str] = "DATI SIMULATI: squadre, calendari e risultati inventati. Non usare per scommettere."
+#: Prefix of the ``match_id`` of every simulated current-season match and fixture (``'SIM-A-12-0451'``).
+SIMULATED_ID_PREFIX: Final[str] = "SIM"
+#: Prefix of the ``match_id`` of the synthetic past seasons of :func:`simulate_history` (``'HIST2526-A-03-0101'``).
+HISTORY_ID_PREFIX: Final[str] = "HIST"
+
+
+def is_simulated_match_id(match_id: str) -> bool:
+    """Whether ``match_id`` was produced by this simulator (:data:`SIMULATED_ID_PREFIX` or :data:`HISTORY_ID_PREFIX`)."""
+    return str(match_id).startswith((SIMULATED_ID_PREFIX, HISTORY_ID_PREFIX))
 
 #: Kick-off of the real Serie C 2026/27 season (a Sunday); the simulated calendar plays one round a week.
 SEASON_2026_27_START: Final[date] = date(2026, 8, 23)
@@ -412,6 +442,16 @@ class SimulatedLeague:
         return int(len(self.matches))
 
     @property
+    def is_demo(self) -> bool:
+        """Always ``True``: a simulated league is demo data (invented results, dates and odds), never real data."""
+        return True
+
+    @property
+    def demo_warning(self) -> str:
+        """:data:`DEMO_WARNING`, the text to print next to this league wherever it is shown."""
+        return DEMO_WARNING
+
+    @property
     def teams(self) -> tuple[str, ...]:
         """Every team that appears in ``matches`` (current and historical), sorted."""
         if self.matches.empty:
@@ -437,6 +477,29 @@ def _played_rounds_as_of(as_of: date, start_date: date, days_between_rounds: int
     return min(total_rounds, int(math.ceil(elapsed / days_between_rounds)))
 
 
+#: Families simulated when no registry is passed: the original Serie C + Serie B perimeter.
+#: The shipped dictionary also lists the 162 Serie D clubs; a 242-club default would make every
+#: demo and test fit ten times larger without exercising anything new (Serie D tests pass an
+#: explicit registry, e.g. :func:`simulate_serie_d_registry`).
+DEFAULT_SIMULATION_FAMILIES: tuple[str, ...] = ("Serie C", "Serie B")
+
+
+def default_simulation_registry(
+    season: str = DEFAULT_SEASON, families: Sequence[str] = DEFAULT_SIMULATION_FAMILIES
+) -> TeamRegistry:
+    """The shipped registry of ``season`` restricted to ``families`` (default: Serie C + Serie B).
+
+    Used by :func:`simulate_league` and :func:`simulate_history` when no
+    registry is given. Aliases are not needed by the simulator and are dropped.
+    """
+    full = load_registry(season)
+    wanted = {f.casefold() for f in families}
+    teams = {g.value: full.teams(g) for g in full.gironi if g.family.casefold() in wanted}
+    if not teams:
+        raise ValueError(f"no teams of {list(families)} in the {season} registry")
+    return TeamRegistry.from_teams(full.season_label, teams)
+
+
 def simulate_league(
     *,
     seed: int = 7,
@@ -450,7 +513,7 @@ def simulate_league(
     bookmaker_margin: float = 0.06,
     bookmaker_noise: float = 0.04,
     as_of: date | None = None,
-    match_id_prefix: str = "SIM",
+    match_id_prefix: str = SIMULATED_ID_PREFIX,
 ) -> SimulatedLeague:
     """Generate a full (or truncated) season with known parameters.
 
@@ -480,7 +543,7 @@ def simulate_league(
         registry = (
             TeamRegistry.from_teams("sim", teams_by_girone)
             if teams_by_girone is not None
-            else load_registry()
+            else default_simulation_registry()
         )
     params = true_params or sample_true_params(registry, rng)
     if start_date is None:
@@ -627,11 +690,20 @@ def _historical_pool(registry: TeamRegistry, rng: np.random.Generator) -> list[s
     :data:`HISTORICAL_TEAMS` minus the registry's current teams (one permutation
     drawn from ``rng``), followed by the registry's ``historical_names`` that are
     not already in the pool (a second permutation, drawn only when there are
-    any, so the draws of a registry without history are unchanged).
+    any, so the draws of a registry without history are unchanged). A name is
+    "current" also when its normalised spelling is one of a current club's
+    (:func:`~src.common.teams.normalize_name`: ``'Trapani'`` is the Serie D
+    club ``'Trapani 1905'``), since a season registry rejects two clubs sharing
+    a spelling.
     """
     current = set(registry.canonical_names)
-    pool = [str(t) for t in rng.permutation(np.array(HISTORICAL_TEAMS, dtype=object)) if t not in current]
-    extra = [str(t) for t in registry.historical_names if t not in current and t not in pool]
+    taken = {normalize_name(n) for n in current} | set(registry.alias_table())
+
+    def free(name: str) -> bool:
+        return name not in current and normalize_name(name) not in taken
+
+    pool = [str(t) for t in rng.permutation(np.array(HISTORICAL_TEAMS, dtype=object)) if free(str(t))]
+    extra = [str(t) for t in registry.historical_names if free(str(t)) and t not in pool]
     if extra:
         pool.extend(str(t) for t in rng.permutation(np.array(extra, dtype=object)))
     return pool
@@ -677,7 +749,7 @@ def simulate_history(
     deterministic.
     """
     rng = np.random.default_rng(seed)
-    reg = registry if registry is not None else load_registry()
+    reg = registry if registry is not None else default_simulation_registry()
     base = true_params or sample_true_params(reg, rng, sigma_alpha=sigma_alpha, sigma_beta=sigma_beta)
     alpha_hist = {t: float(v) for t, v in zip(HISTORICAL_TEAMS, rng.normal(0.0, sigma_alpha, len(HISTORICAL_TEAMS)))}
     beta_hist = {t: float(v) for t, v in zip(HISTORICAL_TEAMS, rng.normal(0.0, sigma_beta, len(HISTORICAL_TEAMS)))}
@@ -706,7 +778,7 @@ def simulate_history(
             start_date=season_start_date(label),
             true_params=params,
             with_odds=False,
-            match_id_prefix=f"HIST{first_year % 100:02d}{(first_year + 1) % 100:02d}",
+            match_id_prefix=f"{HISTORY_ID_PREFIX}{first_year % 100:02d}{(first_year + 1) % 100:02d}",
         )
         frames.append(league.matches)
         season_registries[label] = season_registry

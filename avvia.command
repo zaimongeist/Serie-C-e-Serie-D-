@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Avvio con un doppio clic (macOS / Linux): prepara Python, aggiorna i dati, apre la dashboard.
+# Avvio con un doppio clic (macOS / Linux): prepara Python, scarica i dati FootyStats con la tua chiave, apre la dashboard.
 # Prerequisito: Python 3.12 o superiore installato (https://www.python.org/downloads/).
 set -u
 cd "$(dirname "$0")"
@@ -24,9 +24,11 @@ source .venv/bin/activate
 python -m pip install --quiet --disable-pip-version-check -r requirements.txt || {
   echo "ERRORE nell'installazione delle dipendenze (serve la connessione internet)."; read -r -p "Premi Invio per chiudere." _; exit 1; }
 
-# Sorgente dati: FootyStats (API ufficiale, con quote pre-match) se la chiave è disponibile nella
-# variabile d'ambiente FOOTYSTATS_API_KEY o nel file .env accanto a questo script (vedi .env.example),
-# altrimenti SofaScore (solo da connessione residenziale). La chiave non viene mai stampata.
+# Sorgente dati: FootyStats (API ufficiale), l'unica fonte dei dati reali: squadre, calendari con orari e
+# partite rinviate, risultati e quote pre-match. La chiave si legge dalla variabile d'ambiente
+# FOOTYSTATS_API_KEY o dal file .env accanto a questo script (vedi .env.example) e non viene mai stampata.
+# I dati restano SOLO su questo computer (data/ è escluso da git): il repository è pubblico e i dati
+# FootyStats sono concessi in licenza al titolare della chiave, quindi non vengono mai pubblicati.
 # Il controllo è delegato allo stesso parser Python della CLI (variabile d'ambiente o .env, anche con BOM,
 # CRLF, "export", spazi iniziali, virgolette e commenti), così lanciatore e CLI non possono essere in disaccordo.
 has_footystats_key() {
@@ -36,7 +38,7 @@ has_footystats_key() {
 if [ "${1:-}" != "--solo-dashboard" ]; then
   if ! has_footystats_key && [ ! -f .env ]; then
     echo ">> Nessuna chiave FootyStats trovata."
-    echo "   Incolla qui la chiave API di FootyStats e premi Invio (oppure premi solo Invio per usare SofaScore)."
+    echo "   Incolla qui la chiave API di FootyStats e premi Invio (footystats.org -> il tuo account -> API)."
     read -r -p "   Chiave: " FS_KEY
     FS_KEY="$(printf '%s' "$FS_KEY" | tr -d ' \t\r\n"' | tr -d "'")"
     if [ -n "$FS_KEY" ]; then
@@ -46,23 +48,22 @@ if [ "${1:-}" != "--solo-dashboard" ]; then
     unset FS_KEY
   fi
   if has_footystats_key; then
-    echo ">> Aggiorno i dati reali da FootyStats (Serie C Gironi A/B/C + Serie B + Serie D Gironi A-I, ultime 3 stagioni, quote pre-match)..."
-    echo "   Serie D: alla prima esecuzione le liste squadre dei 9 gironi vengono create in config/teams_2026_27.json dall'API."
+    echo ">> Scarico i dati reali da FootyStats (Serie C Gironi A/B/C + Serie B + Serie D Gironi A-I, ultime 3 stagioni,"
+    echo "   orari, partite rinviate e quote pre-match) e allineo il dizionario squadre a FootyStats..."
     echo "   Le competizioni la cui lega non è fra quelle scelte nel tuo account FootyStats vengono saltate (le altre sono aggiornate comunque)."
-    # Nessun --competitions = tutte le competizioni di config/competitions.toml (13).
-    HARVEST="python -m src.ingestion.footystats --seasons 3 --odds-out data/odds/footystats.csv"
-  else
-    echo ">> Nessuna chiave FootyStats (FOOTYSTATS_API_KEY o file .env, vedi .env.example): uso SofaScore."
-    echo ">> Aggiorno i dati reali (ultime 3 stagioni, Gironi A/B/C). La prima volta serve qualche decina di minuti..."
-    HARVEST="python -m src.ingestion.harvester --gironi A B C --seasons 3"
-  fi
-  if ! $HARVEST; then
-    echo "ATTENZIONE: raccolta dati non riuscita (vedi messaggi sopra)."
-    if [ -s data/processed/matches.csv ]; then
-      echo "Uso i dati reali raccolti in precedenza."
-    else
-      echo "Nessun dato reale disponibile: la dashboard mostrerà la lega simulata."
+    # Nessun --competitions = tutte le competizioni di config/competitions.toml (13); la sincronizzazione del
+    # dizionario config/teams_2026_27.json con /league-teams è inclusa (squadre aggiunte, spostate o rimosse).
+    if ! python -m src.ingestion.footystats --seasons 3; then
+      echo "ATTENZIONE: raccolta dati non riuscita (vedi messaggi sopra)."
+      if [ -s data/processed/matches.csv ]; then
+        echo "La dashboard usa i dati reali scaricati in precedenza (controlla la data dell'ultimo aggiornamento)."
+      else
+        echo "Nessun dato reale disponibile: la dashboard non mostra partite finché la raccolta FootyStats non riesce."
+      fi
     fi
+  else
+    echo ">> Nessuna chiave FootyStats (FOOTYSTATS_API_KEY o file .env, vedi .env.example): nessun dato reale da scaricare."
+    echo "   La dashboard si apre ma non mostra partite inventate: inserisci la chiave e riavvia."
   fi
 fi
 

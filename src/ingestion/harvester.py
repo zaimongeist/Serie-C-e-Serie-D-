@@ -66,8 +66,9 @@ import httpx
 import pandas as pd
 
 from src.common.logging_config import configure_logging, get_logger
-from src.common.paths import CONFIG_DIR, ODDS_DIR, PROCESSED_DIR, RAW_DIR
+from src.common.paths import CONFIG_DIR, DATA_DIR, ODDS_DIR, PROCESSED_DIR, RAW_DIR
 from src.common.schemas import (
+    FIXTURE_STATUSES,
     MATCH_COLUMNS,
     Fixture,
     Girone,
@@ -84,11 +85,13 @@ from src.ingestion.team_matcher import TeamMatcher
 __all__ = [
     "DEFAULT_USER_AGENTS",
     "FIXTURE_COLUMNS",
+    "REQUIRED_FIXTURE_COLUMNS",
     "FOTMOB_STAT_KEYS",
     "ODDS_COLUMNS",
     "PROVIDER_NAMES",
     "STAT_FIELDS",
     "AsyncHarvesterClient",
+    "CachedPayload",
     "ClientStats",
     "EndpointsConfig",
     "FootyStatsEndpoints",
@@ -168,8 +171,14 @@ FOTMOB_STAT_KEYS: Final[dict[str, tuple[str, ...]]] = {
     "xg": ("expected_goals", "Expected goals (xG)", "Expected goals"),
 }
 
-#: Columns of the fixtures CSV written by :meth:`Harvester.save_fixtures`.
-FIXTURE_COLUMNS: Final[tuple[str, ...]] = ("match_id", "date", "round", "girone", "home_team", "away_team")
+#: Columns every fixtures CSV must have (the six-column layout of the files written before
+#: the kick-off time and the status were recorded; :meth:`Harvester.load_fixtures` still reads them).
+REQUIRED_FIXTURE_COLUMNS: Final[tuple[str, ...]] = ("match_id", "date", "round", "girone", "home_team", "away_team")
+
+#: Columns of the fixtures CSV written by :meth:`Harvester.save_fixtures`: the required six plus
+#: ``kickoff`` (ISO 8601 UTC, ``2026-11-07T14:30:00Z``; empty when the source gave no time) and
+#: ``status`` (``scheduled`` | ``postponed``, see :class:`~src.common.schemas.Fixture`).
+FIXTURE_COLUMNS: Final[tuple[str, ...]] = (*REQUIRED_FIXTURE_COLUMNS, "kickoff", "status")
 
 #: Columns of the odds CSV written by :func:`save_odds` (one row per quoted selection),
 #: the format ``main.load_odds_dir`` and the dashboard read from ``data/odds/*.csv``.
@@ -340,8 +349,12 @@ class FootyStatsEndpoints:
     to the ``name`` field of ``/league-list`` and is the fallback when the shared
     competitions module is not available; ``season_ids`` (code -> season label ->
     FootyStats ``season_id``) is used only when ``/league-list`` cannot be reached.
-    The defaults are the public API as documented in November 2026, so a
-    configuration file without the section still works.
+    ``live_matches_cache_minutes`` caps the age of a cached ``/league-matches``
+    payload of a season still being played (default 10 minutes, whatever the
+    ``[http] cache_ttl_hours``): on match days results arrive every few hours, so
+    a refresh must not serve a payload downloaded before the matches it should
+    show as played. The defaults are the public API as documented in November
+    2026, so a configuration file without the section still works.
     """
 
     base_url: str = "https://api.football-data-api.com"
@@ -352,10 +365,18 @@ class FootyStatsEndpoints:
     max_requests_per_hour: int = 1800
     league_names: Mapping[str, str] = field(default_factory=dict)
     season_ids: Mapping[str, Mapping[str, int]] = field(default_factory=dict)
+    live_matches_cache_minutes: float = 10.0
 
     def __post_init__(self) -> None:
         if int(self.max_requests_per_hour) < 1:
             raise ValueError("max_requests_per_hour must be >= 1")
+        if float(self.live_matches_cache_minutes) < 0:
+            raise ValueError("live_matches_cache_minutes must be >= 0")
+
+    @property
+    def live_matches_cache_ttl(self) -> timedelta:
+        """Longest age of a cached ``/league-matches`` payload of a season still being played (results change on match days)."""
+        return timedelta(minutes=float(self.live_matches_cache_minutes))
 
     def url_league_list(self) -> str:
         return _join_url(self.base_url, self.league_list)
@@ -496,12 +517,21 @@ def _parse_footystats_section(raw: Any, path: Path) -> FootyStatsEndpoints:
         max_requests_per_hour=int(raw.get("max_requests_per_hour", defaults.max_requests_per_hour)),
         league_names={str(code).upper(): str(name).strip() for code, name in names_raw.items()},
         season_ids=season_ids,
+        live_matches_cache_minutes=float(raw.get("live_matches_cache_minutes", defaults.live_matches_cache_minutes)),
     )
 
 
 # =============================================================================
 # Raw cache
 # =============================================================================
+@dataclass(frozen=True, slots=True)
+class CachedPayload:
+    """A payload read from :class:`RawCache` and the instant it was downloaded (aware UTC)."""
+
+    payload: Any
+    fetched_at: datetime
+
+
 class RawCache:
     """JSON file cache of raw responses.
 
@@ -556,20 +586,35 @@ class RawCache:
         """Time-to-live that applies to a read: ``stable_ttl`` for stable payloads, else ``ttl``."""
         return self.stable_ttl if stable else self.ttl
 
-    def _is_expired(self, fetched_at: str, *, stable: bool = False) -> bool:
-        ttl = self.ttl_for(stable=stable)
-        if ttl is None:
-            return False
+    @staticmethod
+    def _stamp(fetched_at: Any) -> datetime:
+        """The ``fetched_at`` of a record as an aware UTC ``datetime`` (a naive stamp is read as UTC)."""
         stamp = datetime.fromisoformat(str(fetched_at))
         if stamp.tzinfo is None:
             stamp = stamp.replace(tzinfo=timezone.utc)
-        return datetime.now(timezone.utc) >= stamp + ttl
+        return stamp.astimezone(timezone.utc)
 
-    def get(self, url: str, params: Mapping[str, Any] | None = None, *, stable: bool = False) -> Any | None:
-        """Cached payload or ``None`` on miss, expiry or unreadable file.
+    def _is_expired(self, fetched_at: str, *, stable: bool = False, max_age: timedelta | None = None) -> bool:
+        ttl = self.ttl_for(stable=stable)
+        if max_age is not None:
+            ttl = max_age if ttl is None else min(ttl, max_age)
+        if ttl is None:
+            return False
+        return datetime.now(timezone.utc) >= self._stamp(fetched_at) + ttl
+
+    def get_entry(
+        self, url: str, params: Mapping[str, Any] | None = None, *, stable: bool = False, max_age: timedelta | None = None
+    ) -> CachedPayload | None:
+        """Cached payload **with its fetch time**, or ``None`` on miss, expiry or unreadable file.
 
         ``stable`` says the payload cannot change upstream any more (a completed
         season): the entry then expires after ``stable_ttl`` instead of ``ttl``.
+        ``max_age`` caps the age of the entry for this read only (the shorter of
+        it and the TTL applies), for payloads that must be fresher than the
+        cache's default (the current season's fixture list on match days). The
+        fetch time lets the caller judge the payload *as of when it was
+        downloaded* (a match still ``incomplete`` in a five-hour-old payload was
+        not postponed: it simply had not been played yet).
         """
         path = self.path_for(url, params)
         if not path.exists():
@@ -579,7 +624,17 @@ class RawCache:
             record = json.loads(path.read_text(encoding="utf-8"))
             if not isinstance(record, dict) or "payload" not in record:
                 raise ValueError("cache record without payload")
-            expired = self._is_expired(record.get("fetched_at", ""), stable=stable)
+            ttl = self.ttl_for(stable=stable)
+            if ttl is None and max_age is None:
+                # never expires: an entry without a readable stamp is still served, dated by its file
+                try:
+                    fetched_at = self._stamp(record.get("fetched_at", ""))
+                except (ValueError, TypeError):
+                    fetched_at = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
+                expired = False
+            else:
+                fetched_at = self._stamp(record.get("fetched_at", ""))
+                expired = self._is_expired(record.get("fetched_at", ""), stable=stable, max_age=max_age)
         except (OSError, ValueError, TypeError) as exc:
             log.warning("corrupt cache file treated as miss", extra={"path": str(path), "error": str(exc)})
             self.misses += 1
@@ -589,7 +644,14 @@ class RawCache:
             self.misses += 1
             return None
         self.hits += 1
-        return record["payload"]
+        return CachedPayload(payload=record["payload"], fetched_at=fetched_at)
+
+    def get(
+        self, url: str, params: Mapping[str, Any] | None = None, *, stable: bool = False, max_age: timedelta | None = None
+    ) -> Any | None:
+        """Cached payload or ``None`` on miss, expiry or unreadable file (see :meth:`get_entry`)."""
+        entry = self.get_entry(url, params, stable=stable, max_age=max_age)
+        return None if entry is None else entry.payload
 
     def put(self, url: str, payload: Any, params: Mapping[str, Any] | None = None) -> Path:
         """Atomically store ``payload`` for ``url``; returns the file path."""
@@ -829,30 +891,56 @@ class AsyncHarvesterClient:
 
     # ----------------------------------------------------------------- core
     async def get_json(
-        self, path: str, params: Mapping[str, Any] | None = None, *, use_cache: bool = True, stable: bool = False
+        self,
+        path: str,
+        params: Mapping[str, Any] | None = None,
+        *,
+        use_cache: bool = True,
+        stable: bool = False,
+        max_age: timedelta | None = None,
     ) -> Any:
         """GET ``path`` and return the decoded JSON body.
 
         Cache hits return immediately; ``stable`` marks a payload that cannot
         change upstream any more (a completed season), so the cache applies its
-        long ``stable_ttl`` to it (see :class:`RawCache`). Retryable failures (HTTP 429, 5xx,
+        long ``stable_ttl`` to it (see :class:`RawCache`); ``max_age`` caps the
+        age of a cached entry for this read. Retryable failures (HTTP 429, 5xx,
         transport errors, timeouts) are retried up to ``http.max_retries``
         times; other 4xx raise at once (:class:`NotFoundError` for 404), as do
         undecodable bodies and other non-transient ``httpx`` errors. Every
         failure surfaces as a :class:`HarvestError` subclass. (``Accept-Encoding``
         is left to ``httpx`` so only decodable encodings are advertised.)
         """
+        payload, _ = await self.get_json_entry(path, params, use_cache=use_cache, stable=stable, max_age=max_age)
+        return payload
+
+    async def get_json_entry(
+        self,
+        path: str,
+        params: Mapping[str, Any] | None = None,
+        *,
+        use_cache: bool = True,
+        stable: bool = False,
+        max_age: timedelta | None = None,
+    ) -> tuple[Any, datetime | None]:
+        """Like :meth:`get_json`, plus **when** the body was downloaded.
+
+        Returns ``(payload, fetched_at)``: ``fetched_at`` is the aware UTC
+        instant a cached payload was originally downloaded (:class:`RawCache`
+        stamps every entry) and ``None`` when the payload was fetched from the
+        network by this very call, i.e. it is as fresh as the caller's own clock.
+        """
         url = self.build_url(path)
         if use_cache and self.cache is not None:
             try:
-                cached = self.cache.get(url, params, stable=stable)
+                cached = self.cache.get_entry(url, params, stable=stable, max_age=max_age)
             except OSError as exc:  # unreadable cache directory: fetch instead
                 cached = None
                 log.warning("cache read failed, fetching", extra={"url": url, "error": str(exc)})
             if cached is not None:
                 self.stats.cache_hits += 1
-                log.debug("cache hit", extra={"url": url, "stable": stable})
-                return cached
+                log.debug("cache hit", extra={"url": url, "stable": stable, "fetched_at": cached.fetched_at.isoformat()})
+                return cached.payload, cached.fetched_at
         client = self._ensure_client()
         async with self._semaphore:
             payload = await self._fetch_with_retry(client, url, params)
@@ -864,7 +952,7 @@ class AsyncHarvesterClient:
                 self.cache.put(url, payload, params)
             except OSError as exc:
                 log.warning("cache write failed, payload kept", extra={"url": url, "error": str(exc)})
-        return payload
+        return payload, None
 
     async def _fetch_with_retry(self, client: httpx.AsyncClient, url: str, params: Mapping[str, Any] | None) -> Any:
         max_attempts = self.http.max_retries + 1
@@ -1010,6 +1098,32 @@ def _utc_date_from_epoch(value: Any) -> date | None:
         return datetime.fromtimestamp(float(value), tz=timezone.utc).date()
     except (TypeError, ValueError, OverflowError, OSError):
         return None
+
+
+#: Sentinel of :func:`_parse_kickoff_cell` for a cell that is not a readable timestamp.
+_INVALID: Final[Any] = object()
+
+
+def _iso_utc(value: datetime | None) -> str:
+    """``2026-11-07T14:30:00Z`` for an aware or naive (read as UTC) datetime, ``''`` for ``None``."""
+    if value is None:
+        return ""
+    when = value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
+    return when.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _parse_kickoff_cell(value: Any) -> datetime | None | Any:
+    """A ``kickoff`` CSV cell as an aware UTC datetime, ``None`` when blank, :data:`_INVALID` when unreadable."""
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text or text.lower() in {"nan", "nat", "none", "<na>"}:
+        return None
+    try:
+        when = datetime.fromisoformat(text.replace("Z", "+00:00") if text.endswith("Z") else text)
+    except ValueError:
+        return _INVALID
+    return when.replace(tzinfo=timezone.utc) if when.tzinfo is None else when.astimezone(timezone.utc)
 
 
 def _utc_date_from_iso(value: Any) -> date | None:
@@ -1926,7 +2040,11 @@ class Harvester:
     otherwise. FootyStats harvests every requested competition in one pass;
     the facade then falls back to the next provider for the gironi it could not
     deliver. ``mapping_path`` is the persisted FootyStats team-id mapping
-    (``config/footystats_teams.json`` by default).
+    (``data/footystats_teams.json`` by default: local, git-ignored). The
+    FootyStats provider synchronises ``config_dir/teams_<season>.json`` with
+    ``/league-teams`` before parsing when ``registry`` was loaded from that file
+    (see :meth:`src.ingestion.footystats.FootyStatsProvider.harvest`), and the
+    facade then adopts the synchronised registry.
     """
 
     def __init__(
@@ -1957,7 +2075,7 @@ class Harvester:
         unknown = [p for p in names if p not in PROVIDER_NAMES]
         if unknown or not names:
             raise ValueError(f"providers must be a non-empty subset of {PROVIDER_NAMES}, got {providers!r}")
-        self.mapping_path = Path(mapping_path) if mapping_path is not None else Path(config_dir) / "footystats_teams.json"
+        self.mapping_path = Path(mapping_path) if mapping_path is not None else DATA_DIR / "footystats_teams.json"
         self.config_dir = Path(config_dir)
         if registry is not None:
             self.registry = registry
@@ -2118,14 +2236,14 @@ class Harvester:
             return None, exc, provider.client.client_stats()
         finally:
             await provider.client.close()
-        if result.initialised_competitions:
-            # the provider filled empty competitions of the dictionary (Serie D auto-init) and reloaded
-            # its registry: adopt it, so the facade classifies those teams as current, not unmapped
+        if result.registry_sync is not None:
+            # the provider synchronised the dictionary with FootyStats and reloaded its registry: adopt it, so the
+            # facade classifies the clubs FootyStats lists as current (and the removed ones as history)
             self.registry = provider.mapper.registry
             self.matcher = provider.mapper.matcher
             log.info(
-                "registry adopted after the FootyStats auto-init",
-                extra={"competitions": list(result.initialised_competitions), "n_teams": self.registry.n_teams},
+                "registry adopted after the FootyStats registry sync",
+                extra={"changed": result.registry_sync.changed, "n_teams": self.registry.n_teams, "competitions": list(result.registry_sync.competitions)},
             )
         return result, None, provider.client.client_stats()
 
@@ -2298,7 +2416,12 @@ class Harvester:
 
     @staticmethod
     def save_fixtures(fixtures: Iterable[Fixture], path: Path = PROCESSED_DIR / "fixtures.csv") -> Path:
-        """Write fixtures to CSV with :data:`FIXTURE_COLUMNS`; returns ``path``."""
+        """Write fixtures to CSV with :data:`FIXTURE_COLUMNS`; returns ``path``.
+
+        ``kickoff`` is written in ISO 8601 UTC with a ``Z`` suffix
+        (``2026-11-07T14:30:00Z``), empty for a fixture without a kick-off time;
+        ``status`` is ``scheduled`` or ``postponed``.
+        """
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         rows = [
@@ -2309,18 +2432,28 @@ class Harvester:
                 "girone": f.girone.value,
                 "home_team": f.home_team,
                 "away_team": f.away_team,
+                "kickoff": _iso_utc(f.kickoff),
+                "status": f.status,
             }
             for f in fixtures
         ]
         frame = pd.DataFrame(rows, columns=list(FIXTURE_COLUMNS))
         frame.to_csv(path, index=False)
-        log.info("fixtures saved", extra={"path": str(path), "rows": len(rows)})
+        log.info(
+            "fixtures saved",
+            extra={"path": str(path), "rows": len(rows), "postponed": sum(1 for r in rows if r["status"] == "postponed")},
+        )
         return path
 
     @staticmethod
     def load_fixtures(path: Path = PROCESSED_DIR / "fixtures.csv") -> list[Fixture]:
         """Read fixtures written by :meth:`save_fixtures`.
 
+        Files of the older six-column layout (no ``kickoff`` / ``status``) are
+        read as well: their fixtures have ``kickoff=None`` and status
+        ``scheduled``. A blank ``kickoff`` cell is ``None``, a blank ``status``
+        cell is ``scheduled``; an unparseable kick-off or an unknown status is
+        logged and read the same way, so one bad cell never hides a calendar.
         Rows are deduplicated by ``match_id`` (first occurrence wins, file order
         otherwise preserved), mirroring :meth:`harvest_all`. A hand-edited or
         concatenated CSV with a repeated line would otherwise surface as a
@@ -2332,27 +2465,45 @@ class Harvester:
             raw = pd.read_csv(path, dtype="string", keep_default_na=False)
         except pd.errors.EmptyDataError:
             return []
-        missing = [c for c in FIXTURE_COLUMNS if c not in raw.columns]
+        missing = [c for c in REQUIRED_FIXTURE_COLUMNS if c not in raw.columns]
         if missing:
             raise ValueError(f"fixtures file {path} is missing columns {missing}")
+        has_kickoff = "kickoff" in raw.columns
+        has_status = "status" in raw.columns
         out: list[Fixture] = []
         seen: set[str] = set()
         duplicates: dict[str, int] = {}
-        for row in raw.itertuples(index=False):
-            match_id = str(row.match_id)
+        bad_cells: dict[str, list[str]] = {}
+        for row in raw.to_dict(orient="records"):
+            match_id = str(row["match_id"])
             if match_id in seen:
                 duplicates[match_id] = duplicates.get(match_id, 0) + 1
                 continue
             seen.add(match_id)
+            kickoff = _parse_kickoff_cell(row.get("kickoff") if has_kickoff else None)
+            if kickoff is _INVALID:
+                bad_cells.setdefault("kickoff", []).append(match_id)
+                kickoff = None
+            status = str(row.get("status") or "").strip().lower() if has_status else ""
+            if status and status not in FIXTURE_STATUSES:
+                bad_cells.setdefault("status", []).append(match_id)
+                status = ""
             out.append(
                 Fixture(
                     match_id=match_id,
-                    date=date.fromisoformat(str(row.date)[:10]),
-                    round=_as_int(row.round, 0),
-                    girone=Girone.parse(str(row.girone)),
-                    home_team=str(row.home_team),
-                    away_team=str(row.away_team),
+                    date=date.fromisoformat(str(row["date"])[:10]),
+                    round=_as_int(row["round"], 0),
+                    girone=Girone.parse(str(row["girone"])),
+                    home_team=str(row["home_team"]),
+                    away_team=str(row["away_team"]),
+                    kickoff=kickoff,
+                    status=status or "scheduled",
                 )
+            )
+        if bad_cells:
+            log.warning(
+                "fixtures with an unreadable kickoff or status read as scheduled without a time",
+                extra={"path": str(path), "cells": {column: ids[:10] for column, ids in bad_cells.items()}},
             )
         if duplicates:
             log.warning(

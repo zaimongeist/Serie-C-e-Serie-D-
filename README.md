@@ -30,14 +30,14 @@ Serie-C-e-Serie-D-/
 ├── pyproject.toml / pytest.ini    # Configurazione ruff e pytest (il progetto si esegue dalla root, non si installa)
 ├── config/
 │   ├── competitions.toml          # Le 13 competizioni del perimetro (Serie C A/B/C, Serie B, Serie D A-I) + season id FootyStats, in ordine di visualizzazione
-│   ├── teams_2026_27.json         # Dizionario canonico squadre + alias per competizione (A/B/C/SB; DA..DI riempiti dall'auto-init FootyStats) = PERIMETRO (default)
+│   ├── teams_2026_27.json         # Dizionario canonico squadre + alias delle 13 competizioni (242 squadre) = PERIMETRO (default), allineato a FootyStats a ogni raccolta
 │   ├── teams_2025_26.json         # Stagione precedente: solo fonte di alias storici (squadre uscite dal perimetro, movimenti B<->C)
-│   ├── footystats_teams.json      # Mappa id squadra FootyStats -> nome canonico (generata e aggiornata dall'harvester)
 │   └── endpoints.toml             # Endpoint FootyStats (API ufficiale) e SofaScore/FotMob, retry, cache, rate-limit
-├── data/
+├── data/                          # SOLO LOCALE (escluso da git): dati FootyStats scaricati con la tua chiave
 │   ├── raw/                       # Cache JSON grezzi (chiave = sha1 URL, TTL)
-│   ├── processed/                 # matches.csv / fixtures.csv normalizzati
-│   └── odds/                      # Snapshot quote bookmaker (CSV)
+│   ├── processed/                 # matches.csv / fixtures.csv normalizzati (fixture con orario UTC e stato scheduled/postponed)
+│   ├── odds/                      # Quote pre-match (CSV)
+│   └── footystats_teams.json      # Mappa id squadra FootyStats -> nome canonico (creata alla prima raccolta)
 ├── src/
 │   ├── common/                    # Contratti condivisi
 │   │   ├── competitions.py        # Competition + load_competitions(): legge config/competitions.toml (fallback integrato)
@@ -46,7 +46,8 @@ Serie-C-e-Serie-D-/
 │   │   ├── logging_config.py      # Logging strutturato (JSON lines)
 │   │   └── paths.py
 │   ├── ingestion/                 # MODULO 1
-│   │   ├── footystats.py          # Provider FootyStats (API ufficiale): storico 3 stagioni, fixture, quote pre-match, CLI
+│   │   ├── footystats.py          # Provider FootyStats (API ufficiale): sincronizzazione dizionario, storico 3 stagioni, fixture con orari e rinvii, quote, CLI
+│   │   ├── calendar_snapshot.py   # Verifica dei calendari FootyStats e vista delle giornate del prodotto (solo calendario)
 │   │   ├── harvester.py           # Client httpx asincrono, cache, backoff, provider SofaScore/FotMob, facade con fallback
 │   │   └── team_matcher.py        # Fuzzy matching nomi squadre -> canonico
 │   ├── engine/                    # MODULI 2-3
@@ -66,46 +67,39 @@ Serie-C-e-Serie-D-/
 2. Scarica il progetto: su GitHub pulsante **Code → Download ZIP**, poi estrai la cartella.
 3. Fai doppio clic su `avvia.bat` (Windows) o `avvia.command` (macOS; la prima volta: tasto destro → Apri).
 
-Lo script crea l'ambiente Python, installa le dipendenze, raccoglie i dati reali delle ultime tre stagioni
-e apre la dashboard nel browser. Se trova la chiave FootyStats (variabile `FOOTYSTATS_API_KEY` oppure un file
-`.env` accanto allo script, copia di `.env.example`) usa l'API ufficiale FootyStats (Serie C A/B/C + Serie B,
-quote pre-match incluse: pochi secondi); altrimenti SofaScore (solo da connessione residenziale, la prima volta
-serve qualche decina di minuti, poi è veloce grazie alla cache).
-Per aprire solo la dashboard senza aggiornare i dati: `avvia.bat --solo-dashboard`.
-Le quote dei bookmaker vanno in `data/odds/*.csv` (formato più sotto).
-Per pubblicare i CSV raccolti sul repository (così li vede anche la dashboard in cloud):
-`pubblica_dati.bat` / `pubblica_dati.command` (serve git e una copia clonata, non lo ZIP). Oltre ai CSV caricano anche i
-dizionari che la raccolta FootyStats aggiorna in locale, `config/teams_2026_27.json` (liste dei gironi di Serie D create
-dall'auto-init) e `config/footystats_teams.json` (mappa id FootyStats → nome canonico): senza di loro la dashboard in
-cloud vedrebbe le partite di Serie D ma gironi «non inizializzati».
+Lo script crea l'ambiente Python, installa le dipendenze, **chiede la chiave FootyStats** se non la trova (variabile
+`FOOTYSTATS_API_KEY` oppure file `.env` accanto allo script, copia di `.env.example`; la chiave resta solo sul tuo
+computer), scarica i dati reali con `python -m src.ingestion.footystats` (Serie C A/B/C, Serie B, Serie D A–I, ultime
+tre stagioni, orari, partite rinviate, quote pre-match) **allineando prima il dizionario squadre a FootyStats** e apre
+la dashboard nel browser. Senza chiave non ci sono dati reali da mostrare: la dashboard non presenta mai una lega
+simulata come se fosse reale. Per aprire solo la dashboard senza aggiornare i dati: `avvia.bat --solo-dashboard`.
 
-## ⏱️ Aggiornamento automatico dopo ogni giornata (GitHub Actions)
+## 🔒 Dati FootyStats: solo in locale, mai nel repository
 
-Il workflow `.github/workflows/aggiorna-dati.yml` gira lunedì e giovedì alle 06:30 UTC (o a mano da
-*Actions → Aggiorna dati Serie C, Serie B e Serie D → Run workflow*), raccoglie le ultime tre stagioni di **tutte le
-13 competizioni configurate** e committa `data/processed/matches.csv`, `fixtures.csv`, `data/odds/footystats.csv`,
-`config/footystats_teams.json` e `config/teams_2026_27.json` (quando l'auto-init della Serie D lo modifica) solo se
-sono cambiati. Il riepilogo del job mostra le partite per competizione e stagione, i gironi di Serie D inizializzati e le
-competizioni saltate perché la loro lega non è fra quelle scelte nell'account FootyStats.
+Il repository è **pubblico** e i dati FootyStats (squadre, calendari, risultati, statistiche, quote) sono concessi in
+licenza al titolare della chiave: pubblicarli su GitHub significherebbe ridistribuirli. Per questo:
 
-- **Con FootyStats (consigliato, funziona sui runner GitHub)**: salva la chiave API come *segreto* di repository
-  `FOOTYSTATS_API_KEY` (Settings → Secrets and variables → Actions → New repository secret). Il job esegue
-  `python -m src.ingestion.footystats --seasons 3 --odds-out data/odds/footystats.csv` (nessun `--competitions` =
-  tutte le competizioni di `config/competitions.toml`; l'input `competitions` di *Run workflow* le restringe); la
-  chiave non compare mai nei log né nei file. Alla prima esecuzione con una chiave che copre la Serie D il job
-  inizializza le liste squadre dei nove gironi in `config/teams_2026_27.json` e le committa (riga *registry
-  initialised* nel riepilogo). Vedi la sezione *Dati reali con FootyStats*.
-- **Senza segreto** il job usa SofaScore. **Sui runner GitHub** SofaScore risponde spesso `403 Forbidden` agli IP
-  dei datacenter: in quel caso il job fallisce e il riepilogo lo spiega. Vale la pena tenerlo attivo (a volte
-  passa), ma non contarci.
-- **Dal tuo PC, in automatico**: registra un *self-hosted runner* (Settings → Actions → Runners → New self-hosted
-  runner, segui i comandi mostrati) e imposta la variabile di repository `HARVEST_RUNNER = self-hosted`
-  (Settings → Secrets and variables → Actions → Variables). Lo stesso job partirà sul tuo PC, con il tuo IP,
-  quando è acceso e il runner è in esecuzione. È la via affidabile.
-- **A mano**: `avvia.bat` / `avvia.command` raccolgono i dati, poi `pubblica_dati.*` carica sul repository i CSV e i
-  due dizionari aggiornati dalla raccolta (`config/teams_2026_27.json`, `config/footystats_teams.json`).
+- i dati si scaricano **a runtime con la tua chiave** (`avvia.*`, `python -m src.ingestion.footystats`, l'aggiornamento
+  dalla dashboard) e restano **solo sul disco locale**: `.gitignore` esclude `data/processed/*`, `data/odds/*`,
+  `data/raw/*`, `data/*.json` (la mappa id → nome) e `.env`;
+- non esistono più il workflow che committava i CSV (`aggiorna-dati.yml`) né gli script `pubblica_dati.*`: c'era anche
+  un motivo tecnico, i workflow pianificati girano solo sul branch principale, quindi la raccolta automatica non era mai
+  partita e la dashboard ripiegava in silenzio sulla lega simulata;
+- il workflow `.github/workflows/verifica-calendari.yml` (a ogni push sul branch di lavoro che tocca l'ingestion o il
+  calendario, oppure *Run workflow*) usa il secret `FOOTYSTATS_API_KEY` **senza scrivere nulla nel repository e senza
+  artifact**: stampa nel log solo fatti di calendario (squadre, giornate, orari, stato, risultati; mai quote né
+  statistiche). Passo 1: istantanea `python -m src.ingestion.calendar_snapshot` (anomalie, rinvii, giornata corrente,
+  prova a secco della sincronizzazione del dizionario). Passo 2: il percorso del prodotto,
+  `python -m src.ingestion.footystats --seasons 3 --no-odds --out ci/matches.csv --fixtures-out ci/fixtures.csv
+  --odds-out ci/odds.csv` in una cartella temporanea fuori da `data/` (il dizionario viene sincronizzato nella copia di lavoro, mai
+  committato), poi `--product-view` stampa la giornata corrente di ogni competizione **come la mostra la dashboard**
+  (stessa regola di `src/engine/calendar.py`), con i recuperi e le partite rinviate.
 
-I CSV in `data/processed/` e `data/odds/` sono versionati; la cache grezza `data/raw/` no.
+### Dashboard su Streamlit Community Cloud
+
+Non caricare né `.env` né CSV: nelle impostazioni dell'app, **Secrets**, aggiungi una riga
+`FOOTYSTATS_API_KEY = "la-tua-chiave"`. L'app scarica i dati da FootyStats a runtime sul proprio disco (temporaneo) con
+quella chiave; il repository resta privo di dati.
 
 ## 🚀 Quick Start
 
@@ -123,23 +117,25 @@ python main.py --mode full
 #    opzioni comuni: --season 2026_27 (perimetro = config/teams_<stagione>.json), --history 0|1|2 (stagioni sintetiche
 #    precedenti quella del dizionario: 2024/25-2025/26 per il 2026/27); il mini è un'istantanea fissa di inizio stagione
 
-# 3) raccolta dati reali: FootyStats (API ufficiale, chiave in .env o FOOTYSTATS_API_KEY; Serie C A/B/C + Serie B,
-#    ultime 3 stagioni, quote pre-match in data/odds/footystats.csv) -> data/processed/
-python -m src.ingestion.footystats --competitions A B C SB --seasons 3
-#    Serie D (9 gironi DA..DI): la prima raccolta inizializza le liste squadre dei gironi dall'API, poi la sezione
-#    "Serie D" della dashboard e di main.py si popola (vedi "Dashboard e demo a console")
-python -m src.ingestion.footystats --competitions DA DB DC DD DE DF DG DH DI --seasons 3
-#    oppure SofaScore (senza chiave, solo dal proprio PC: vedi "Ingestion") -> data/processed/
-python -m src.ingestion.harvester --gironi A B C --seasons 3 --out data/processed/matches.csv
+# 3) raccolta dati reali da FootyStats con la TUA chiave (.env o FOOTYSTATS_API_KEY): tutte le 13 competizioni, ultime
+#    3 stagioni, fixture con orario e stato (rinviate incluse), quote pre-match -> data/ (solo locale, escluso da git);
+#    prima allinea config/teams_2026_27.json a /league-teams (squadre aggiunte/spostate/rimosse, report in console)
+python -m src.ingestion.footystats --seasons 3
+#    solo l'allineamento del dizionario squadre, senza scaricare partite
+python -m src.ingestion.footystats --sync-registry
+#    fallback manuale per i soli gironi di Serie C: SofaScore (senza chiave, solo dal proprio PC: vedi "Ingestion")
+python -m src.ingestion.harvester --gironi A B C --seasons 3 --providers sofascore
 
 # 4) pipeline sui dati reali con quote bookmaker in data/odds/*.csv (--section bc|d|all sceglie le sezioni stampate)
 python main.py --processed data/processed/matches.csv --fixtures data/processed/fixtures.csv --odds data/odds
 python main.py --mode full --rounds 6 --history 0 --serie-d-demo --section d   # la sezione Serie D su dati sintetici
 
-# 5) dashboard interattiva (usa data/processed se presente, altrimenti la lega simulata 2026/27 al calendario di oggi)
+# 5) dashboard interattiva sui dati reali di data/processed (scaricati con la tua chiave); senza dati mostra la pagina
+#    iniziale che spiega come configurare la chiave, MAI una lega simulata al loro posto
 streamlit run src/dashboard/app.py
-#    variabili utili: SERIEC_FORCE_SIMULATE=1  SERIEC_SEASON=2026_27  SERIEC_HISTORY=2  SERIEC_AS_OF=2026-11-06
-#                     SERIEC_SIM_ROUNDS=15 (giornate fisse invece del calendario)  SERIEC_SEED=7
+#    demo esplicita su dati inventati (banner rosso su ogni pagina, mai per scommettere): SERIEC_DEMO=1
+#    (SERIEC_FORCE_SIMULATE=1 è l'alias deprecato); altre variabili: SERIEC_SEASON=2026_27  SERIEC_HISTORY=2
+#    SERIEC_AS_OF=2026-11-06  SERIEC_SIM_ROUNDS=15 (solo demo: giornate fisse invece del calendario)  SERIEC_SEED=7
 
 # test
 python -m pytest -q
@@ -178,7 +174,7 @@ definizioni integrate (le stesse 13), così gli import non falliscono mai. Le co
 **famiglie** (`families()` → `Serie C`, `Serie B`, `Serie D`; `describe_competitions(family=...)`,
 `competitions_of_family`, `family_label`): il modello stima **una sola volta** tutto il perimetro, l'interfaccia è
 divisa per famiglia. Il **perimetro** è il dizionario della stagione corrente (`config/teams_2026_27.json`, chiavi =
-codici delle competizioni): `Serie C 2026/27 Gironi A/B/C + Serie B (80 squadre)` — la frase è derivata dalla
+codici delle competizioni, 242 squadre): `Serie C 2026/27 Gironi A/B/C + Serie B + Serie D Gironi A-I (242 squadre)` — la frase è derivata dalla
 configurazione (`TeamRegistry.perimeter_label`, che chiamata con una famiglia la restringe:
 `registry.perimeter_label('Serie D')` → `Serie D 2026/27 Gironi A-I (162 squadre)`), conta solo le competizioni che
 hanno squadre (`registry.gironi`; quelle vuote sono in `registry.missing_competitions()`) e compare identica nel
@@ -220,52 +216,48 @@ Serie C: le squadre promosse e retrocesse collegano le divisioni, il fattore cam
   `FootyStatsHarvest.not_chosen`), senza fermare né invalidare la raccolta di Serie B e Serie C, che vengono scritte
   normalmente (exit code 0). I piani FootyStats limitano il numero di leghe scelte: se non puoi aggiungerle tutte,
   restringi `--competitions` (o l'input `competitions` del workflow) alle leghe che hai.
-- **Liste squadre inizializzate dall'API (auto-init)**: le composizioni dei nove gironi **non sono nel codice**. In
-  `config/teams_2026_27.json` le chiavi `DA` … `DI` sono oggetti vuoti; la prima raccolta FootyStats con la chiave
-  (`python -m src.ingestion.footystats`, `avvia.*`, il job GitHub Actions) chiama `/league-teams` della stagione
-  corrente per ogni competizione senza squadre, scrive nome canonico (`cleanName`) e alias (`name`, `english_name`,
-  `alt_names`, senza mai rimuovere alias esistenti né scrivere una grafia che un altro club già usa), ricarica il
-  dizionario e lo riporta (`FootyStatsHarvest.initialised_competitions`, riga `registry initialised: DA (18 teams), …`
-  in console). Lo stesso avviene per le stagioni future (`--season 2027_28`). `--no-auto-init` lo disattiva: le
-  squadre di Serie D vengono allora raccolte come storiche, fuori dal perimetro. Finché l'auto-init non è stato
-  eseguito `registry.missing_competitions()` elenca i nove codici, il perimetro conta solo le 80 squadre presenti e la
-  sezione Serie D mostra lo stato.
+- **Liste squadre da FootyStats (sincronizzazione del dizionario)**: `config/teams_2026_27.json` contiene le 162
+  squadre dei nove gironi così come le elenca `/league-teams` (nome canonico = `cleanName` FootyStats; unica eccezione
+  `AC Palermo Serie D`, perché `AC Palermo` si normalizza come il `Palermo` di Serie B, un altro club). Ogni raccolta
+  FootyStats (`python -m src.ingestion.footystats`, `avvia.*`, l'aggiornamento della dashboard) **sincronizza** il
+  dizionario della stagione corrente con `/league-teams`, per tutte le competizioni richieste (vedi *Dati reali con
+  FootyStats*); `--no-sync` la disattiva.
 - **Statistiche più povere**: su FootyStats la Serie D ha spesso tiri e xG non raccolti (`0`/`-1`, letti come `NaN`)
   e quote pre-match per meno partite. Tutto degrada senza errori: λ e μ si stimano dai gol, senza xG il filtro
   REGRESSION_TRAP non scatta, il pannello valore è in parte vuoto.
 - **Simulazione**: `simulate_serie_d_registry(seed, n_teams=18)` costruisce un dizionario sintetico di Serie D
   (`Squadra DA 01` …) per test e demo; `simulate_league`/`simulate_history` simulano solo le competizioni che hanno
-  squadre, quindi la lega simulata di default resta Serie C + Serie B.
+  squadre nel dizionario: con il dizionario 2026/27 allineato a FootyStats (Serie D compresa) la lega simulata di
+  default copre tutte le 13 competizioni (242 squadre).
 
 **Per aggiungere un campionato** (es. un'altra nazione):
 
 1. aggiungi una tabella `[[competition]]` a `config/competitions.toml` con un `code` nuovo (maiuscole/cifre, es. `DA`);
-2. aggiungi le squadre di quella competizione, con gli alias, sotto la stessa chiave in `config/teams_<stagione>.json`
-   — oppure lascia la chiave con un oggetto vuoto `{}` e l'harvester FootyStats la riempie da `/league-teams` alla
-   prima raccolta (auto-init, come per la Serie D). Una squadra ha **un solo nome canonico** anche se cambia divisione:
-   `Pescara` in Serie B 2025/26 e nel girone B 2026/27; il dizionario della stagione corrente decide la sua
-   competizione, le stagioni passate restano storico;
+2. aggiungi la chiave della competizione in `config/teams_<stagione>.json` (anche un oggetto vuoto `{}`): la prima
+   raccolta FootyStats la riempie da `/league-teams` (sincronizzazione del dizionario). Una squadra ha **un solo nome
+   canonico** anche se cambia divisione: `Pescara` in Serie B 2025/26 e nel girone B 2026/27; il dizionario della
+   stagione corrente decide la sua competizione, le stagioni passate restano storico;
 3. inserisci il `footystats_name` esatto restituito da `/league-list` e aggiungi la lega al tuo account su
    footystats.org (l'API mostra solo le leghe scelte), poi raccogli i dati con l'harvester FootyStats.
 
-Nient'altro va toccato: enum, dizionario, motore, selettori e banner seguono il file. Per controllare una
-composizione (es. la Serie B 2026/27) usa `python -m src.ingestion.footystats --init-registry`: **aggiunge** al
-dizionario le squadre e gli alias mancanti secondo `/league-teams` di FootyStats e stampa il diff, comprese le squadre
-del file che FootyStats **non elenca più** (*no longer listed by FootyStats*). Il comando non cancella mai squadre o
-alias: un club di troppo (retrocesso, escluso, inserito nel girone sbagliato) va rimosso a mano dal file.
+Nient'altro va toccato: enum, dizionario, motore, selettori e banner seguono il file. Per una stagione nuova
+(`config/teams_2027_28.json` ancora assente) `python -m src.ingestion.footystats --init-registry --season 2027_28`
+crea il file dalle squadre FootyStats (aggiunge squadre e alias, non rimuove nulla); da lì in poi ogni raccolta con
+`--season 2027_28` lo mantiene allineato.
 
-## 🔑 Dati reali con FootyStats (API ufficiale, consigliata)
+## 🔑 Dati reali con FootyStats (API ufficiale, unica fonte di verità)
 
-FootyStats (<https://footystats.org/api/>) è un'API documentata e autenticata con chiave: risponde anche dai
-datacenter (GitHub Actions, cloud), copre i tre gironi di Serie C, la Serie B e i nove gironi di Serie D con
-risultati, tiri, tiri nello specchio, angoli, xG (dove disponibile) e **quote pre-match** (1X2, Over/Under 1.5-2.5-3.5, Gol/NoGol) che
-alimentano il motore di valore. È la sorgente di default appena la chiave è disponibile; SofaScore resta il
-fallback (sezione successiva).
+FootyStats (<https://footystats.org/api/>) è un'API documentata e autenticata con chiave: copre i tre gironi di Serie
+C, la Serie B e i nove gironi di Serie D con squadre, calendario ufficiale (`game_week` = giornata, orario
+`date_unix`), risultati, tiri, tiri nello specchio, angoli, xG (dove disponibile) e **quote pre-match** (1X2,
+Over/Under 1.5-2.5-3.5, Gol/NoGol). È **l'unica fonte di verità** per squadre e calendari: il dizionario squadre e le
+giornate mostrate seguono FootyStats, mai una lista scritta a mano o una lega simulata. I dati restano **solo in
+locale** (vedi *Dati FootyStats: solo in locale*).
 
 1. **Chiave**: dal tuo account su footystats.org → *API*. Non committarla mai: va in una variabile d'ambiente
    `FOOTYSTATS_API_KEY` oppure in un file `.env` nella root del repository (copia `.env.example`;
-   `.env` è in `.gitignore`), oppure passata con `--key`. Il codice la maschera ovunque (`***`): non finisce
-   in log, cache (`data/raw/`), messaggi d'errore né nei file prodotti.
+   `.env` è in `.gitignore`), nei *Secrets* dell'app su Streamlit Cloud, oppure passata con `--key`. Il codice la
+   maschera ovunque (`***`): non finisce in log, cache (`data/raw/`), messaggi d'errore né nei file prodotti.
 2. **Leghe dell'account**: su footystats.org aggiungi al tuo account (*Choose leagues*) **Italy Serie C Group A**,
    **Italy Serie C Group B**, **Italy Serie C Group C**, **Italy Serie B** e le nove leghe **Italy Serie D Group A** …
    **Italy Serie D Group I**. **Ogni competizione da raccogliere deve essere fra le leghe scelte**: l'API elenca solo
@@ -279,57 +271,97 @@ fallback (sezione successiva).
 
 ```bash
 # ultime 3 stagioni di TUTTE le 13 competizioni (Serie C A/B/C, Serie B, Serie D A-I) in UN solo matches.csv + fixture
-# della stagione corrente + quote; i gironi di Serie D senza squadre in config/teams_2026_27.json vengono inizializzati
-python -m src.ingestion.footystats --seasons 3 --odds-out data/odds/footystats.csv
-# solo Serie C e Serie B (il perimetro precedente alla Serie D)
-python -m src.ingestion.footystats --competitions A B C SB --seasons 3 --odds-out data/odds/footystats.csv
-# solo Serie D, senza riempire il dizionario (le sue squadre restano storiche, fuori dal perimetro)
-python -m src.ingestion.footystats --competitions DA DB DC DD DE DF DG DH DI --seasons 3 --no-auto-init
-# solo Serie B, 2 stagioni, senza quote
-python -m src.ingestion.footystats --competitions SB --seasons 2 --no-odds
+# della stagione corrente (orario, stato, rinviate) + quote; prima allinea config/teams_2026_27.json a FootyStats
+python -m src.ingestion.footystats --seasons 3
+# solo Serie C e Serie B
+python -m src.ingestion.footystats --competitions A B C SB --seasons 3
+# solo Serie B, 2 stagioni, senza quote, senza toccare il dizionario (--no-odds non riscrive data/odds/footystats.csv:
+# toglie solo le quote delle partite rinviate o già iniziate, prezzi non più validi)
+python -m src.ingestion.footystats --competitions SB --seasons 2 --no-odds --no-sync
+# solo l'allineamento del dizionario squadre (nessuna partita scaricata), con il report
+python -m src.ingestion.footystats --sync-registry
 # leghe e season id del tuo account
 python -m src.ingestion.footystats --list-leagues
-# crea/aggiorna config/teams_2027_28.json dalle squadre FootyStats: aggiunge squadre/alias mancanti e stampa il diff
-# (squadre e alias esistenti non vengono mai rimossi; quelle non più elencate da FootyStats sono segnalate, da togliere a mano)
+# crea config/teams_2027_28.json per una stagione nuova (aggiunge squadre/alias, non rimuove nulla)
 python -m src.ingestion.footystats --init-registry --season 2027_28 --competitions A B C SB
-# poi la pipeline / la dashboard leggono data/processed e data/odds
-python main.py --processed data/processed/matches.csv --fixtures data/processed/fixtures.csv --odds data/odds
+# controllo dei calendari (solo calendario: niente quote né statistiche), e la giornata corrente come la mostra il prodotto
+python -m src.ingestion.calendar_snapshot --summary snapshot/riepilogo.md
+python -m src.ingestion.calendar_snapshot --product-view --matches data/processed/matches.csv --fixtures data/processed/fixtures.csv
 ```
 
+- **Sincronizzazione del dizionario squadre** (`sync_registry` / `apply_registry_sync` in
+  `src/ingestion/footystats.py`, eseguita da ogni raccolta prima di leggere le partite): per ogni competizione
+  richiesta il dizionario della stagione corrente diventa **uguale** a `/league-teams`. L'identità di un club si
+  decide, in quest'ordine e **mai per somiglianza (fuzzy)**: id squadra FootyStats già associato da una
+  sincronizzazione precedente (`data/footystats_teams.json`); grafia esatta o alias (`cleanName`, `name`,
+  `english_name`) di un club della stessa competizione; il nome che la regola delle collisioni gli darebbe; grafia
+  esatta o alias di un club di un'altra competizione, che viene **spostato** (solo se anche quella competizione è
+  sincronizzata nella stessa esecuzione). I club nuovi prendono il `cleanName` (se la grafia è già di un altro club:
+  `name`, poi `cleanName + famiglia`, es. `AC Palermo Serie D`, poi `cleanName + girone`); quelli che FootyStats non
+  elenca più per la competizione vengono **rimossi** (restano nello storico tramite i file delle stagioni precedenti);
+  un nome canonico uguale al vecchio `cleanName` segue una ridenominazione FootyStats (il vecchio resta alias), i nomi
+  scelti a mano (`Juventus Next Gen` ← `Juventus II`, `Atalanta U23` ← `Atalanta II`, `Inter U23` ← `Inter II`,
+  `Campobasso` ← `Città di Campobasso`, …) non cambiano mai. Le grafie FootyStats diventano alias quando nessun altro club
+  le usa; gli alias esistenti restano. Il file viene scritto in modo atomico solo se cambia, e mai se non si
+  caricherebbe. Il report (`RegistrySyncReport.describe()`) è stampato dalla CLI: aggiunte, rimosse, spostate,
+  rinominate per competizione e totale squadre. Una competizione senza lista (lega non scelta, errore) o con lista
+  vuota resta invariata.
+- **Un club, una competizione**: anche senza la sincronizzazione (`--no-sync`, una lista non scaricata, un id non
+  ancora associato) una squadra della stagione corrente non viene mai fusa con un club che il dizionario mette in
+  un'altra competizione: `AC Palermo` (Serie D, girone I) resta `AC Palermo Serie D` e non diventa il `Palermo` di
+  Serie B, così nessuna squadra gioca in due campionati. Lo stesso vale per `--init-registry` di una stagione nuova:
+  due club FootyStats che rispondono allo stesso nome restano due club (il secondo prende il nome della regola delle
+  collisioni, segnalato come `conflict`), mentre promozioni e retrocessioni mantengono il nome. Uno spostamento vero
+  fra competizioni nella stagione in corso lo applica solo la sincronizzazione, che riconosce i club per id.
+- **Calendario fedele**: `game_week` è la giornata ufficiale e le giornate si giocano da venerdì a lunedì, con
+  recuperi infrasettimanali. Le partite `incomplete` con orario futuro sono fixture `scheduled` con il loro orario
+  (`Fixture.kickoff`, UTC; `kickoff_local` in Europe/Rome); quelle con orario passato da **più di 3 ore** sono fixture
+  `postponed` (rinviate) con data e orario originali, non più scartate, così una giornata non sembra mai più corta di
+  quello che è; quelle iniziate da meno di 3 ore sono **in corso** e restano fixture `scheduled` con il loro orario
+  (già passato), così la giornata le elenca ancora e resta quella corrente fino al risultato, che arriva con la
+  raccolta successiva. Le partite giocate della stagione corrente (anche quelle della giornata in corso, es. i due
+  anticipi del venerdì) sono in `matches.csv`. `fixtures.csv` ha le colonne
+  `match_id,date,round,girone,home_team,away_team,kickoff,status` (`kickoff` ISO 8601 UTC, `status`
+  `scheduled|postponed`); i file del vecchio formato a 6 colonne si leggono ancora. Le quote si raccolgono solo per le
+  fixture `scheduled` non ancora iniziate.
+- **Dati freschi anche dalla cache**: lo stato di una partita `incomplete` si giudica all'istante in cui FootyStats
+  l'ha servita (`fetched_at` della cache `data/raw/`), mai a un orologio successivo: una partita ancora da giocare in
+  un payload di cinque ore fa non diventa «rinviata». Il calendario della stagione in corso (`/league-matches`) si
+  riusa dalla cache al massimo per `live_matches_cache_minutes` minuti (`[footystats]` di `config/endpoints.toml`,
+  default 10), qualunque sia `[http] cache_ttl_hours`: nei giorni di partita un aggiornamento mostra i risultati
+  appena arrivati.
 - Le competizioni sono i codici di `config/competitions.toml` (`A`, `B`, `C`, `SB`, `DA` … `DI`; senza
   `--competitions` si raccolgono tutte quelle che il provider supporta, 13); il nome FootyStats di ciascuna
   (`footystats_name`, es. `Italy Serie B`) è lì, con un fallback in `[footystats.league_names]` di
-  `config/endpoints.toml`. Per aggiungere un campionato: una tabella `[[competition]]`, le squadre nel
-  dizionario di stagione (`--init-registry` le aggiunge con gli alias FootyStats), la lega nell'account FootyStats
-  (le istruzioni stampate quando manca la chiave elencano i `footystats_name` di tutte le competizioni configurate).
+  `config/endpoints.toml`.
 - Storico: per ogni competizione vengono scaricate le ultime `--seasons` stagioni elencate dall'API (season id
   risolti a runtime da `/league-list`; `[competition.season_ids]` di `competitions.toml`, poi
   `[footystats.season_ids]` di `endpoints.toml`, sono il fallback solo se la lista non risponde; una lega che la lista
   non elenca non è scelta nell'account e viene saltata, vedi sopra).
   Tutte le squadre che vi hanno partecipato restano nello storico, anche quelle poi retrocesse, promosse o
   fallite: mantengono la loro grafia canonica (*historical teams*) e servono a valutare le avversarie, ma non
-  entrano in classifica/previsioni. Le partite `suspended`/`canceled` sono scartate; le `incomplete` future della
-  stagione corrente diventano `fixtures.csv`, le loro quote `data/odds/footystats.csv`
-  (`match_id,bookmaker,market,selection,odds`, bookmaker `FootyStats`).
+  entrano in classifica/previsioni. Le partite `suspended`/`canceled` sono scartate.
 - Statistiche mancanti: FootyStats usa `0`/`-1` per i dati non raccolti; tiri a 0 per entrambe le squadre o xG a 0
   per entrambe vengono letti come assenti (`NaN`), così il modello non li confonde con zeri veri.
-- Nomi squadra: `config/footystats_teams.json` memorizza la mappa *id FootyStats → nome canonico* e viene
-  aggiornato a ogni esecuzione (gli id battono il fuzzy matching; un hit esatto/alias del dizionario batte
-  entrambi). Correggi lì il campo `canonical` se una squadra è mappata male. Le squadre che nessun dizionario
-  conosce mantengono il `cleanName` FootyStats e sono elencate come *unmapped teams*.
+- Nomi squadra: `data/footystats_teams.json` (locale, escluso da git, creato alla prima raccolta; un vecchio
+  `config/footystats_teams.json` viene letto una volta per migrarlo) memorizza la mappa *id FootyStats → nome
+  canonico*. Le voci scritte dalla sincronizzazione (`"method": "sync"`) identificano il club e battono ogni ricerca per
+  grafia, anche nelle stagioni passate (gli id FootyStats sono stabili); per le altre un hit esatto/alias del
+  dizionario batte l'id memorizzato, che batte il fuzzy. Correggi lì il campo `canonical` se una squadra è mappata male.
 - Limiti: circa **1800 richieste/ora** sui piani standard; un run completo (13 competizioni × 3 stagioni) ne usa
   ~80 (4 competizioni: ~25). Il 429 viene ritentato con backoff; la cache in `data/raw/` evita di riscaricare le stagioni concluse.
 - Exit code della CLI: `0` ok, `2` chiave mancante (con le istruzioni), `1` raccolta fallita o parziale (il CSV
   esistente non viene sovrascritto senza `--allow-partial`).
 - La facade `src.ingestion.harvester.Harvester` prova i provider in ordine (`footystats`, poi `sofascore`
-  quando una chiave è disponibile; solo `sofascore` altrimenti): `python -m src.ingestion.harvester --odds-out ...`
-  usa quindi FootyStats e ripiega su SofaScore competizione per competizione in caso di errore.
+  quando una chiave è disponibile; solo `sofascore` altrimenti) e adotta il dizionario sincronizzato da FootyStats.
 
 ## 📥 Ingestion: raccolta dati reali (SofaScore, fallback)
 
-Il **perimetro** è il dizionario della stagione corrente (`config/teams_2026_27.json`: le 60 squadre dei tre
-gironi ufficiali Lega Pro più le 20 della Serie B, 80 in tutto, più i nove gironi di Serie D una volta inizializzati
-da FootyStats): solo queste squadre vengono classificate, previste e prezzate. Le stagioni precedenti servono
+SofaScore è un **fallback manuale** per i soli gironi di Serie C (nessun calendario con orari e rinvii, nessuna Serie B
+né Serie D): squadre e calendari di riferimento restano quelli di FootyStats. Il **perimetro** è il dizionario della
+stagione corrente (`config/teams_2026_27.json`: le 60 squadre dei tre gironi ufficiali Lega Pro, le 20 della Serie B e
+le 162 dei nove gironi di Serie D, 242 in tutto, allineate a FootyStats): solo queste squadre vengono classificate,
+previste e prezzate. Le stagioni precedenti servono
 **unicamente come base storica** per stimare meglio la forza delle squadre correnti. L'harvester SofaScore copre i
 soli gironi di Serie C; Serie B e Serie D arrivano da FootyStats (la Serie D non ha id SofaScore:
 `sofascore_tournament_id = 0`, quindi `Harvester.supported_gironi('sofascore')` la esclude).
@@ -341,8 +373,7 @@ python -m src.ingestion.harvester --gironi A B C --seasons 3
 python -m src.ingestion.harvester --seasons 1
 # perimetro esplicito (config/teams_<stagione>.json) oppure una singola stagione SofaScore
 python -m src.ingestion.harvester --season 2026_27 --season-id 77031
-# poi copiare i CSV dove gira la pipeline / la dashboard
-scp data/processed/matches.csv data/processed/fixtures.csv utente@server:/percorso/Serie-C-e-Serie-D-/data/processed/
+# i CSV restano in data/processed/ (solo locale, escluso da git)
 ```
 
 - `--seasons N` raccoglie le ultime N stagioni di ogni girone (la corrente + N−1 storiche, default 3) e scrive
@@ -372,8 +403,8 @@ scp data/processed/matches.csv data/processed/fixtures.csv utente@server:/percor
 
 > **Nota 403 (stato novembre 2026).** `api.sofascore.com` risponde HTTP 403 alle richieste provenienti da IP di
 > datacenter/cloud (CI, notebook cloud, VPS, container remoti), con qualunque header: l'harvester va eseguito da
-> una **connessione residenziale** (il proprio PC) e i file `data/processed/*.csv` vanno poi copiati (scp, commit,
-> cartella condivisa) dove girano `main.py --processed ...` o la dashboard. Il 403 non viene ritentato perché
+> una **connessione residenziale** (il proprio PC), e `main.py --processed ...` o la dashboard vanno eseguiti sullo
+> stesso computer: i CSV non si committano mai (il repository è pubblico). Il 403 non viene ritentato perché
 > non è transitorio. FotMob è **sperimentale**: dal 2026 `/api/allLeagues` restituisce una pagina HTML 404 e
 > l'API richiede l'header firmato `x-mas` (`--x-mas` / env `FOTMOB_X_MAS`); il provider resta disponibile con
 > `--providers sofascore fotmob` ma non è un fallback funzionante senza firma. Dettagli in `config/endpoints.toml`.
@@ -438,47 +469,95 @@ scp data/processed/matches.csv data/processed/fixtures.csv utente@server:/percor
 
 ## 🖥️ Dashboard e demo a console
 
-- **Perimetro sempre dichiarato**: badge della sidebar e sottotitolo della pagina riportano
-  `Perimetro: Serie C 2026/27 Gironi A/B/C + Serie B (80 squadre) · N partite stagione corrente · M partite storiche
-  (2024/25-2025/26)`; la console di `main.py` apre con `Perimetro: Serie C 2026/27 Gironi A/B/C + Serie B (80 squadre) ·
-  stagione corrente: N partite · storico: M partite 2024/25-2025/26` e stampa il riepilogo per stagione (partite,
-  squadre attuali e storiche). La frase è derivata da `config/competitions.toml` e dal dizionario, mai cablata.
+- **Solo dati reali, mai numeri inventati in silenzio**: la dashboard (`streamlit run src/dashboard/app.py`) lavora
+  esclusivamente sui dati FootyStats scaricati **a runtime con la tua chiave** (`src/dashboard/data_refresh.py`) e
+  salvati **solo in locale** (`data/processed`, `data/odds`, esclusi da git: i dati FootyStats sono in licenza al tuo
+  account e non vanno pubblicati nel repository). All'avvio, se la chiave è configurata e i dati mancano o hanno più di
+  **6 ore**, li riscarica (una volta ogni 6 ore per server, con barra di avanzamento): partite delle ultime 3 stagioni,
+  calendario con orari e rinvii, quote pre-match, e allinea il dizionario squadre a FootyStats. La sidebar mostra
+  `Dati FootyStats aggiornati alle HH:MM del gg/mm` e il pulsante **Aggiorna dati ora**; una competizione che non si
+  può scaricare (lega non scelta sull'account, errore di rete) è segnalata con `st.warning` e tiene i dati precedenti,
+  le altre si aggiornano; lo stesso vale per una sola stagione: se fallisce la stagione in corso di una competizione
+  (es. HTTP 503) restano le sue partite, il calendario e le quote del download precedente. Finché i dati restano più
+  vecchi di 6 ore (chiave mancante, aggiornamento non riuscito in una qualunque sessione) ogni esecuzione mostra in cima
+  `Dati vecchi di 2 giorni (ultimo aggiornamento FootyStats alle 13:46 del 05/11/2026): …` con il motivo, e un avviso
+  per ogni competizione ferma ai dati di un download precedente. Se i CSV sono stati riscritti dopo l'ultimo
+  aggiornamento della dashboard (per esempio da `avvia.bat` / `avvia.command`, che lanciano
+  `python -m src.ingestion.footystats`) conta l'ora del file `matches.csv`, così la dashboard non riscarica tutto
+  subito dopo il launcher. Le differenze del dizionario squadre (squadre aggiunte, spostate, rinominate) sono in
+  *Dettagli pipeline*.
+- **Pagina iniziale senza dati**: senza `data/processed/matches.csv` la dashboard non mostra alcun tab, ma una pagina
+  che dice cosa manca, come fornire la chiave e — se la chiave c'è — offre il pulsante **Scarica i dati da FootyStats
+  adesso**. La chiave si legge, nell'ordine, da `FOOTYSTATS_API_KEY` nell'ambiente, dal file `.env` (copia di
+  `.env.example`) e dai secrets di Streamlit; non viene mai stampata, registrata nei log o scritta nei file.
+- **Streamlit Community Cloud**: nessun dato nel repository; in *App settings → Secrets* incolla
+  `FOOTYSTATS_API_KEY = "la_tua_chiave"`: al primo avvio l'app scarica i dati sul server (e li riscarica ogni 6 ore o
+  con *Aggiorna dati ora*). Le leghe delle competizioni vanno scelte sull'account footystats.org (*Choose leagues*).
+- **Demo esplicita** (`SERIEC_DEMO=1`; `SERIEC_FORCE_SIMULATE=1` resta come alias deprecato): lega simulata della
+  stagione del dizionario sul suo calendario (squadre vere, **calendari, risultati e quote inventati**). Ogni pagina e
+  ogni tab apre con l'avviso rosso `DATI SIMULATI: squadre, calendari e risultati inventati. Non usare per
+  scommettere.` e il badge della sidebar dice **Demo**; ogni CSV scaricato dalla demo (tabella giornata, risultati,
+  selezioni, report valore, previsioni) si chiama `DEMO_…` e ha come prima colonna `AVVISO` =
+  `DATI SIMULATI - NON USARE PER SCOMMETTERE`. Le giornate con data precedente a `SERIEC_AS_OF` (default oggi,
+  risolto a ogni esecuzione) risultano giocate, la prima successiva è il turno da prevedere; `SERIEC_SIM_ROUNDS=N`
+  fissa le giornate giocate, `SERIEC_HISTORY` (0-2, default 2) aggiunge stagioni sintetiche precedenti, `SERIEC_SEED`
+  il seme. Con il dizionario reale completo (Serie B, Serie C e Serie D, 242 squadre) la prima stima della demo
+  richiede alcuni minuti; poi resta in cache. Le cartelle dei dati reali si cambiano con `SERIEC_PROCESSED_DIR` /
+  `SERIEC_ODDS_DIR`.
+- **Perimetro sempre dichiarato**: badge della sidebar e sottotitolo della pagina riportano il perimetro derivato da
+  `config/competitions.toml` e dal dizionario, mai cablato (`Perimetro: Serie C 2026/27 Gironi A/B/C + Serie B (80
+  squadre) · N partite stagione corrente · M partite storiche (2024/25-2025/26)` per la sezione Serie B e Serie C); la
+  console di `main.py` apre con la stessa frase e stampa il riepilogo per stagione (partite, squadre attuali e storiche).
 - **Sezione Serie D (esclusiva)**: la sidebar apre con il selettore **Sezione** (`Serie B e Serie C`, default, oppure
   `Serie D`). La stima Dixon-Coles resta **una sola** per tutto il perimetro (B + C + D: le squadre promosse e
   retrocesse collegano le divisioni, il fattore campo e il vincolo Σα = 0 per competizione tengono i gironi
   confrontabili), ma tutto ciò che si vede è della sezione scelta: titoli dei tab (`Classifica di forza · Serie D`),
   selettore Competizione (`Tutti` + `D-A` … `D-I`), tabella giornata, risultati, pannello valore, alert
   REGRESSION_TRAP, selezioni (le 5 X / 12 GG sono calcolate **dentro** la sezione), export e la frase del perimetro
-  (`Perimetro: Serie D 2026/27 Gironi A-I (162 squadre) · …`). Le giornate di Serie D sono raggruppate dal suo
-  calendario (34 turni, 9 gironi di 18 squadre) e non spostano quelle di Serie B / Serie C; la giornata, la partita e i
-  filtri scelti sono per sezione (`st.session_state["matchday_d"]`, `fixture_d`, …), cambiando sezione si riparte dai
-  default di quella sezione. Le liste squadre dei nove gironi **non sono nel codice**: la prima raccolta FootyStats con
-  la chiave le inizializza da `/league-teams` in `config/teams_<stagione>.json`; finché la sezione non è inizializzata
-  ogni tab mostra un solo avviso con lo stato (`Serie D non inizializzata: esegui la raccolta FootyStats con la chiave`)
-  e il comando esatto (`python -m src.ingestion.footystats --competitions DA DB DC DD DE DF DG DH DI --seasons 3`,
-  seguito da `--season <stagione>` quando la stagione del perimetro — `SERIEC_SEASON` — non è quella di default del
-  raccoglitore, così inizializza proprio quel dizionario; oppure `avvia.bat` / `avvia.command`); il badge della
-  sidebar e *Dettagli pipeline* riportano sempre lo stato
-  (`inizializzata: 162 squadre, N partite della stagione …`). Le statistiche di Serie D su FootyStats sono più povere e
-  tutto degrada senza errori: xG e tiri spesso mancano (colonne `-`, λ e μ stimati dai gol), senza xG il filtro
-  REGRESSION_TRAP non scatta (l'alert lo dice), le quote coprono meno partite (pannello valore in parte vuoto, con una
-  nota). Data layer: `src/dashboard/state.py` (`SECTION_BC`, `SECTION_D`, `sections()`, `section_options()`,
-  `matchdays(state, section)`, `perimeter_text(state, section)`, `serie_d_status`, parametro `section=` su ogni helper
-  di tabella, picks ed export; `None` = tutto il perimetro, il comportamento precedente).
+  (`Perimetro: Serie D 2026/27 Gironi A-I (162 squadre) · …`). Le giornate di Serie D sono costruite dalle sue giornate
+  ufficiali e non spostano quelle di Serie B / Serie C; la giornata, la partita e i filtri scelti sono per sezione
+  (`st.session_state["matchday_d"]`, `fixture_d`, …). Le liste squadre dei nove gironi vengono da FootyStats e si
+  riallineano a ogni aggiornamento; finché non ci sono partite di Serie D nei dati ogni tab mostra un solo avviso con lo
+  stato e il comando di raccolta. Le statistiche di Serie D su FootyStats sono più povere e tutto degrada senza errori:
+  xG e tiri spesso mancano (colonne `-`, λ e μ stimati dai gol), senza xG il filtro REGRESSION_TRAP non scatta,
+  le quote coprono meno partite (pannello valore in parte vuoto, con una nota).
 - **Selettore Competizione**: `Tutti` + l'etichetta breve di ogni competizione configurata della sezione (`Girone A`,
   `Girone B`, `Girone C`, `Serie B`; `D-A` … `D-I` in Serie D); filtra classifica, partite e opportunità.
-- **Classifica Forza**: solo le 80 squadre correnti, colonna *Competizione* = competizione del dizionario 2026/27
-  (`Girone A`, ..., `Serie B`); stesso nome di colonna nel pannello valore e negli alert.
-- **Quote**: ogni CSV in `data/odds/` è un bookmaker come gli altri, compreso quello scritto dall'harvester FootyStats
-  (`bookmaker = FootyStats`, quote pre-match 1X2 / Over-Under / GG-NG): la colonna *Bookmaker* del pannello valore dice
-  da dove viene ogni quota.
-- **Giornata** (`src/engine/tables.py`, `matchday_table`): tutta la giornata in **una tabella**, una riga per partita
-  della giornata scelta e della competizione della sidebar, così il turno si legge in un colpo d'occhio invece di
-  aprire le partite una per una da un menù: forza delle due squadre (α/β), forma delle ultime 5 gare della stagione
-  (`V-P-N-V-V`, punti, gol fatti/subiti), xG prodotti/concessi nelle ultime 3, λ, μ, totale atteso, risultato più
-  probabile, probabilità 1X2 / Over 1.5-2.5-3.5 / GG, quote fair, miglior quota book per esito, EV massimo con la
-  selezione che lo realizza (`X @3.40`) e l'unione dei flag (`REGRESSION_TRAP` / `TRAP:<squadra>` anche senza quote).
-  Cliccando una riga (`st.dataframe`, `selection_mode="single-row"`) si apre sotto il dettaglio della partita —
+- **Classifica Forza**: solo le squadre correnti del dizionario, colonna *Competizione* = competizione del dizionario
+  2026/27 (`Girone A`, ..., `Serie B`); stesso nome di colonna nel pannello valore e negli alert.
+- **Quote**: ogni CSV in `data/odds/` è un bookmaker come gli altri, compreso quello scritto dall'aggiornamento
+  FootyStats (`bookmaker = FootyStats`, quote pre-match 1X2 / Over-Under / GG-NG): la colonna *Bookmaker* del pannello
+  valore dice da dove viene ogni quota.
+- **Giornata corrente: la regola** (`src/engine/calendar.py`): la giornata è quella **ufficiale** (`game_week` di
+  FootyStats), competizione per competizione. Sono candidate le giornate con almeno una partita in programma (non
+  rinviata) con calcio d'inizio non più vecchio di 3 ore (una partita iniziata da meno di 3 ore tiene la giornata
+  candidata); la **giornata corrente** è la più bassa candidata in cui almeno **metà** delle partite con una data non è
+  ancora giocata (le rinviate senza nuova data non contano), oppure che è in corso: qualche partita giocata o iniziata e
+  una partita rimasta nello stesso blocco della settimana (venerdì-lunedì o martedì-giovedì, `week_block`) della
+  maggior parte del turno — un turno in corso resta corrente fino al posticipo del lunedì. Esempi reali: Serie C
+  girone A, 13ª giornata con due partite giocate venerdì 06/11 e otto il 07-08/11 → è la giornata corrente e si vede con
+  tutte e dieci le partite, le due del venerdì con il risultato; Serie D girone G, 10ª giornata con otto partite giocate
+  il 31/10-01/11 e il recupero Trastevere-Anzio mercoledì 11/11 → non è la giornata corrente (lo è l'11ª del fine
+  settimana) e il recupero finisce in **Recuperi e rinvii**; lo stesso per un turno invernale di Serie D con quattro
+  partite giocate, quattro rinviate e una spostata a mercoledì.
+- **Stato di una partita, all'istante della pagina**: `giocata 2-1` (nei dati con il risultato), `da giocare` (calcio
+  d'inizio ancora da venire: le sole partite previste, nelle selezioni e nel pannello valore), `in corso / risultato in
+  attesa` (calcio d'inizio passato ma risultato non ancora nei dati: partita in corso, risultato non ancora pubblicato
+  da FootyStats o dati locali di prima della fine; resta nel suo turno, senza previsione né quote: nessuna giocata
+  pre-partita su una partita iniziata) e `rinviata` (nessun risultato **48 ore** dopo il calcio d'inizio, come
+  Chisola-Borgosesia della 1ª di Serie D girone A, 30/09: resta nella sua giornata con stato `rinviata` e nell'elenco
+  dei rinvii, senza previsione).
+- **Giornata** (tab, `src/engine/tables.py`, `matchday_table`): **ogni partita** delle giornate scelte in una tabella:
+  colonna *Calcio d'inizio* in ora italiana (`sab 07/11 14:30`, conversione da UTC con ora legale/solare; i file senza
+  orario mostrano solo il giorno), colonna *Stato* (`giocata 2-1` con le colonne del modello vuote, `da giocare` con la
+  previsione, `in corso / risultato in attesa` e `rinviata` senza previsione), poi forza (α/β), forma delle ultime 5 gare (`V-P-N-V-V`, punti, gol fatti/subiti), xG delle
+  ultime 3, λ, μ, totale atteso, risultato più probabile, probabilità 1X2 / Over 1.5-2.5-3.5 / GG, quote fair, miglior
+  quota book per esito, EV massimo (`X @3.40`) e l'unione dei flag. Senza competizione nella sidebar la tabella è la
+  giornata scelta (di default la giornata corrente di ogni competizione); con una competizione compare il menù
+  **Giornata n.** con tutte le sue giornate ufficiali (passate e future, `(corrente)` accanto a quella in corso).
+  L'espansore **Recuperi e rinvii** elenca le partite rinviate e i recuperi ancora da giocare fuori dalla giornata
+  corrente con nuova data, data originale (solo per una partita spostata davvero) e probabilità 1X2 / GG del modello;
+  una partita già iniziata senza risultato non è mai un recupero. Cliccando una partita da giocare si apre sotto il dettaglio —
   metriche, matrice dei punteggi, mercati — con il menù *Partita* come alternativa sincronizzata; «Scarica tabella
   giornata (CSV)» esporta la tabella completa (più `match_id`).
 - **Risultati** (`results_table`): una riga per partita giocata della stagione scelta (default quella corrente; il
@@ -488,69 +567,50 @@ scp data/processed/matches.csv data/processed/fixtures.csv utente@server:/percor
   (`12/7`), xG di entrambe, più λ, μ, **P esito** (la probabilità che il modello assegna all'esito avvenuto: lettura a
   posteriori, il modello è stimato anche su quella partita) e **Sorpresa** («sorpresa» sotto il 20%, «atteso» sopra il
   50%). Colonne ordinabili dall'intestazione, «Scarica risultati (CSV)».
-- **Giornata / Opportunità di Valore**: solo partite in programma della stagione corrente fra squadre
-  correnti; le partite datate in un'altra stagione (fixtures stantii dell'anno scorso), con una squadra storica o
-  sconosciuta allo storico sono elencate come saltate in *Dettagli pipeline* (e il tab Giornata lo segnala quando non
-  resta nulla da mostrare).
-- **Fallback simulato** (nessun `data/processed/matches.csv`, o `SERIEC_FORCE_SIMULATE=1`): lega della stagione del
-  dizionario sul suo calendario reale (2026/27: via dal 23/08/2026, una giornata a settimana di domenica; con
-  `SERIEC_SEASON=2025_26` il calendario parte dal 24/08/2025, così le partite «correnti» sono sempre della stagione
-  del dizionario): le giornate con data precedente a `SERIEC_AS_OF` risultano giocate, la prima in data uguale o
-  successiva è il turno da prevedere. Senza `SERIEC_AS_OF` la data è *oggi, risolta a ogni esecuzione*: la posizione
-  nel calendario avanza da sola mentre il server resta acceso (fa parte della chiave di cache). `SERIEC_HISTORY`
-  (0-2, default 2) stagioni sintetiche *precedenti* quella del dizionario (2024/25-2025/26 per il 2026/27) con
-  composizione in parte diversa (squadre storiche reali, Inter U23 nel girone A, Atalanta U23 nel C, Juventus Next
-  Gen nel B) alimentano lo storico; se i nomi storici reali non bastano (12 dei 20 giocano la Serie C 2025/26) il
-  generatore completa con le squadre storiche del dizionario e, in ultima istanza, con club sintetici `Storica 01`, `Storica 02`, ...,
-  mai con un errore. `SERIEC_SIM_ROUNDS=N` fissa invece le giornate giocate. Se una combinazione di variabili è
-  comunque rifiutata dalla pipeline, la pagina mostra l'errore e ripiega sulla configurazione predefinita.
-- **Console (`main.py`)**: `--mode full` segue il calendario come la dashboard (`--as-of AAAA-MM-GG`, default oggi:
-  giornate precedenti giocate, prima giornata uguale o successiva da prevedere; prima del via si simula comunque una
-  giornata, a stagione finita si tiene l'ultima come turno da prevedere) oppure `--rounds N` fissa le giornate
-  giocate (es. `--rounds 30` per il report di recupero dei parametri); `--mode mini` è un'istantanea fissa di inizio
-  stagione (prime 20 partite = giornate 1-3, 4ª giornata da prevedere) e lo dichiara in testa all'output. Opzioni
-  comuni: `--history 0|1|2`, `--season`. Ogni output apre con il perimetro (`Perimetro: Serie C 2026/27 Gironi A/B/C +
-  Serie B (80 squadre) · stagione corrente: N partite · storico: M partite 2024/25-2025/26`, derivato da
-  `config/competitions.toml`) e la posizione nel calendario. La sezione `4) PREVISIONI PROSSIMO TURNO` stampa la
-  prossima giornata come **tabella compatta** (competizione, data, squadre, λ, μ, P1/PX/P2, O2.5, GG, Fair X, Book X,
-  EV max, Flag) invece di una riga di testo per partita; con `--export` scrive anche la tabella completa in
-  `<export>_giornata.csv` e i risultati giocati della stagione corrente (con P esito e Sorpresa) in
-  `<export>_risultati.csv`, accanto al report valore e alle selezioni.
-  **Sezioni a console**: `--section bc|d|all` (default `all`). Le fasi 1-2 (dataset, stima) sono uniche per tutto il
-  perimetro; le fasi 3-8 (ranking per competizione, tabella giornata, valore, alert, selezioni 5 X / 12 GG calcolate
-  dentro la sezione) sono stampate **una volta per sezione**, ognuna con il proprio banner (`SEZIONE SERIE D --
-  Perimetro: Serie D 2026/27 Gironi A-I (162 squadre) · …`). Corrono solo le sezioni con squadre: finché la Serie D non
-  è inizializzata, dopo le sezioni disponibili compare `SEZIONE SERIE D -- non disponibile` con lo stato e il comando
-  di raccolta (con `--season <stagione>` quando la stagione del perimetro non è quella di default, così il comando
-  inizializza proprio il `config/teams_<stagione>.json` nominato); le fasi 1-2 e, in `--mode full`, la verifica dei
-  parametri vengono comunque stampate; `--section d` non stampa alcuna sezione e con `--export` scrive solo il report
-  valore di tutto il perimetro. Con più sezioni i CSV portano il suffisso della sezione
-  (`<export>_bc_giornata.csv`, `<export>_d_giornata.csv`, `_d_selezioni.csv`, `_d_risultati.csv`), il report valore
-  in `--export` copre sempre tutto il perimetro; con una sola sezione i nomi restano quelli di sempre.
-  `--serie-d-demo` (solo `--mode full` simulato) aggiunge al perimetro un dizionario sintetico di Serie D (9 gironi ×
-  18 squadre, `Squadra DA 01` …) così la sezione si può provare offline:
-  `python main.py --mode full --rounds 6 --history 0 --serie-d-demo --section d`.
-- **Giornate** (`src/engine/picks.py`): con FootyStats il file delle partite in programma contiene *tutta* la stagione
-  residua (centinaia di partite con numero di giornata e data), perciò le partite sono raggruppate in «giornate» **per
-  calendario**: ogni turno di ogni competizione è ancorato alla data mediana delle sue partite (il giorno in cui se ne
-  gioca la maggior parte) e i turni delle varie competizioni ancorati nello stesso blocco della settimana calcistica
-  — fine settimana venerdì-lunedì oppure turno infrasettimanale martedì-giovedì (`week_block`) — formano una giornata,
-  etichettata con l'intervallo di date e i numeri di turno (`Giornata del 7-9 nov 2026 · Girone A g.14, Girone B
-  g.14, Girone C g.14, Serie B g.13`). Così la Serie B in sosta per le nazionali manca semplicemente da quella
-  giornata senza spostare gli accoppiamenti delle settimane seguenti, e due turni della stessa competizione nello
-  stesso blocco aprono due giornate. I recuperi (turni con meno della metà delle partite di un turno tipico, cioè
-  meno di 5 su 10, qualunque sia la data: anche il recupero infrasettimanale che precede il turno del fine settimana)
-  e le partite di un turno regolare oltre 7 giorni dalla sua data mediana sono aggregati alla giornata più vicina per
-  data. La tabella del tab *Giornata*, il pannello valore (con la casella «Mostra tutte le giornate») e le
-  selezioni usano di default la **prossima** giornata; la scelta nel tab *Selezioni di giornata* vale per tutti e tre
-  i tab (`st.session_state["matchday"]`). Gli export CSV restano completi.
+- **Previsioni e valore**: solo partite in programma della stagione corrente fra squadre correnti; le partite datate in
+  un'altra stagione (fixtures stantii dell'anno scorso), con una squadra storica o sconosciuta allo storico sono
+  elencate come saltate in *Dettagli pipeline*.
+- **Giornate** (`src/engine/picks.py`, `matchdays`): la **prima giornata** è l'unione della giornata corrente di ogni
+  competizione, qualunque sia il numero (Serie B all'11ª, gironi di Serie C alla 13ª) e con le partite già giocate; le
+  **successive** raggruppano i turni seguenti giocati nello stesso blocco della settimana calcistica (così la Serie B in
+  sosta per le nazionali manca da quella giornata senza spostare gli accoppiamenti seguenti, e due turni della stessa
+  competizione nello stesso blocco aprono due giornate). L'etichetta riporta date e numeri ufficiali (`Giornata del 6-9
+  nov 2026 · Girone A g.13, Girone B g.13, Girone C g.13, Serie B g.11`). **I recuperi non spostano mai una giornata**:
+  rinvii, recuperi di turni già giocati e partite riprogrammate a più di 7 giorni dal loro turno sono elencati a parte
+  (Recuperi e rinvii). La tabella del tab *Giornata*, il pannello valore (con la casella «Mostra tutte le giornate») e
+  le selezioni usano di default la giornata corrente; la scelta nel tab *Selezioni di giornata* vale per tutti e tre i
+  tab (`st.session_state["matchday"]`). Gli export CSV restano completi.
 - **Selezioni di giornata** (tab omonimo e sezione `8) SELEZIONI DI GIORNATA` della console): per la giornata scelta,
-  le **5 partite più probabili da X** e le **12 partite più probabili da GG** fra le competizioni della sezione
-  (Serie B e Serie C gironi A/B/C insieme, oppure i nove gironi di Serie D insieme),
+  fra le sole partite **ancora da giocare** (calcio d'inizio non ancora passato: una partita iniziata esce dalle liste,
+  dal pannello valore e dall'export delle previsioni), le **5 partite più probabili da X** e le **12 partite più probabili da GG**
+  fra le competizioni della sezione (Serie B e Serie C gironi A/B/C insieme, oppure i nove gironi di Serie D insieme),
   ordinate solo per probabilità del modello, con quota fair, miglior quota book, bookmaker, EV e flag quando una
   quota esiste, più una nota («lambda e mu vicini», «pochi gol attesi», «xG attese alte», «entrambi gli attacchi sopra
   1.2 gol attesi»). Le dimensioni si cambiano con i controlli *N risultati X* / *N partite GG* (console: `--n-draws`,
   `--n-btts`); un solo CSV scarica entrambe le liste (console: `<export>_selezioni.csv` accanto al report valore).
+- **Console (`main.py`)**: `python main.py --footystats` scarica prima i dati reali con la chiave (`.env` o ambiente;
+  restano in `data/processed` / `data/odds`), stampa l'esito (competizioni saltate, differenze del dizionario) e lavora
+  su quei dati; `--processed <matches.csv> --fixtures <fixtures.csv> --odds <cartella>` usa CSV già raccolti; per i dati
+  reali la giornata corrente è valutata adesso (o a mezzanotte di `--as-of AAAA-MM-GG`). **Senza** una delle due
+  opzioni la console gira su una lega **simulata** e lo dichiara: la **prima e l'ultima riga** dell'output sono
+  `DATI SIMULATI: squadre, calendari e risultati inventati. Non usare per scommettere.` e i CSV di `--export` si
+  chiamano `DEMO_<nome>` (`reports/DEMO_value_report.csv`, `DEMO_value_report_selezioni.csv`, …) con la prima colonna
+  `AVVISO` = `DATI SIMULATI - NON USARE PER SCOMMETTERE`. `--mode full` simulato segue
+  il calendario (`--as-of`, default oggi) oppure `--rounds N` fissa le giornate giocate (es. `--rounds 30` per il
+  report di recupero dei parametri); `--mode mini` è un'istantanea fissa di inizio stagione (prime 20 partite = giornate
+  1-3, 4ª giornata da prevedere). Opzioni comuni: `--history 0|1|2`, `--season`. La sezione `4) PREVISIONI PROSSIMO
+  TURNO` stampa la giornata corrente come **tabella compatta** (competizione, data, calcio d'inizio, squadre, stato, λ,
+  μ, P1/PX/P2, O2.5, GG, Fair X, Book X, EV max, Flag) con il conteggio di partite giocate / da giocare / in corso /
+  rinviate (la sezione 5 esclude le quote delle partite già iniziate); con
+  `--export` scrive anche la tabella completa in `<export>_giornata.csv` e i risultati giocati della stagione corrente
+  (con P esito e Sorpresa) in `<export>_risultati.csv`, accanto al report valore e alle selezioni.
+  **Sezioni a console**: `--section bc|d|all` (default `all`). Le fasi 1-2 (dataset, stima) sono uniche per tutto il
+  perimetro; le fasi 3-8 (ranking per competizione, tabella giornata, valore, alert, selezioni 5 X / 12 GG calcolate
+  dentro la sezione) sono stampate **una volta per sezione**, ognuna con il proprio banner (`SEZIONE SERIE D --
+  Perimetro: Serie D 2026/27 Gironi A-I (162 squadre) · …`). Corrono solo le sezioni con squadre; con più sezioni i CSV
+  portano il suffisso della sezione (`<export>_bc_giornata.csv`, `<export>_d_giornata.csv`, `_d_selezioni.csv`,
+  `_d_risultati.csv`), il report valore in `--export` copre sempre tutto il perimetro. `--serie-d-demo` (solo
+  `--mode full` simulato) aggiunge un dizionario sintetico di Serie D (9 gironi × 18 squadre, `Squadra DA 01` …).
 - **Legenda** (tab omonimo, ultimo): il glossario qui sotto, generato da `src/dashboard/legend.py`
   (`legend_markdown()`), con un esempio svolto («Come leggere una riga del pannello valore») su una riga del pannello
   valore così come è filtrato in quel momento (giornata scelta o tutte, competizione della sidebar, soglia EV): la
@@ -586,7 +646,12 @@ Glossario di tutti i numeri mostrati da dashboard, console ed export, scritto pe
 
 ### Tabella giornata e risultati
 
-- **Tabella giornata (tab Giornata)** — una riga per ogni partita della giornata scelta (tutte le competizioni o quella della sidebar): forza delle due squadre (α, β), forma recente, gol attesi del modello, risultato più probabile, probabilità e quote fair dei mercati, miglior quota book per esito, EV migliore e flag. Tutto il turno si legge in un colpo d'occhio; cliccando una riga (o scegliendo la gara nel menù «Partita») sotto compaiono la matrice dei punteggi e i mercati di quella partita. «Scarica tabella giornata (CSV)» ha le stesse colonne più match_id.
+- **Tabella giornata (tab Giornata)** — una riga per **ogni partita** della giornata ufficiale di ogni competizione (tutte le competizioni della sezione o quella della sidebar): le partite già giocate con il risultato finale, quelle da giocare con orario e previsione del modello (forza α/β, forma recente, gol attesi, risultato più probabile, probabilità e quote fair dei mercati, miglior quota book per esito, EV migliore e flag), quelle già iniziate senza risultato nei dati e quelle rinviate. Tutto il turno si legge in un colpo d'occhio, anche quando una parte è già stata giocata il venerdì; cliccando una partita da giocare (o scegliendola nel menù «Partita») sotto compaiono la matrice dei punteggi e i mercati di quella partita. «Scarica tabella giornata (CSV)» ha le stesse colonne più match_id.
+- **Giornata corrente** — la giornata ufficiale (game_week di FootyStats) che si sta giocando o che sta per iniziare, competizione per competizione: la più bassa che ha ancora almeno una partita in programma (calcio d'inizio non più vecchio di 3 ore: una partita iniziata da meno di 3 ore tiene la giornata corrente) e in cui almeno metà delle partite con una data non è ancora giocata (le rinviate senza nuova data non contano), oppure che è in corso: qualche partita giocata o iniziata e una partita rimasta nello stesso blocco della settimana (venerdì-lunedì o martedì-giovedì) della maggior parte del turno. Così un turno con due partite giocate il venerdì e otto nel fine settimana resta la giornata corrente, con tutte e dieci le partite; un turno di cui resta solo un recupero infrasettimanale no (anche se altre partite sono rinviate): la giornata corrente è la successiva e il recupero va in «Recuperi e rinvii».
+- **Calcio d'inizio** — giorno e ora della partita in ora italiana, «sab 07/11 14:30» (FootyStats dà l'orario in UTC: il passaggio fra ora legale e solare è già considerato). Le partite giocate e i file senza orario mostrano solo il giorno, «ven 06/11».
+- **Stato · giocata / da giocare / in corso / rinviata** — «giocata 2-1» = partita già disputata, con il risultato finale e le colonne del modello vuote (non si prevede il passato); «da giocare» = calcio d'inizio ancora da venire, con la previsione: sono le sole partite delle selezioni e del pannello valore; «in corso / risultato in attesa» = il calcio d'inizio è passato ma il risultato non è ancora nei dati (partita in corso, FootyStats non l'ha ancora pubblicato o i dati locali sono di prima della fine): resta nel suo turno, senza previsione e senza quote, perché una giocata pre-partita su una partita iniziata non ha senso; «rinviata» = nessun risultato 48 ore dopo il calcio d'inizio e recupero non ancora fissato: niente previsione finché non ha una nuova data.
+- **Giornata n. (una competizione)** — con una sola competizione scelta nella sidebar compare il menù «Giornata n.»: mostra qualsiasi giornata ufficiale di quella competizione, passata o futura, con tutte le sue partite; «(corrente)» indica la giornata corrente.
+- **Recuperi e rinvii** — l'elenco, sotto la tabella, delle partite rinviate e dei recuperi ancora da giocare fissati fuori dalla giornata corrente della loro competizione (per esempio un recupero del mercoledì di un turno già giocato), con la nuova data e, per una partita spostata davvero, la data originale (il giorno in cui si giocava il resto del turno). Non spostano mai la giornata e non entrano nelle selezioni di giornata; per quelle in programma sono indicate le probabilità 1X2 e GG del modello. Una partita già iniziata senza risultato non è un recupero: resta nel suo turno come «in corso / risultato in attesa».
 - **Forma (Casa / Ospiti)** — gli esiti delle ultime 5 partite giocate dalla squadra nella stagione corrente, casa e trasferta insieme, dalla più recente alla più vecchia: V vittoria, N pareggio (nullo), P sconfitta. «V-V-N-P-N» = ha vinto le ultime due. Meno di 5 lettere = ha giocato meno di 5 partite; vuota = nessuna partita giocata.
 - **Pt (5)** — punti raccolti nelle stesse ultime 5 partite (3 per vittoria, 1 per pareggio): da 0 a 15; il numero fra parentesi nel nome della colonna è la finestra. Non è la classifica: misura il momento di forma, che il modello non usa direttamente (α e β pesano tutta la stagione, più lo storico).
 - **GF/GS (5)** — gol fatti / gol subiti nelle ultime 5 partite: «9/4» = 9 segnati e 4 subiti. Confrontalo con λ e μ: una squadra che segna molto più di quanto il modello si aspetti sta sovra-performando (o il modello la sottovaluta), una che subisce poco con tanti xG contro è candidata alla trappola di regressione.
@@ -627,7 +692,7 @@ Glossario di tutti i numeri mostrati da dashboard, console ed export, scritto pe
 
 ### Selezioni di giornata (tab Selezioni di giornata)
 
-- **Giornata** — i turni delle competizioni della sezione scelta (Serie B e i tre gironi di Serie C, oppure i nove gironi di Serie D) giocati nello stesso blocco della settimana calcistica: fine settimana (venerdì-lunedì) oppure turno infrasettimanale (martedì-giovedì). Ogni turno è ancorato alla data in cui si gioca la maggior parte delle sue partite, i numeri di giornata possono differire (Serie B alla 13ª, gironi di Serie C alla 14ª) e una competizione che in quel blocco non gioca (Serie B in sosta per le nazionali) semplicemente manca dall'etichetta. I recuperi di turni passati (poche partite con un numero di giornata vecchio) sono aggregati alla giornata più vicina per data. Le giornate di Serie D sono raggruppate a parte, dal suo calendario: non spostano quelle di Serie B e Serie C.
+- **Giornata** — la giornata corrente di ogni competizione della sezione scelta (Serie B e i tre gironi di Serie C, oppure i nove gironi di Serie D), messe insieme qualunque sia il loro numero (Serie B all'11ª, gironi di Serie C alla 13ª) e con le partite già giocate incluse; le giornate successive raggruppano i turni seguenti giocati nello stesso blocco della settimana calcistica: fine settimana (venerdì-lunedì) oppure turno infrasettimanale (martedì-giovedì). Una competizione che in quel blocco non gioca (Serie B in sosta per le nazionali) manca dall'etichetta. Le liste X e GG considerano solo le partite ancora da giocare (calcio d'inizio non ancora passato: una partita iniziata esce dalle liste e dal pannello valore); rinvii e recuperi fuori turno non spostano la giornata (sono in «Recuperi e rinvii»). Le giornate di Serie D sono raggruppate a parte, dal suo calendario: non spostano quelle di Serie B e Serie C.
 - **Le 5 partite più probabili da X** — fra tutte le partite della giornata della sezione scelta (Serie B e Serie C gironi A, B e C insieme, oppure i nove gironi di Serie D insieme), le cinque con la probabilità di pareggio più alta secondo il modello. Ordinate **solo per probabilità**, non per valore: una X al 33% a quota 2.90 (EV −4%) sta in lista anche se non conviene. Nota «lambda e mu vicini» = squadre equilibrate, «pochi gol attesi» = gara chiusa: entrambe spingono il pareggio.
 - **Le 12 partite più probabili da GG** — le dodici partite della giornata, su tutte le competizioni della sezione, con la probabilità più alta che entrambe le squadre segnino. Stesso criterio: solo probabilità del modello. Nota «xG attese alte» = tanti gol attesi in totale, «entrambi gli attacchi sopra 1.2 gol attesi» = nessuna delle due dovrebbe restare a secco.
 - **«Più probabile» non è «conveniente»** — la probabilità dice quante volte l'esito accade, la quota dice quanto paga: un GG al 65% pagato 1.45 (fair 1.54) perde soldi nel lungo periodo, un GG al 55% pagato 2.00 (fair 1.82) li guadagna. Le colonne Quota Fair, Quota Book ed EV sono lì per questo: incrocia sempre la lista con la quota e con l'EV prima di puntare, e dà la precedenza alle righe che compaiono anche nel pannello valore.
@@ -635,10 +700,12 @@ Glossario di tutti i numeri mostrati da dashboard, console ed export, scritto pe
 
 ### Dati e limiti
 
-- **Dati simulati vs reali** — il badge nella sidebar dice quale sta usando la dashboard. «Dati simulati» = lega sintetica generata dal programma per provare l'interfaccia (squadre vere, risultati inventati, quote del bookmaker fittizio SimBook): **non usarli per scommettere**. «Dati reali» = partite, calendario e quote raccolti da FootyStats in data/processed e data/odds.
+- **Dati simulati vs reali** — la dashboard mostra solo dati reali FootyStats, scaricati con la tua chiave: il badge della sidebar dice «Dati reali FootyStats». Senza dati non mostra numeri ma una pagina iniziale che spiega cosa manca e come configurare la chiave. La lega simulata (squadre vere, calendari, risultati e quote del bookmaker fittizio SimBook inventati) esiste solo come demo esplicita, avviata con SERIEC_DEMO=1: allora ogni pagina ha in cima l'avviso rosso «DATI SIMULATI: squadre, calendari e risultati inventati. Non usare per scommettere.» e il badge dice «Demo»; ogni CSV scaricato dalla demo si chiama DEMO_... e ha come prima colonna AVVISO = «DATI SIMULATI - NON USARE PER SCOMMETTERE». **Non usare mai la demo per scommettere.**
+- **Aggiornamento dei dati FootyStats** — all'avvio, se la chiave è configurata e i dati locali mancano o hanno più di 6 ore, la dashboard li scarica di nuovo da FootyStats (partite delle ultime 3 stagioni, calendario con orari e rinvii, quote) e allinea il dizionario squadre; la sidebar dice «Dati FootyStats aggiornati alle HH:MM del gg/mm» e il pulsante «Aggiorna dati ora» li riscarica subito. Una competizione che non si può scaricare (lega non scelta sull'account, errore di rete, anche solo per la stagione in corso) è segnalata con un avviso e tiene i dati precedenti; le altre si aggiornano. Finché i dati restano più vecchi di 6 ore (chiave mancante, aggiornamento non riuscito) un avviso giallo in cima alla pagina ne dice l'età e il motivo, e un altro avviso resta per ogni competizione ferma ai dati di un download precedente. Le differenze del dizionario squadre sono in «Dettagli pipeline».
+- **Chiave FootyStats e dati locali** — la chiave non va mai pubblicata: in locale sta nel file .env (FOOTYSTATS_API_KEY=...), su Streamlit Cloud in App settings → Secrets (FOOTYSTATS_API_KEY = "..."). I dati scaricati restano solo in data/processed e data/odds sul tuo computer o sul server dell'app: non sono nel repository pubblico, perché i dati FootyStats sono in licenza al tuo account.
 - **Storico di 3 stagioni** — il modello è stimato sulla stagione in corso più le due precedenti; le partite vecchie contano meno (ξ). Le squadre presenti solo nello storico (retrocesse, promosse, escluse) restano nella stima come avversarie ma non compaiono in classifica, previsioni e valore.
-- **Squadre storiche e perimetro** — il perimetro è il dizionario squadre della stagione (config/teams_<stagione>.json): le 80 squadre di Serie C A/B/C e Serie B, più le 162 di Serie D quando la sezione è inizializzata. Una partita in programma con una squadra fuori perimetro o datata in un'altra stagione viene saltata e segnalata in «Dettagli pipeline».
-- **Serie D (sezione dedicata)** — il selettore «Sezione» della sidebar separa Serie B e Serie C da Serie D: nove gironi (A-I) di 18 squadre, 34 giornate ciascuno, codici DA-DI. La stima Dixon-Coles è unica per tutto il perimetro (le squadre promosse e retrocesse collegano le divisioni; fattore campo e Σα = 0 per competizione tengono i gironi confrontabili), ma classifica, giornate, risultati, valore, selezioni ed export mostrano solo la sezione scelta e le liste X / GG sono calcolate dentro la sezione. Le liste squadre dei gironi non sono nel codice: la prima raccolta FootyStats con la chiave le inizializza dall'API (python -m src.ingestion.footystats --competitions DA DB DC DD DE DF DG DH DI --seasons 3, oppure avvia.bat), e fino ad allora la sezione mostra solo questo avviso. Le statistiche di Serie D su FootyStats sono più povere: xG e tiri spesso mancano (colonne «-», λ e μ restano stimati dai gol), senza xG il filtro REGRESSION_TRAP non può scattare, e le quote coprono meno partite (pannello valore in parte vuoto): leggi gli EV di Serie D con prudenza ancora maggiore.
+- **Squadre storiche e perimetro** — il perimetro è il dizionario squadre della stagione (config/teams_<stagione>.json), allineato alle liste squadre di FootyStats a ogni aggiornamento: le 80 squadre di Serie C A/B/C e Serie B più le 162 dei nove gironi di Serie D. Una partita in programma con una squadra fuori perimetro o datata in un'altra stagione viene saltata e segnalata in «Dettagli pipeline».
+- **Serie D (sezione dedicata)** — il selettore «Sezione» della sidebar separa Serie B e Serie C da Serie D: nove gironi (A-I) di 18 squadre, 34 giornate ciascuno, codici DA-DI. La stima Dixon-Coles è unica per tutto il perimetro (le squadre promosse e retrocesse collegano le divisioni; fattore campo e Σα = 0 per competizione tengono i gironi confrontabili), ma classifica, giornate, risultati, valore, selezioni ed export mostrano solo la sezione scelta e le liste X / GG sono calcolate dentro la sezione. Le liste squadre dei gironi vengono da FootyStats e si riallineano a ogni aggiornamento dei dati; finché non ci sono partite di Serie D nei dati la sezione mostra solo un avviso con il comando di raccolta (python -m src.ingestion.footystats --competitions DA DB DC DD DE DF DG DH DI --seasons 3). Le statistiche di Serie D su FootyStats sono più povere: xG e tiri spesso mancano (colonne «-», λ e μ restano stimati dai gol), senza xG il filtro REGRESSION_TRAP non può scattare, e le quote coprono meno partite (pannello valore in parte vuoto): leggi gli EV di Serie D con prudenza ancora maggiore.
 - **Copertura minima** — sotto le 15 partite giocate per squadra nella competizione meno coperta la prior resta attiva; sotto le 5-6 le stime sono comunque fragili e gli EV vanno letti con sospetto (le quote dei book incorporano già informazioni che il modello non ha ancora visto).
 - **Prime giornate** — nelle prime 3-4 giornate il modello si regge quasi solo sullo storico e sulla prior: usalo per orientarti (gol attesi, squadre equilibrate), punta poco o niente sulle sole indicazioni di valore e aspetta che la copertura cresca. Il filtro REGRESSION_TRAP ha bisogno di 3 gare giocate per squadra.
 - **Quote e tempi** — le quote cambiano fino al calcio d'inizio: un EV calcolato su quote di ieri può non esistere più oggi. Confronta la quota presa con quella di chiusura (closing line): batterla stabilmente è il segnale più affidabile che il modello vede qualcosa.

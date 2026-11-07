@@ -11,6 +11,8 @@ import pandas as pd
 import pytest
 
 from src.common.schemas import Fixture, Girone, Market, OddsQuote, validate_matches_df
+from src.common.teams import TeamRegistry, load_registry
+from src.engine.calendar import RoundMatch, round_view
 from src.engine.model import DixonColesConfig, DixonColesEngine, dixon_coles_pmf, markets_from_matrix
 from src.engine.picks import next_matchday
 from src.engine.tables import (
@@ -21,6 +23,7 @@ from src.engine.tables import (
     MATCHDAY_COLUMNS,
     MISSING_TEXT,
     P_OUTCOME_DECIMALS,
+    RECOVERIES_COLUMNS,
     RESULT_DRAW,
     RESULT_LOSS,
     RESULT_WIN,
@@ -36,6 +39,7 @@ from src.engine.tables import (
     matchday_table,
     outcome_probabilities,
     p_outcome_percent,
+    recoveries_table,
     results_table,
     surprise_tag,
     team_form,
@@ -45,6 +49,12 @@ from src.engine.value import FLAG_REGRESSION_TRAP, TRAP_FLAG_PREFIX, ValueEngine
 from src.simulation.generator import inject_regression_trap, simulate_history, simulate_league
 
 AS_OF = date(2026, 11, 6)
+
+
+def bc_registry() -> TeamRegistry:
+    """The Serie B and Serie C part of the shipped 2026/27 dictionary (80 teams): the simulated perimeter of these tests."""
+    full = load_registry()
+    return TeamRegistry.from_teams(full.season, {g.value: full.teams_by_girone[g] for g in full.gironi if g.family in ("Serie C", "Serie B")})
 
 
 # ----------------------------------------------------------------------------- hand-built frame
@@ -152,7 +162,7 @@ def league() -> dict:
     One Girone A team of the next round gets the regression trap; the engine is
     fitted once; opportunities come from the value engine on the synthetic odds.
     """
-    sim = simulate_league(seed=7, as_of=AS_OF)
+    sim = simulate_league(seed=7, registry=bc_registry(), as_of=AS_OF)
     first_a = next(f for f in sim.fixtures if f.girone == Girone.A)
     trap_team = first_a.home_team
     current = inject_regression_trap(sim.matches, trap_team)
@@ -282,7 +292,8 @@ def test_matchday_table_girone_and_matchday_filters_and_empty(league: dict) -> N
     assert len(matchday_table([*league["predictions"], far], **kwargs)) == 41
     empty = matchday_table([], **kwargs)
     assert empty.empty and list(empty.columns) == list(MATCHDAY_COLUMNS) and str(empty["Data"].dtype).startswith("datetime64")
-    assert list(matchday_columns(3, 2))[11:17] == ["Pt Casa (3)", "Pt Ospiti (3)", "GF/GS Casa (3)", "GF/GS Ospiti (3)", "xG F/S Casa (2)", "xG F/S Ospiti (2)"]
+    assert list(matchday_columns(3, 2))[13:19] == ["Pt Casa (3)", "Pt Ospiti (3)", "GF/GS Casa (3)", "GF/GS Ospiti (3)", "xG F/S Casa (2)", "xG F/S Ospiti (2)"]
+    assert list(matchday_columns())[:7] == ["Competizione", "Data", "Calcio d'inizio", "Giornata", "Casa", "Ospiti", "Stato"]
     custom = matchday_table(league["predictions"], form_n=3, xg_n=2, **kwargs)
     assert list(custom.columns) == list(matchday_columns(3, 2)) and custom["Forma Casa"].str.count("-").eq(2).all()
     with pytest.raises(ValueError):
@@ -427,10 +438,10 @@ def test_tables_are_fast_on_a_full_league(league: dict) -> None:
     assert len(matches) == 3040 + 440
     engine = DixonColesEngine(DixonColesConfig(xi=0.0))
     params = engine.fit(matches, registry=sim.registry)
-    fixtures = [f for k in range(11, 15) for f in simulate_league(seed=7, n_rounds=k).fixtures]
+    fixtures = [f for k in range(11, 15) for f in simulate_league(seed=7, registry=sim.registry, n_rounds=k).fixtures]
     assert len(fixtures) == 160 and len({f.match_id for f in fixtures}) == 160
     predictions = engine.predict_fixtures(fixtures)
-    quotes = [q for k in range(11, 15) for q in simulate_league(seed=7, n_rounds=k).odds]
+    quotes = [q for k in range(11, 15) for q in simulate_league(seed=7, registry=sim.registry, n_rounds=k).odds]
     opportunities = league["value_engine"].evaluate(predictions, quotes, matches=league["current"], traps=league["traps"])
     started = time.perf_counter()
     table = matchday_table(predictions, params=params, matches=matches, opportunities=opportunities, traps=league["traps"])
@@ -466,3 +477,96 @@ def test_tables_restrict_to_a_set_of_competitions(league: dict) -> None:
     assert len(mine) == 11 and ((mine["Casa"] == team) | (mine["Ospiti"] == team)).all()
     assert results_table(league["matches"], season="2026/27", team=team, gironi=["A"]).empty
     assert list(results_table(league["matches"], gironi=[]).columns) == list(RESULTS_COLUMNS)
+
+
+# ----------------------------------------------------------------------------- every match of the round (played, to play, postponed)
+def test_round_table_lists_every_match_with_kickoff_and_status(league: dict) -> None:
+    """The current round with two matches already played on Friday: every match is a row, predictions only for those to play."""
+    from datetime import UTC, datetime
+
+    sim, current = league["sim"], league["current"]
+    a12 = [f for f in sim.fixtures if f.girone == Girone.A]
+    # the first two Girone A matches of round 12 were played on Friday 13/11; one is postponed; the others have a kick-off time
+    friday = date(2026, 11, 13)
+    played = pd.concat(
+        [
+            current,
+            pd.DataFrame(
+                [
+                    {"match_id": f.match_id, "date": pd.Timestamp(friday), "round": 12, "girone": "A", "home_team": f.home_team, "away_team": f.away_team, "home_goals": hg, "away_goals": ag}
+                    for f, (hg, ag) in zip(a12[:2], [(2, 1), (0, 0)])
+                ]
+            ),
+        ],
+        ignore_index=True,
+    )
+    timed = [
+        Fixture(f.match_id, f.date, f.round, f.girone, f.home_team, f.away_team, kickoff=datetime(2026, 11, 14 + (i % 2), 13, 30, tzinfo=UTC), status="postponed" if i == 9 else "scheduled")
+        for i, f in enumerate(a12)
+        if i >= 2
+    ]
+    view = round_view(Girone.A, 12, played, timed)
+    assert (view.n_played, view.n_to_play, view.n_postponed) == (2, 7, 1)
+    table = matchday_table(league["predictions"], params=league["params"], matches=league["current"], opportunities=league["opportunities"], traps=league["traps"], rounds=[view])
+    assert list(table.columns) == list(MATCHDAY_COLUMNS) and len(table) == 10 and table["Giornata"].eq(12).all()
+    # chronological: the Friday rows first (date only), then Saturday 14:30 and Sunday 14:30 in Rome
+    assert table["Stato"].tolist()[:2] in (["giocata 2-1", "giocata 0-0"], ["giocata 0-0", "giocata 2-1"])
+    assert table["Calcio d'inizio"].tolist()[:2] == ["ven 13/11", "ven 13/11"]
+    to_play = table[table["Stato"] == "da giocare"]
+    assert len(to_play) == 7 and set(to_play["Calcio d'inizio"]) <= {"sab 14/11 14:30", "dom 15/11 14:30"}
+    assert to_play["P1 (%)"].notna().all() and to_play["λ"].notna().all() and to_play["EV max (%)"].notna().all()
+    blank = table[table["Stato"] != "da giocare"]
+    assert len(blank) == 3 and blank["P1 (%)"].isna().all() and blank["λ"].isna().all() and blank["Book X"].isna().all()
+    assert blank["Ris. prob."].eq("").all() and blank["Miglior EV"].eq("").all() and blank["Flag"].eq("").all()
+    assert (table["Stato"] == "rinviata").sum() == 1 and blank["α Casa"].notna().all(), "the teams' strengths stay visible"
+    assert table["Data"].is_monotonic_increasing
+    # the girone filter still applies to round views, and a matchday built by matchdays() carries them
+    assert matchday_table(league["predictions"], params=league["params"], matches=league["current"], rounds=[view], girone=Girone.B).empty
+    day = next_matchday(timed, played=played)
+    assert day is not None and day.rounds == {Girone.A: 12} and day.n_played == 2
+    by_day = matchday_table(league["predictions"], params=league["params"], matches=league["current"], matchday=day)
+    assert len(by_day) == 10 and set(by_day["match_id"]) == view.match_ids
+    # a fixture the fit cannot predict is still a row, with blank model columns
+    unknown = Fixture("X-1", date(2026, 11, 15), 12, Girone.A, "Nuova Squadra", a12[2].away_team, kickoff=datetime(2026, 11, 15, 13, 30, tzinfo=UTC))
+    extended = round_view(Girone.A, 12, played, [*timed, unknown])
+    row = matchday_table(league["predictions"], params=league["params"], matches=league["current"], rounds=[extended]).set_index("match_id").loc["X-1"]
+    assert row["Stato"] == "da giocare" and math.isnan(row["P1 (%)"]) and math.isnan(row["α Casa"])
+
+
+def test_round_table_shows_kicked_off_matches_in_play_without_predictions(league: dict) -> None:
+    """Regression: a match that kicked off stayed 'da giocare' with pre-match numbers; now it is 'in corso / risultato in attesa', blank."""
+    from datetime import UTC, datetime
+
+    from src.engine.calendar import IN_PLAY_TEXT
+
+    sim = league["sim"]
+    a12 = [f for f in sim.fixtures if f.girone == Girone.A]
+    timed = [
+        Fixture(f.match_id, f.date, f.round, f.girone, f.home_team, f.away_team, kickoff=datetime(2026, 11, 14 + (i % 2), 13, 30, tzinfo=UTC))
+        for i, f in enumerate(a12)
+    ]
+    saturday_ids = {f.match_id for i, f in enumerate(timed) if i % 2 == 0}
+    view = round_view(Girone.A, 12, league["current"], timed, now=datetime(2026, 11, 14, 15, 0, tzinfo=UTC))
+    assert view.n_in_play == 5 and view.n_to_play == 5 and view.fixture_ids == {f.match_id for f in timed} - saturday_ids
+    table = matchday_table(league["predictions"], params=league["params"], matches=league["current"], opportunities=league["opportunities"], traps=league["traps"], rounds=[view])
+    assert len(table) == 10 and (table["Stato"] == IN_PLAY_TEXT).sum() == 5 and (table["Stato"] == "da giocare").sum() == 5
+    in_play = table[table["Stato"] == IN_PLAY_TEXT]
+    assert set(in_play["match_id"]) == saturday_ids and set(in_play["Calcio d'inizio"]) == {"sab 14/11 14:30"}
+    assert in_play["P1 (%)"].isna().all() and in_play["λ"].isna().all() and in_play["EV max (%)"].isna().all() and in_play["Flag"].eq("").all()
+    assert table.loc[table["Stato"] == "da giocare", "P1 (%)"].notna().all()
+
+
+def test_recoveries_table_columns_dates_and_probabilities(league: dict) -> None:
+    preds = league["predictions"]
+    first = preds[0].fixture
+    rescheduled = RoundMatch(first.match_id, first.girone, 9, first.date, None, first.home_team, first.away_team, "da giocare", original_date=date(2026, 10, 25))
+    postponed = RoundMatch("P-1", Girone.B, 3, date(2026, 9, 20), None, "H", "O", "rinviata", original_date=date(2026, 9, 20))
+    table = recoveries_table([postponed, rescheduled], preds)
+    assert list(table.columns) == list(RECOVERIES_COLUMNS) and len(table) == 2
+    assert table.loc[0, "Data originale"] == "dom 20/09" and table.loc[0, "Nuova data"] == "da definire" and table.loc[0, "Stato"] == "rinviata"
+    assert math.isnan(table.loc[0, "P1 (%)"])
+    assert table.loc[1, "Data originale"] == "dom 25/10" and table.loc[1, "Partita"] == first.label and table.loc[1, "Giornata"] == 9
+    p = preds[0].probabilities
+    assert table.loc[1, "PX (%)"] == round(p[Market.MATCH_ODDS]["X"] * 100, 1) and table.loc[1, "GG (%)"] == round(p[Market.BTTS]["GG"] * 100, 1)
+    empty = recoveries_table([])
+    assert empty.empty and list(empty.columns) == list(RECOVERIES_COLUMNS)

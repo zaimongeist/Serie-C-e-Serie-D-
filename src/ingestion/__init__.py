@@ -1,4 +1,4 @@
-"""Ingestion layer: async harvesters for FootyStats (official API), SofaScore / FotMob and team-name matching.
+"""Ingestion layer: FootyStats (official API, single source of truth for teams and calendars), SofaScore / FotMob and team-name matching.
 
 Public names are re-exported lazily (PEP 562) so that importing the package is
 cheap and ``python -m src.ingestion.harvester`` does not import the harvester
@@ -11,9 +11,12 @@ from typing import Any
 
 _EXPORTS: dict[str, str] = {
     "DEFAULT_USER_AGENTS": "src.ingestion.harvester",
+    "FIXTURE_COLUMNS": "src.ingestion.harvester",
     "ODDS_COLUMNS": "src.ingestion.harvester",
+    "REQUIRED_FIXTURE_COLUMNS": "src.ingestion.harvester",
     "PROVIDER_NAMES": "src.ingestion.harvester",
     "AsyncHarvesterClient": "src.ingestion.harvester",
+    "CachedPayload": "src.ingestion.harvester",
     "ClientStats": "src.ingestion.harvester",
     "EndpointsConfig": "src.ingestion.harvester",
     "FootyStatsEndpoints": "src.ingestion.harvester",
@@ -41,6 +44,11 @@ _EXPORTS: dict[str, str] = {
     "save_odds": "src.ingestion.harvester",
     "save_processed": "src.ingestion.harvester",
     "season_label_from_year": "src.ingestion.harvester",
+    "DEFAULT_MAPPING_PATH": "src.ingestion.footystats",
+    "IN_PLAY_WINDOW": "src.ingestion.footystats",
+    "LEGACY_MAPPING_PATH": "src.ingestion.footystats",
+    "SYNC_METHOD": "src.ingestion.footystats",
+    "CompetitionSync": "src.ingestion.footystats",
     "FootyStatsClient": "src.ingestion.footystats",
     "FootyStatsError": "src.ingestion.footystats",
     "FootyStatsHarvest": "src.ingestion.footystats",
@@ -48,20 +56,27 @@ _EXPORTS: dict[str, str] = {
     "FootyStatsTeamMapper": "src.ingestion.footystats",
     "KeyInjectingTransport": "src.ingestion.footystats",
     "LeagueInfo": "src.ingestion.footystats",
+    "MatchesSnapshot": "src.ingestion.footystats",
     "MissingApiKeyError": "src.ingestion.footystats",
+    "ParseReport": "src.ingestion.footystats",
     "RegistryDiff": "src.ingestion.footystats",
+    "RegistrySyncReport": "src.ingestion.footystats",
     "SeasonRef": "src.ingestion.footystats",
     "SeasonResolution": "src.ingestion.footystats",
     "TeamInfo": "src.ingestion.footystats",
+    "apply_registry_sync": "src.ingestion.footystats",
     "competition_season_ids": "src.ingestion.footystats",
     "find_api_key": "src.ingestion.footystats",
     "init_registry": "src.ingestion.footystats",
     "is_not_chosen_refusal": "src.ingestion.footystats",
+    "load_team_mapping": "src.ingestion.footystats",
     "mask_key": "src.ingestion.footystats",
     "not_chosen_reason": "src.ingestion.footystats",
     "parse_match": "src.ingestion.footystats",
     "parse_odds": "src.ingestion.footystats",
+    "prune_stale_odds": "src.ingestion.footystats",
     "resolve_api_key": "src.ingestion.footystats",
+    "sync_registry": "src.ingestion.footystats",
     "write_registry_update": "src.ingestion.footystats",
     "DIFFLIB_FALLBACK": "src.ingestion.team_matcher",
     "MatchResult": "src.ingestion.team_matcher",

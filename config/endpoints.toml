@@ -3,12 +3,15 @@
 #
 # Template variables: {tournament_id} {season_id} {round} {page} {event_id} {league_id} {match_id}
 #
+# Data policy: FootyStats (the footystats section below) is the single source of truth for teams and
+# calendars. Its data are licensed to the key holder and this repository is PUBLIC, so every
+# provider writes only LOCAL files (data/ is git-ignored); nothing harvested is ever committed.
+#
 # Reachability (verified November 2026):
 # * api.sofascore.com answers HTTP 403 to requests coming from datacenter /
 #   cloud IP ranges (hosted CI, cloud notebooks, VPS), whatever the headers.
-#   Run the harvester from a RESIDENTIAL connection (your own PC) and copy
-#   data/processed/*.csv to wherever the pipeline or the dashboard runs:
-#       python -m src.ingestion.harvester --gironi A B C --seasons 3
+#   It is a manual, residential-only fallback for the Serie C gironi (your own PC):
+#       python -m src.ingestion.harvester --gironi A B C --seasons 3 --providers sofascore
 #   The 403 is not retried (it is not transient); the raw JSON cache in
 #   data/raw/ lets a run be resumed without re-downloading what succeeded:
 #   the current season's payloads expire after [http] cache_ttl_hours (6 h,
@@ -64,11 +67,14 @@ cache_ttl_hours = 6
 history_cache_ttl_hours = 8760
 
 [footystats]
-# Official, documented API (https://footystats.org/api/). Unlike SofaScore it answers
-# from datacenter IPs, so it is the provider the GitHub Actions job uses. The API key
-# (your account at footystats.org -> API) is NEVER written here: it is read from the
-# environment variable named in `key_env`, from a `.env` file in the repository root
-# (FOOTYSTATS_API_KEY=...) or from `--key`. On footystats.org add the competitions you
+# Official, documented API (https://footystats.org/api/), the single source of truth for
+# teams and calendars: every harvest (python -m src.ingestion.footystats, avvia.*, the
+# dashboard refresh) first synchronises config/teams_<season>.json with /league-teams and
+# keeps postponed matches with their original kick-off. Unlike SofaScore it answers from
+# datacenter IPs too (the verifica-calendari workflow runs it, writing nothing to the repo).
+# The API key (your account at footystats.org -> API) is NEVER written here: it is read from
+# the environment variable named in `key_env`, from a `.env` file in the repository root
+# (FOOTYSTATS_API_KEY=...), from the Streamlit Cloud app Secrets or from `--key`. On footystats.org add the competitions you
 # want to harvest to your account ("Choose leagues"): the harvester only sees the
 # chosen ones (`league_list` with chosen_leagues_only=true). Needed for this project
 # (the `footystats_name` of every [[competition]] in config/competitions.toml):
@@ -92,6 +98,12 @@ key_env = "FOOTYSTATS_API_KEY"
 # backoff). A full run of 13 competitions x 3 seasons costs ~80 requests (one league list,
 # then one league-teams and one or two league-matches pages per season).
 max_requests_per_hour = 1800
+# Longest age (minutes) of a cached /league-matches payload of a season still being played,
+# whatever [http] cache_ttl_hours says: results arrive every few hours on match days, so a
+# refresh (CLI, avvia.*, the dashboard's "Aggiorna dati ora") re-downloads the current
+# calendar after this long (13 requests for 13 competitions). An incomplete match is always
+# judged as of the payload's download time (its fetched_at), never as of a later clock.
+live_matches_cache_minutes = 10
 # Competition code -> `name` field of /league-list. Legacy fallback used only when the
 # shared competitions module (src/common/competitions.py) is not available; the Serie D
 # gironi are configured in competitions.toml only.

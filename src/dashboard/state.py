@@ -3,16 +3,31 @@
 Everything the UI shows is computed here from the shared contracts, so the
 dashboard can be unit-tested without a browser:
 
-* :func:`build_state` runs the whole pipeline (load or simulate -> fit ->
-  predict -> value) and returns an immutable-by-convention
-  :class:`PipelineState` snapshot;
+* :func:`build_state` runs the whole pipeline (load -> fit -> predict ->
+  value) and returns an immutable-by-convention :class:`PipelineState`
+  snapshot. It works on **real data only** unless the demo is asked for
+  explicitly (``simulate=True``, the dashboard's ``SERIEC_DEMO=1``): without
+  usable files in ``data/processed`` it raises :class:`NoDataError`, which the
+  dashboard renders as a setup page, and it never falls back to the simulator
+  silently (the synthetic league invents teams' results, dates and pairings:
+  showing it as if it were real is the worst failure a betting tool can have);
+* the calendar views follow the **official rounds** (:mod:`src.engine.calendar`):
+  :func:`matchdays` groups the current round of every competition (with its
+  matches already played) and the rounds after it, :func:`state_at` regroups a
+  cached state at another instant, :func:`round_view_for` /
+  :func:`competition_rounds` give any round of one competition and
+  :func:`recoveries_for` the postponed matches and isolated recoveries;
 * the ``*_table`` helpers turn that snapshot into ``pandas`` frames with
   Italian column labels, ready for ``st.dataframe`` (:func:`matchday_table_for`
   is the whole matchday in one table, :func:`results_table_for` the played
   matches, both from :mod:`src.engine.tables`);
 * :func:`heatmap_figure` builds the score-matrix Plotly figure (whole matrix
   by default, or a compact view whose last row/column aggregate the tail);
-* :func:`export_csv_bytes` serialises any frame for ``st.download_button``.
+* :func:`export_csv_bytes` serialises any frame for ``st.download_button``;
+  with ``demo=True`` (the demo state, :attr:`PipelineState.is_demo`) every
+  export carries the first column ``AVVISO`` = :data:`DEMO_EXPORT_TEXT` and
+  :func:`demo_file_name` prefixes the file name with ``DEMO_``, so invented
+  numbers never leave the dashboard looking like real ones.
 
 Bookmaker odds are read from ``odds_dir/*.csv`` in the same format
 ``main.load_odds_dir`` understands, see :func:`load_odds_quotes`.
@@ -31,10 +46,12 @@ them), the older rows are *history* that only sharpens the strength estimates
 and keeps them out of :func:`ranking_table`; fixtures involving them, and
 fixtures dated in another season than the registry's -- a stale ``fixtures.csv``
 of last season -- are skipped and listed in the notes). Without processed data
-a league is simulated on the registry season's real calendar (2026/27 by
+:func:`build_state` raises :class:`NoDataError`; the demo (``simulate=True``)
+simulates a league on the registry season's real calendar (2026/27 by
 default; played rounds derived from ``as_of``, today by default, see
 :func:`simulate_current_season`) together with ``history_seasons`` synthetic
-seasons *preceding* it (:func:`src.simulation.generator.history_seasons_for`).
+seasons *preceding* it (:func:`src.simulation.generator.history_seasons_for`),
+and says so in every note (:data:`DEMO_WARNING`).
 
 Sections (Serie B e Serie C / Serie D)
 --------------------------------------
@@ -59,6 +76,8 @@ import math
 import re
 import time
 from collections.abc import Iterable, Mapping, Sequence
+import dataclasses
+import os
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -83,6 +102,8 @@ from src.common.schemas import (
     validate_matches_df,
 )
 from src.common.teams import DEFAULT_SEASON, TeamRegistry, load_registry, season_file_stem
+from src.engine.calendar import ROME as ROME_TZ
+from src.engine.calendar import CompetitionCalendar, RoundMatch, RoundView, kicked_off, rome_midnight
 from src.engine.model import DixonColesConfig, DixonColesEngine, FittedParams
 from src.engine.picks import (
     DEFAULT_N_BTTS,
@@ -97,9 +118,11 @@ from src.engine.picks import (
 from src.engine.picks import matchdays as group_matchdays
 from src.engine.tables import (
     MATCHDAY_COLUMNS,
+    RECOVERIES_COLUMNS,
     RESULTS_COLUMNS,
     RESULTS_MODEL_COLUMNS,
     matchday_table,
+    recoveries_table,
     results_table,
     team_matches,
 )
@@ -112,6 +135,7 @@ from src.engine.value import (
 )
 from src.ingestion.harvester import load_fixtures, load_processed
 from src.simulation.generator import (
+    DEMO_WARNING,
     HISTORY_SEASONS,
     SimulatedLeague,
     history_seasons_for,
@@ -124,6 +148,13 @@ from src.simulation.generator import (
 __all__ = [
     "ALL_MATCHDAYS",
     "DEFAULT_HISTORY_SEASONS",
+    "DEMO_BADGE",
+    "DEMO_ENV_VAR",
+    "DEMO_EXPORT_COLUMN",
+    "DEMO_EXPORT_TEXT",
+    "DEMO_FILE_PREFIX",
+    "DEMO_WARNING",
+    "LEGACY_DEMO_ENV_VAR",
     "DEFAULT_SECTION",
     "MARKETS_COLUMNS",
     "MARKET_LABELS",
@@ -136,6 +167,7 @@ __all__ = [
     "PRIOR_MIN_MATCHES_PER_TEAM",
     "PRIOR_THRESHOLD_MATCHES",
     "RANKING_COLUMNS",
+    "RECOVERIES_COLUMNS",
     "RESULTS_COLUMNS",
     "RESULTS_MODEL_COLUMNS",
     "SECTION_BC",
@@ -150,6 +182,7 @@ __all__ = [
     "VALUE_COLUMNS",
     "CoverageReport",
     "MatchdaySelector",
+    "NoDataError",
     "PipelineState",
     "Source",
     "all_sections",
@@ -157,10 +190,14 @@ __all__ = [
     "build_state",
     "competition_label",
     "competition_options",
+    "competition_rounds",
     "configured_gironi",
     "coverage_report",
     "coverage_text",
+    "current_round_for",
     "current_teams",
+    "demo_file_name",
+    "demo_requested",
     "draw_picks_table",
     "export_csv_bytes",
     "family_gironi",
@@ -179,6 +216,7 @@ __all__ = [
     "matchday_table_for",
     "matchday_table_key",
     "matchdays",
+    "mark_demo_frame",
     "matches_per_team",
     "max_sim_rounds",
     "no_odds_message",
@@ -193,10 +231,15 @@ __all__ = [
     "prior_recommended",
     "quotes_for",
     "ranking_table",
+    "recoveries_for",
+    "recoveries_table_for",
     "resolve_matchday",
     "results_csv_bytes",
     "results_table_for",
     "results_team_options",
+    "round_table_for",
+    "round_view_for",
+    "season_fixtures",
     "seasons_available",
     "section_families",
     "section_gironi",
@@ -219,6 +262,7 @@ __all__ = [
     "serie_d_status_text",
     "simulate_current_season",
     "split_by_season",
+    "state_at",
     "strength_figure",
     "traps_table",
     "value_opportunities",
@@ -228,6 +272,55 @@ __all__ = [
 log = get_logger(__name__)
 
 Source = Literal["processed", "simulated"]
+
+#: Environment variable that switches the dashboard (and only it) to the synthetic demo league.
+DEMO_ENV_VAR: Final[str] = "SERIEC_DEMO"
+#: Deprecated alias of :data:`DEMO_ENV_VAR`, still honoured (with a logged deprecation warning).
+LEGACY_DEMO_ENV_VAR: Final[str] = "SERIEC_FORCE_SIMULATE"
+#: Text of the source badge in demo mode.
+DEMO_BADGE: Final[str] = "Demo"
+#: Text of the first column of every CSV exported from the demo (dashboard downloads and ``main.py`` files).
+DEMO_EXPORT_TEXT: Final[str] = "DATI SIMULATI - NON USARE PER SCOMMETTERE"
+#: Name of that first column.
+DEMO_EXPORT_COLUMN: Final[str] = "AVVISO"
+#: Prefix of the file name of every CSV exported from the demo.
+DEMO_FILE_PREFIX: Final[str] = "DEMO_"
+_TRUTHY: Final[frozenset[str]] = frozenset({"1", "true", "yes", "on", "si", "sì"})
+
+
+def demo_requested(environ: Mapping[str, str] | None = None) -> bool:
+    """Whether the synthetic demo was asked for: ``SERIEC_DEMO=1`` (or the deprecated ``SERIEC_FORCE_SIMULATE=1``).
+
+    ``1/true/yes/on/si`` count as yes, case-insensitively. The demo is never
+    the default: without one of the two variables the dashboard shows real
+    data or the setup page, never invented numbers.
+    """
+    env = os.environ if environ is None else environ
+    if str(env.get(DEMO_ENV_VAR, "")).strip().lower() in _TRUTHY:
+        return True
+    if str(env.get(LEGACY_DEMO_ENV_VAR, "")).strip().lower() in _TRUTHY:
+        log.warning(
+            "deprecated environment variable: use the demo switch instead",
+            extra={"variable": LEGACY_DEMO_ENV_VAR, "replacement": DEMO_ENV_VAR},
+        )
+        return True
+    return False
+
+
+class NoDataError(RuntimeError):
+    """No usable real data: :func:`build_state` refuses to invent it.
+
+    ``reasons`` lists, in Italian, what is missing or unusable (``matches.csv``
+    absent, empty or unreadable); ``processed_dir`` is the directory that was
+    read. The dashboard renders it as the setup page (how to provide the
+    FootyStats key, the button that downloads the data) instead of tabs with
+    simulated numbers; ``main.py`` prints it and exits.
+    """
+
+    def __init__(self, reasons: Sequence[str], *, processed_dir: Path) -> None:
+        self.reasons: tuple[str, ...] = tuple(reasons) or ("nessun dato reale disponibile",)
+        self.processed_dir = Path(processed_dir)
+        super().__init__("Nessun dato reale disponibile: " + "; ".join(self.reasons))
 
 #: Selector value meaning "every matchday" for :func:`fixtures_for`, :func:`value_table` and
 #: :func:`matchday_predictions`; ``None`` means "the next matchday" and a :class:`Matchday` that one.
@@ -351,10 +444,14 @@ class PipelineState:
     """Snapshot of one pipeline run, consumed read-only by the dashboard.
 
     ``source`` tells whether ``matches`` came from the harvested CSVs
-    (``'processed'``) or from the synthetic generator (``'simulated'``);
-    ``notes`` is the human-readable log of what happened (data source, injected
-    trap, fit diagnostics, skipped quotes...) shown in the *Dettagli pipeline*
-    expander.
+    (``'processed'``) or from the synthetic generator (``'simulated'``, the demo
+    only: :attr:`is_demo`, :attr:`demo_warning`); ``notes`` is the
+    human-readable log of what happened (data source, injected trap, fit
+    diagnostics, skipped quotes...) shown in the *Dettagli pipeline* expander.
+    ``now`` is the reference instant of the calendar (the official-round rule
+    of :mod:`src.engine.calendar`; ``None`` = the fixture list already is the
+    upcoming schedule, as in the demo): :func:`state_at` regroups a state at
+    another instant without refitting.
 
     ``matches`` is everything the fit saw (history included); ``current_matches``
     are its rows of the registry season (``season_label``) and ``history_matches``
@@ -366,10 +463,11 @@ class PipelineState:
     current-season coverage the ``use_prior=None`` rule looked at
     (:class:`CoverageReport`, with the registry competitions it ignored because
     they have no match in the data). ``matchdays`` groups the *predicted*
-    fixtures into "giornate" (:func:`src.engine.picks.matchdays`): with a real
-    provider the fixture list is the whole remaining season, so the match
-    selector, the value panel and the picks default to ``matchdays[0]``, the
-    next one (:attr:`next_matchday`). The per-section matchdays of the
+    the calendar into "giornate" (:func:`src.engine.picks.matchdays` on the
+    current-season fixtures and played matches at ``now``): the first one is
+    the current round of every competition, with its matches already played,
+    so the match selector, the value panel and the picks default to
+    ``matchdays[0]`` (:attr:`next_matchday`). The per-section matchdays of the
     dashboard are :func:`matchdays` ``(state, section)``, cached on the state.
 
     The perimeter may span several *families* (:attr:`families`: ``'Serie C'``,
@@ -396,6 +494,7 @@ class PipelineState:
     skipped_fixtures: list[str] = field(default_factory=list)
     coverage: "CoverageReport | None" = None
     matchdays: list[Matchday] = field(default_factory=list)
+    now: datetime | None = None
     #: Lazily built per-team long frame of the current-season matches (see :meth:`team_matches_frame`).
     _team_matches: pd.DataFrame | None = field(default=None, init=False, repr=False, compare=False)
     #: Lazily grouped matchdays per section (see :func:`matchdays`); a ``dataclasses.replace`` starts afresh.
@@ -416,8 +515,23 @@ class PipelineState:
 
     @property
     def next_matchday(self) -> Matchday | None:
-        """The first upcoming matchday (``matchdays[0]``), ``None`` without predicted fixtures."""
+        """The current matchday (``matchdays[0]``: the current round of every competition), ``None`` without a round to play."""
         return self.matchdays[0] if self.matchdays else None
+
+    @property
+    def is_demo(self) -> bool:
+        """Whether the state is the synthetic demo (``source == 'simulated'``): invented teams' results, dates and odds."""
+        return self.source == "simulated"
+
+    @property
+    def demo_warning(self) -> str:
+        """:data:`DEMO_WARNING` for the demo, ``''`` for real data."""
+        return DEMO_WARNING if self.is_demo else ""
+
+    @property
+    def calendar_fixtures(self) -> list[Fixture]:
+        """The loaded fixtures dated in the registry season (the calendar of the current rounds), in load order."""
+        return season_fixtures(self.fixtures, self.season_label)
 
     @property
     def n_matches(self) -> int:
@@ -554,6 +668,12 @@ def split_by_season(matches: pd.DataFrame, season_label: str) -> tuple[pd.DataFr
     seasons = pd.to_datetime(matches["date"]).map(season_of)
     is_current = (seasons == label).to_numpy(dtype=bool)
     return matches.loc[is_current].reset_index(drop=True), matches.loc[~is_current].reset_index(drop=True)
+
+
+def season_fixtures(fixtures: Iterable[Fixture], season_label: str) -> list[Fixture]:
+    """The fixtures dated in ``season_label`` (``'2026/27'`` or ``'2026_27'``), in input order: the calendar of the current season."""
+    label = str(season_label).replace("_", "/")
+    return [f for f in fixtures if season_of(f.date) == label]
 
 
 def history_label(matches: pd.DataFrame) -> str:
@@ -973,19 +1093,29 @@ def _model_config(
 
 
 def _load_processed_inputs(
-    processed_dir: Path, odds_dir: Path, notes: list[str]
+    processed_dir: Path, odds_dir: Path, notes: list[str], reasons: list[str]
 ) -> tuple[pd.DataFrame, list[Fixture], list[OddsQuote]] | None:
-    """Load matches/fixtures/odds from disk; ``None`` when there is nothing usable."""
+    """Load matches/fixtures/odds from disk; ``None`` (with the Italian ``reasons``) when there is nothing usable.
+
+    ``matches.csv`` missing, unreadable or empty means no real data; a missing
+    or unreadable ``fixtures.csv`` and missing odds are noted but do not stop
+    the pipeline (the played matches still give the ranking and the results).
+    """
     matches_path = Path(processed_dir) / "matches.csv"
     fixtures_path = Path(processed_dir) / "fixtures.csv"
+    if not matches_path.is_file():
+        reasons.append(f"il file {matches_path} non esiste: i dati FootyStats non sono ancora stati scaricati")
+        log.warning("processed matches missing", extra={"path": str(matches_path)})
+        return None
     try:
         matches = load_processed(matches_path)
     except (ValueError, OSError, pd.errors.ParserError) as exc:
         log.warning("processed matches unreadable", extra={"path": str(matches_path), "error": str(exc)})
-        notes.append(f"File {matches_path} non leggibile ({exc}); uso i dati simulati.")
+        reasons.append(f"il file {matches_path} non è leggibile ({exc})")
         return None
     if matches.empty:
-        notes.append(f"File {matches_path} vuoto; uso i dati simulati.")
+        reasons.append(f"il file {matches_path} non contiene partite giocate")
+        log.warning("processed matches empty", extra={"path": str(matches_path)})
         return None
     fixtures: list[Fixture] = []
     if fixtures_path.exists():
@@ -997,7 +1127,7 @@ def _load_processed_inputs(
     else:
         notes.append(f"Nessun file {fixtures_path.name}: nessuna partita in programma da prevedere.")
     quotes = load_odds_quotes(Path(odds_dir))
-    notes.append(f"Dati reali da {matches_path}: {len(matches)} partite, {len(fixtures)} partite in programma, {len(quotes)} quote da {odds_dir}.")
+    notes.append(f"Dati reali da {matches_path}: {len(matches)} partite, {len(fixtures)} partite in calendario, {len(quotes)} quote da {odds_dir}.")
     if not quotes:
         notes.append("Nessuna quota bookmaker trovata: il pannello EV resta vuoto.")
     return matches, fixtures, quotes
@@ -1028,7 +1158,7 @@ def simulate_current_season(
 ) -> tuple[SimulatedLeague, int]:
     """Simulated current season of ``registry`` on its real calendar; returns ``(league, played_rounds)``.
 
-    Shared by the dashboard fallback and ``main.py --mode full`` so both read
+    Shared by the dashboard demo and ``main.py --mode full`` so both read
     the calendar the same way. With ``n_rounds`` the played rounds are fixed,
     clamped to ``[MIN_SIM_ROUNDS, max_sim_rounds(registry)]`` so one round of
     fixtures always remains (a clamp is recorded in ``notes``). Otherwise the
@@ -1142,14 +1272,15 @@ def build_state(
     xi: float = 0.0018,
     seed: int = 7,
     n_rounds: int | None = None,
-    simulate: bool | None = None,
+    simulate: bool | None = False,
     use_prior: bool | None = None,
     season: str = DEFAULT_SEASON,
     history_seasons: int = DEFAULT_HISTORY_SEASONS,
     as_of: date | None = None,
     registry: TeamRegistry | None = None,
+    now: datetime | None = None,
 ) -> PipelineState:
-    """Run load/simulate -> fit -> predict -> value and return a :class:`PipelineState`.
+    """Run load -> fit -> predict -> value and return a :class:`PipelineState`.
 
     Perimeter
         ``season`` selects the registry (``config/teams_<season>.json``, 2026/27
@@ -1160,17 +1291,28 @@ def build_state(
         registry are fitted as *historical* opponents only. The rows of the
         registry season are the current matches; older rows are history.
     Data source
-        ``processed_dir/matches.csv`` is used when it exists and ``simulate`` is
-        not ``True`` (``fixtures.csv`` alongside it when present, odds from
-        ``odds_dir/*.csv`` in the :func:`load_odds_quotes` format); it may hold
-        several seasons. Otherwise a league is simulated with
+        Real data only, unless ``simulate=True``. ``processed_dir/matches.csv``
+        (several seasons allowed) with ``fixtures.csv`` alongside it when
+        present and the odds of ``odds_dir/*.csv`` (:func:`load_odds_quotes`
+        format). When ``matches.csv`` is missing, unreadable or empty
+        :class:`NoDataError` is raised: there is **no silent fallback** to the
+        simulator (``simulate=None`` is the same as ``False``). ``simulate=True``
+        is the explicit demo: a league simulated with
         :func:`simulate_current_season` on the registry season's real calendar
-        (2026/27 by default) -- with ``n_rounds`` the played rounds are fixed,
-        with ``n_rounds=None`` they are the rounds dated before ``as_of`` (today
-        by default) and the next round is the fixture list -- plus
+        (with ``n_rounds`` the played rounds are fixed, with ``n_rounds=None``
+        they are the rounds dated before ``as_of``, today by default) plus
         ``history_seasons`` (0-2) synthetic seasons preceding it from
-        :func:`simulate_history`; a REGRESSION_TRAP is injected on one Girone A
-        team of the next round.
+        :func:`simulate_history`, a REGRESSION_TRAP injected on one team of the
+        first competition, and :data:`DEMO_WARNING` as the first note.
+    Calendar
+        The matchdays follow the official rounds at the reference instant
+        ``now`` (:func:`src.engine.picks.matchdays` with the current-season
+        played matches): for real data ``now`` defaults to midnight of
+        ``as_of`` in ``Europe/Rome`` when ``as_of`` is given, else to the
+        current instant; for the demo it defaults to ``None`` (the simulated
+        fixture list is the next round by construction). A naive ``now`` is
+        read as UTC. :func:`state_at` regroups an existing state at another
+        instant.
     Model
         ``use_prior=None`` enables the Gaussian prior while the least-covered
         girone has fewer than :data:`PRIOR_MIN_MATCHES_PER_TEAM` played
@@ -1204,23 +1346,25 @@ def build_state(
     season_label = reg.season_label
     notes: list[str] = []
     started = time.perf_counter()
-    loaded: tuple[pd.DataFrame, list[Fixture], list[OddsQuote]] | None = None
-    if simulate is not True:
-        matches_path = Path(processed_dir) / "matches.csv"
-        if matches_path.exists():
-            loaded = _load_processed_inputs(Path(processed_dir), Path(odds_dir), notes)
-        elif simulate is False:
-            notes.append(f"Richiesti dati reali ma {matches_path} non esiste: uso i dati simulati.")
-            log.warning("processed matches requested but missing", extra={"path": str(matches_path)})
-    if loaded is not None:
-        source: Source = "processed"
-        all_matches, fixtures, quotes = loaded
-        current, history = split_by_season(all_matches, season_label)
-    else:
-        source = "simulated"
+    if now is not None and now.tzinfo is None:
+        now = now.replace(tzinfo=UTC)  # a naive instant is UTC, as in src.engine.calendar
+    if simulate is True:
+        source: Source = "simulated"
+        notes.append(DEMO_WARNING)
         current, history, fixtures, quotes = _simulated_inputs(
             seed, n_rounds, notes, registry=reg, history_seasons=int(history_seasons), as_of=as_of
         )
+        reference = now
+    else:
+        reasons: list[str] = []
+        loaded = _load_processed_inputs(Path(processed_dir), Path(odds_dir), notes, reasons)
+        if loaded is None:
+            log.warning("no real data: the pipeline refuses to simulate silently", extra={"processed_dir": str(processed_dir), "reasons": reasons})
+            raise NoDataError(reasons, processed_dir=Path(processed_dir))
+        source = "processed"
+        all_matches, fixtures, quotes = loaded
+        current, history = split_by_season(all_matches, season_label)
+        reference = now if now is not None else (rome_midnight(as_of) if as_of is not None else datetime.now(UTC))
     matches = validate_matches_df(pd.concat([history, current], ignore_index=True)) if not history.empty else current
     if matches.empty:
         raise ValueError(f"no played matches available for the {season_label} perimeter")
@@ -1332,17 +1476,16 @@ def build_state(
         f"Kelly x{kelly_fraction:g} su {bankroll_units:g} unità, {len(traps)} squadre in trappola di regressione "
         f"(stagione {season_label}), {n_trap_flags} selezioni Over/GG segnalate."
     )
-    giornate = group_matchdays(p.fixture for p in predictions)
-    if giornate:
-        first = giornate[0]
-        notes.append(
-            f"Partite in programma raggruppate in {len(giornate)} {'giornata' if len(giornate) == 1 else 'giornate'}; "
-            f"la prossima è {first.label} ({first.n_fixtures} partite): selettore partite, pannello valore e selezioni "
-            "di giornata la usano come default."
-        )
+    giornate = group_matchdays(season_fixtures(fixtures, season_label), played=current, now=reference)
+    notes.append(_calendar_note(giornate, reference))
     log.info(
         "matchdays grouped",
-        extra={"n_matchdays": len(giornate), "n_predicted": len(predictions), "next": giornate[0].key if giornate else None},
+        extra={
+            "n_matchdays": len(giornate),
+            "n_predicted": len(predictions),
+            "next": giornate[0].key if giornate else None,
+            "now": None if reference is None else reference.isoformat(),
+        },
     )
     notes.append(f"Pipeline completata in {time.perf_counter() - started:.2f} s.")
     return PipelineState(
@@ -1364,7 +1507,39 @@ def build_state(
         skipped_fixtures=skipped_season + skipped_historical + skipped_unknown,
         coverage=coverage,
         matchdays=giornate,
+        now=reference,
     )
+
+
+def _calendar_note(giornate: Sequence[Matchday], reference: datetime | None) -> str:
+    """The *Dettagli pipeline* line about the calendar: the current matchday and how many follow."""
+    when = "" if reference is None else f" al {reference.astimezone(ROME_TZ).strftime('%d/%m/%Y %H:%M')}"
+    if not giornate:
+        return f"Calendario{when}: nessun turno da giocare nelle partite in calendario."
+    first = giornate[0]
+    played = f", {first.n_played} già giocate" if first.n_played else ""
+    played += f", {first.n_in_play} in corso o in attesa del risultato" if first.n_in_play else ""
+    return (
+        f"Calendario{when}: giornata corrente {first.label} ({first.n_fixtures} partite da giocare{played}); "
+        f"{len(giornate) - 1} giornate successive in calendario. Selettore partite, pannello valore e selezioni di giornata "
+        "partono dalla giornata corrente."
+    )
+
+
+def state_at(state: PipelineState, now: datetime | None) -> PipelineState:
+    """``state`` with its calendar regrouped at the instant ``now`` (no refit): same matches, predictions and prices.
+
+    The official-round rule depends on the time (a round stops being current
+    when its last matches have kicked off), while the fit does not: the
+    dashboard caches the fitted state and calls this on every run. Returns
+    ``state`` itself when ``now`` equals :attr:`PipelineState.now`; otherwise a
+    copy (``dataclasses.replace``, so the per-state caches start afresh).
+    """
+    if now == state.now:
+        return state
+    giornate = group_matchdays(state.calendar_fixtures, played=state.current_matches, now=now)
+    log.debug("calendar regrouped", extra={"now": None if now is None else now.isoformat(), "n_matchdays": len(giornate)})
+    return dataclasses.replace(state, matchdays=giornate, now=now)
 
 
 # =============================================================================
@@ -1464,23 +1639,79 @@ def family_predictions(state: PipelineState, family: str) -> list[MatchPredictio
 
 
 def matchdays(state: PipelineState, section: str | None = None) -> list[Matchday]:
-    """The "giornate" of a section, grouped from **its own** predicted fixtures (``state.matchdays`` for ``None``).
+    """The "giornate" of a section, built from **its own** competitions' official rounds (``state.matchdays`` for ``None``).
 
+    The first one is the current round of every competition of the section
+    (:func:`src.engine.picks.matchdays` on :attr:`PipelineState.calendar_fixtures`
+    and the current-season played matches, at :attr:`PipelineState.now`).
     Serie D plays 34 rounds on its own calendar: grouped together with Serie B
-    and Serie C its rounds would rename every shared weekend and add midweek
-    matchdays nobody in the other section asked for, so each section groups its
-    fixtures separately (:func:`src.engine.picks.matchdays` with the section's
-    competitions) and its keys, labels and rounds only ever mention that
-    section. Grouped once per section and cached on the state.
+    and Serie C its rounds would rename every shared weekend, so each section
+    groups its competitions separately and its keys, labels and rounds only
+    ever mention that section. Grouped once per section and cached on the state.
     """
     if section is None:
         return list(state.matchdays)
     cached = state._section_matchdays.get(section)
     if cached is None:
-        cached = group_matchdays((p.fixture for p in state.predictions), gironi=configured_gironi(section))
+        cached = group_matchdays(
+            state.calendar_fixtures, gironi=configured_gironi(section), played=state.current_matches, now=state.now
+        )
         state._section_matchdays[section] = cached
         log.debug("section matchdays grouped", extra={"section": section, "n_matchdays": len(cached)})
     return list(cached)
+
+
+# ----------------------------------------------------------------------------- official rounds of one competition
+def _calendar(state: PipelineState, girone: Girone | str) -> CompetitionCalendar:
+    """The :class:`~src.engine.calendar.CompetitionCalendar` of one competition (current-season played matches and fixtures)."""
+    return CompetitionCalendar.build(girone, state.current_matches, state.calendar_fixtures)
+
+
+def competition_rounds(state: PipelineState, girone: Girone | str) -> list[int]:
+    """Every round of a competition with at least one match in the current season (played, to play, postponed), ascending.
+
+    The options of the *Giornata n.* selector of the Giornata tab (one
+    competition selected in the sidebar); ``[]`` for a competition without
+    matches.
+    """
+    return _calendar(state, girone).rounds()
+
+
+def current_round_for(state: PipelineState, girone: Girone | str) -> RoundView | None:
+    """The current round of a competition at :attr:`PipelineState.now` (see :mod:`src.engine.calendar`), ``None`` when none is pending."""
+    return _calendar(state, girone).current(state.now)
+
+
+def round_view_for(state: PipelineState, girone: Girone | str, round_number: int) -> RoundView:
+    """Every match of one round of a competition at :attr:`PipelineState.now` (played with the score, in play, to play, postponed); empty for an unknown round."""
+    return _calendar(state, girone).view(int(round_number), state.now)
+
+
+def recoveries_for(state: PipelineState, section: str | None = None, girone: Girone | None = None) -> list[RoundMatch]:
+    """Postponed matches and recoveries outside the current rounds, of one competition or of every competition of a section.
+
+    :meth:`src.engine.calendar.CompetitionCalendar.recoveries` at
+    :attr:`PipelineState.now` for each competition (the *Recuperi e rinvii*
+    expander of the Giornata tab), chronological; ``[]`` for a competition
+    outside ``section`` (:func:`outside_section`).
+    """
+    g = _as_girone(girone)
+    if outside_section(g, section):
+        return []
+    gironi = (g,) if g is not None else configured_gironi(section)
+    fixtures = state.calendar_fixtures
+    codes = {f.girone for f in fixtures}
+    out: list[RoundMatch] = []
+    for x in gironi:
+        if x in codes:
+            out.extend(CompetitionCalendar.build(x, state.current_matches, fixtures).recoveries(state.now))
+    out.sort(key=RoundMatch.sort_key)
+    return out
+
+
+def recoveries_table_for(state: PipelineState, section: str | None = None, girone: Girone | None = None) -> pd.DataFrame:
+    """:func:`src.engine.tables.recoveries_table` of :func:`recoveries_for`, with the model's 1X2 / GG for the scheduled ones."""
+    return recoveries_table(recoveries_for(state, section, girone), state.predictions)
 
 
 def section_perimeter_label(state: PipelineState, section: str | None = None) -> str:
@@ -1606,14 +1837,20 @@ def resolve_matchday(state: PipelineState, matchday: MatchdaySelector | str = No
 
 
 def _restrict(state: PipelineState, matchday: MatchdaySelector, section: str | None = None) -> list[MatchPrediction]:
-    """Predictions of the selected matchday within a section (every prediction of the section for :data:`ALL_MATCHDAYS`).
+    """Predictions of the selected matchday within a section (every pre-match prediction of the section for :data:`ALL_MATCHDAYS`).
 
-    With ``None`` and no matchday in the section (no predicted fixture) there is
-    nothing to show, so the result is empty, consistent with the selectors.
+    Only fixtures that have not kicked off at :attr:`PipelineState.now`
+    (:func:`src.engine.calendar.kicked_off`) are returned: a matchday holds
+    only its matches still to play, and :data:`ALL_MATCHDAYS` drops the
+    fixtures already under way (or postponed, their kick-off passed) too, so
+    the value panel, the picks and the predictions export never price a match
+    that has started. With ``None`` and no matchday in the section (no
+    predicted fixture) there is nothing to show, so the result is empty,
+    consistent with the selectors.
     """
     preds = section_predictions(state, section)
     if matchday is ALL_MATCHDAYS or (isinstance(matchday, str) and matchday == ALL_MATCHDAYS):
-        return preds
+        return [p for p in preds if not kicked_off(p.fixture, state.now)]
     chosen = resolve_matchday(state, matchday, section)
     if chosen is None:
         return []
@@ -1658,27 +1895,55 @@ def matchday_table_for(
     matchday: MatchdaySelector = None,
     girone: Girone | None = None,
     section: str | None = None,
+    *,
+    round_number: int | None = None,
 ) -> pd.DataFrame:
-    """The whole matchday as one table (:func:`src.engine.tables.matchday_table`), one row per predicted fixture.
+    """The table of the Giornata tab (:func:`src.engine.tables.matchday_table`): every match of the selected rounds.
 
     ``matchday`` follows the selector semantics of :func:`fixtures_for` (the
-    next matchday of the section by default, :data:`ALL_MATCHDAYS` for every
-    predicted fixture), ``girone`` keeps one competition, ``section`` one
-    section (every competition when ``None``). Strengths come from
-    ``state.params``, the form columns from the current-season matches
+    current matchday of the section by default): the table lists **every**
+    match of its rounds -- played (with the score), to play (with the model's
+    numbers), postponed -- restricted to ``girone`` / ``section``.
+    :data:`ALL_MATCHDAYS` lists every predicted fixture instead (the exports).
+    ``round_number`` with ``girone`` shows that official round of that
+    competition, whatever the matchday (the *Giornata n.* selector). Strengths
+    come from ``state.params``, the form columns from the current-season matches
     (:meth:`PipelineState.team_matches_frame`, built once per state), the
     ``Book`` / ``EV max`` / ``Flag`` columns from ``state.opportunities`` and
     ``state.traps``. Columns exactly :data:`MATCHDAY_COLUMNS`, ``match_id`` last.
     """
-    preds = _restrict(state, matchday, section)
-    return matchday_table(
-        preds,
+    g = _as_girone(girone)
+    common = dict(
         params=state.params,
         matches=state.current_matches,
         opportunities=state.opportunities,
         traps=state.traps,
-        girone=_as_girone(girone),
+        girone=g,
         long=state.team_matches_frame(),
+    )
+    if round_number is not None and g is not None:
+        if outside_section(g, section):
+            return matchday_table([], **common)
+        return matchday_table(section_predictions(state, section), rounds=[round_view_for(state, g, round_number)], **common)
+    if matchday is ALL_MATCHDAYS or (isinstance(matchday, str) and matchday == ALL_MATCHDAYS):
+        return matchday_table(_restrict(state, ALL_MATCHDAYS, section), **common)
+    chosen = resolve_matchday(state, matchday, section)
+    if chosen is None or outside_section(g, section):
+        return matchday_table([], **common)
+    gironi = None if section is None else configured_gironi(section)
+    return matchday_table(section_predictions(state, section), matchday=chosen, gironi=gironi, **common)
+
+
+def round_table_for(state: PipelineState, view: RoundView) -> pd.DataFrame:
+    """The Giornata table of one :class:`~src.engine.calendar.RoundView` (every match of the round, model numbers for the ones to play)."""
+    return matchday_table(
+        state.predictions,
+        params=state.params,
+        matches=state.current_matches,
+        opportunities=state.opportunities,
+        traps=state.traps,
+        long=state.team_matches_frame(),
+        rounds=[view],
     )
 
 
@@ -1686,7 +1951,13 @@ def matchday_table_for(
 MATCHDAY_TABLE_KEY_PREFIX: Final[str] = "matchday_table"
 
 
-def matchday_table_key(matchday: Matchday | None, girone: Girone | None = None, section: str | None = None) -> str:
+def matchday_table_key(
+    matchday: Matchday | None,
+    girone: Girone | None = None,
+    section: str | None = None,
+    *,
+    round_number: int | None = None,
+) -> str:
     """``st.session_state`` key of the *Giornata* table widget, scoped to the matchday, competition and section it shows.
 
     Streamlit derives a ``st.dataframe`` element id from its ``key`` and
@@ -1699,9 +1970,14 @@ def matchday_table_key(matchday: Matchday | None, girone: Girone | None = None, 
     Serie C one played the same weekend; the default section adds no suffix,
     see :func:`section_key`) -- makes each scope its own widget, which starts
     without a selection. The prefix is :data:`MATCHDAY_TABLE_KEY_PREFIX`, so a
-    test can still find the table by ``key.startswith(...)``.
+    test can still find the table by ``key.startswith(...)``. ``round_number``
+    (one competition's official round chosen in the *Giornata n.* selector)
+    scopes the key to that round instead of the matchday: ``'matchday_table_g13_A'``.
     """
-    scope_matchday = "tutte" if matchday is None else str(matchday.key)
+    if round_number is not None:
+        scope_matchday = f"g{int(round_number)}"
+    else:
+        scope_matchday = "tutte" if matchday is None else str(matchday.key)
     scope_girone = "all" if girone is None else str(_as_girone(girone).value)
     return section_key(f"{MATCHDAY_TABLE_KEY_PREFIX}_{scope_matchday}_{scope_girone}", section)
 
@@ -1741,8 +2017,8 @@ def matchday_csv_bytes(
     girone: Girone | None = None,
     section: str | None = None,
 ) -> bytes:
-    """CSV bytes (see :func:`export_csv_bytes`) of :func:`matchday_table_for`, for the download button and the console export."""
-    return export_csv_bytes(matchday_table_for(state, matchday, girone, section))
+    """CSV bytes (see :func:`export_csv_bytes`) of :func:`matchday_table_for`, for the download button and the console export (marked in the demo)."""
+    return export_csv_bytes(matchday_table_for(state, matchday, girone, section), demo=state.is_demo)
 
 
 def seasons_available(state: PipelineState, section: str | None = None) -> list[str]:
@@ -1844,15 +2120,16 @@ def results_csv_bytes(
     season: str | None = None,
     section: str | None = None,
 ) -> bytes:
-    """CSV bytes (see :func:`export_csv_bytes`) of :func:`results_table_for`, for the download button and the console export."""
-    return export_csv_bytes(results_table_for(state, girone, team, season, section))
+    """CSV bytes (see :func:`export_csv_bytes`) of :func:`results_table_for`, for the download button and the console export (marked in the demo)."""
+    return export_csv_bytes(results_table_for(state, girone, team, season, section), demo=state.is_demo)
 
 
 def no_odds_message(state: PipelineState) -> str:
     """Italian hint shown by the value panel when ``state.quotes`` is empty.
 
-    The text depends on the data source: with harvested data the user can add
-    odds CSVs to the odds directory; with the synthetic generator the odds come
+    The text depends on the data source: with harvested data FootyStats may not
+    quote the fixtures yet (or the user can add odds CSVs to the odds
+    directory); with the synthetic generator of the demo the odds come
     from the simulated bookmaker, which quotes only the upcoming fixtures, so
     the only way to have no quotes is to have no fixtures left.
     """
@@ -1862,8 +2139,9 @@ def no_odds_message(state: PipelineState) -> str:
         except ValueError:
             odds_dir = str(ODDS_DIR)
         return (
-            f"Nessuna quota bookmaker disponibile: aggiungi file CSV in {odds_dir} "
-            "(colonne match_id, bookmaker, market, selection, odds) per calcolare l'EV."
+            "Nessuna quota bookmaker disponibile: FootyStats non quota ancora le partite in calendario (aggiorna i dati "
+            f"più tardi) oppure aggiungi file CSV in {odds_dir} (colonne match_id, bookmaker, market, selection, odds) "
+            "per calcolare l'EV."
         )
     if not state.fixtures:
         return (
@@ -2298,11 +2576,42 @@ def picks_export_frame(draws: pd.DataFrame, btts: pd.DataFrame, matchday: Matchd
     return out.assign(Lista=out["Lista"].astype("string"), Giornata=out["Giornata"].astype("string"))
 
 
-def picks_csv_bytes(draws: pd.DataFrame, btts: pd.DataFrame, matchday: Matchday | None = None) -> bytes:
-    """CSV bytes (see :func:`export_csv_bytes`) of :func:`picks_export_frame`, for the download button and the console export."""
-    return export_csv_bytes(picks_export_frame(draws, btts, matchday))
+def picks_csv_bytes(draws: pd.DataFrame, btts: pd.DataFrame, matchday: Matchday | None = None, *, demo: bool = False) -> bytes:
+    """CSV bytes (see :func:`export_csv_bytes`) of :func:`picks_export_frame`, for the download button and the console export.
+
+    ``demo`` marks the file as simulated (:func:`mark_demo_frame`): pass
+    :attr:`PipelineState.is_demo`.
+    """
+    return export_csv_bytes(picks_export_frame(draws, btts, matchday), demo=demo)
 
 
-def export_csv_bytes(frame: pd.DataFrame) -> bytes:
-    """UTF-8, comma-separated, ``.`` decimal CSV without index (dates as ISO ``YYYY-MM-DD``)."""
-    return frame.to_csv(index=False, sep=",", decimal=".", date_format="%Y-%m-%d", lineterminator="\n").encode("utf-8")
+def mark_demo_frame(frame: pd.DataFrame) -> pd.DataFrame:
+    """``frame`` with a first column :data:`DEMO_EXPORT_COLUMN` = :data:`DEMO_EXPORT_TEXT` on every row.
+
+    An empty frame gets one row holding only the warning, so even a file with
+    no data says it comes from the demo. The input is not modified.
+    """
+    columns = [c for c in frame.columns if c != DEMO_EXPORT_COLUMN]
+    if frame.empty:
+        return pd.DataFrame([{DEMO_EXPORT_COLUMN: DEMO_EXPORT_TEXT}], columns=[DEMO_EXPORT_COLUMN, *columns])
+    marked = frame[columns].copy()
+    marked.insert(0, DEMO_EXPORT_COLUMN, DEMO_EXPORT_TEXT)
+    return marked
+
+
+def demo_file_name(name: str, demo: bool) -> str:
+    """``'DEMO_<name>'`` for a demo export (:data:`DEMO_FILE_PREFIX`), ``name`` unchanged otherwise (never prefixed twice)."""
+    if not demo or name.startswith(DEMO_FILE_PREFIX):
+        return name
+    return f"{DEMO_FILE_PREFIX}{name}"
+
+
+def export_csv_bytes(frame: pd.DataFrame, *, demo: bool = False) -> bytes:
+    """UTF-8, comma-separated, ``.`` decimal CSV without index (dates as ISO ``YYYY-MM-DD``).
+
+    ``demo=True`` (the demo state: pass :attr:`PipelineState.is_demo`) writes
+    :func:`mark_demo_frame` instead: first column ``AVVISO`` with
+    ``'DATI SIMULATI - NON USARE PER SCOMMETTERE'`` on every row.
+    """
+    data = mark_demo_frame(frame) if demo else frame
+    return data.to_csv(index=False, sep=",", decimal=".", date_format="%Y-%m-%d", lineterminator="\n").encode("utf-8")

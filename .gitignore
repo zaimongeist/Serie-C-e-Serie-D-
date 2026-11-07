@@ -8,17 +8,20 @@ build/
 dist/
 .venv/
 venv/
+# secrets: the FootyStats key lives in .env (local) or in the Streamlit Cloud app Secrets, never in git
 .env
 .streamlit/secrets.toml
-# raw cache and generated data (keep the folders)
+# FootyStats data are licensed to the key holder and this repository is PUBLIC: everything the
+# harvest writes stays local (raw cache, processed CSVs, odds, the team-id mapping). Keep the folders.
 data/raw/*
 !data/raw/.gitkeep
-# processed CSVs and odds snapshots are versioned (the dashboard in cloud reads them from the repo)
 data/processed/*
 !data/processed/.gitkeep
-!data/processed/*.csv
 data/odds/*
 !data/odds/.gitkeep
-!data/odds/*.csv
+data/*.json
+# local output of the calendar check (python -m src.ingestion.calendar_snapshot / the CI step)
+ci/
+snapshot/
 reports/
 *.log

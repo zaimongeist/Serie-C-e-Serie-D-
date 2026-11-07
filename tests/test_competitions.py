@@ -1,6 +1,8 @@
 """Config-driven competitions: ``config/competitions.toml`` -> dynamic ``Girone`` enum -> registry,
-engine, simulator, console and dashboard (Serie C Gironi A/B/C + Serie B + Serie D Gironi A-I; the Serie D
-dictionaries ship empty and are covered in ``tests/test_serie_d.py``).
+engine, simulator, console and dashboard (Serie C Gironi A/B/C + Serie B + Serie D Gironi A-I: 242 clubs in the
+shipped 2026/27 dictionary; the Serie D specifics are covered in ``tests/test_serie_d.py``). The simulator, engine,
+console and dashboard tests of the Serie B wiring run on the Serie C + Serie B part of the shipped dictionary
+(:func:`serie_c_b_registry`, 80 clubs) so that their numbers stay those of four 20-team competitions.
 """
 from __future__ import annotations
 
@@ -117,10 +119,21 @@ def registry() -> TeamRegistry:
     return load_registry()
 
 
+def serie_c_b_registry() -> TeamRegistry:
+    """The shipped 2026/27 dictionary restricted to Serie C and Serie B: four competitions of 20 clubs (80)."""
+    shipped = load_registry()
+    return TeamRegistry.from_teams("2026/27", {g.value: shipped.teams(g) for g in (Girone.A, Girone.B, Girone.C, Girone.SB)})
+
+
+@pytest.fixture(scope="module")
+def serie_c_b() -> TeamRegistry:
+    return serie_c_b_registry()
+
+
 @pytest.fixture(scope="module")
 def sim_state():
-    """Simulated 2026/27 pipeline with the four competitions (15 rounds, no history, stationary)."""
-    return build_state(simulate=True, seed=7, xi=0.0, n_rounds=15, history_seasons=0)
+    """Simulated 2026/27 pipeline with the four Serie C / Serie B competitions (15 rounds, no history, stationary)."""
+    return build_state(simulate=True, seed=7, xi=0.0, n_rounds=15, history_seasons=0, registry=serie_c_b_registry())
 
 
 # ----------------------------------------------------------------------------- configuration file
@@ -305,11 +318,11 @@ def test_contracts_accept_serie_b() -> None:
 
 
 # ----------------------------------------------------------------------------- registry
-def test_registry_has_80_teams_in_four_competitions_and_a_config_derived_perimeter_label(registry: TeamRegistry) -> None:
-    assert registry.n_teams == 80 and registry.gironi == (Girone.A, Girone.B, Girone.C, Girone.SB)
-    assert all(len(registry.teams(g)) == 20 for g in registry.gironi) and len(registry.teams("Serie B")) == 20
-    assert registry.perimeter_label == "Serie C 2026/27 Gironi A/B/C + Serie B (80 squadre)"
-    assert registry.canonical_names[60:] == registry.teams(Girone.SB)  # configuration order: Serie B last
+def test_registry_has_242_teams_in_thirteen_competitions_and_a_config_derived_perimeter_label(registry: TeamRegistry) -> None:
+    assert registry.n_teams == 242 and registry.gironi == tuple(Girone) and len(registry.gironi) == 13
+    assert all(len(registry.teams(g)) == (20 if g.family != "Serie D" else 18) for g in registry.gironi) and len(registry.teams("Serie B")) == 20
+    assert registry.perimeter_label == "Serie C 2026/27 Gironi A/B/C + Serie B + Serie D Gironi A-I (242 squadre)"
+    assert registry.canonical_names[60:80] == registry.teams(Girone.SB)  # configuration order: Serie B after Serie C, Serie D last
     for team in ("Arezzo", "Ascoli", "Benevento", "Vicenza", "Hellas Verona", "Sampdoria", "Südtirol"):
         assert registry.girone_of(team) is Girone.SB and registry.is_current_team(team)
     for team in ("Pescara", "Spezia", "Reggiana"):
@@ -323,7 +336,8 @@ def test_registry_has_80_teams_in_four_competitions_and_a_config_derived_perimet
     merged = load_registry(with_history=True)
     assert merged.exact("Delfino Pescara") == "Pescara" and merged.girone_of("Pescara") is Girone.B and merged.is_current_team("Pescara")
     assert merged.exact("L.R. Vicenza") == "Vicenza" and merged.girone_of("Vicenza") is Girone.SB
-    assert {"Frosinone", "Monza", "Venezia", "Ternana"} <= set(merged.historical_names)
+    assert {"Frosinone", "Monza", "Venezia", "Rimini"} <= set(merged.historical_names)
+    assert merged.is_current_team("Ternana") and merged.girone_of("Ternana") is Girone.DE  # Serie C 2025/26 -> Serie D 2026/27
     assert not merged.is_current_team("Frosinone") and merged.exact("Frosinone Calcio") == "Frosinone"
     # smaller registries describe only the competitions they hold
     assert TeamRegistry.from_teams("2026/27", {"A": ("x", "y"), "C": ("z", "w")}).perimeter_label == "Serie C 2026/27 Gironi A/C (4 squadre)"
@@ -346,16 +360,17 @@ def test_registry_rejects_alias_collisions_across_clubs() -> None:
     # repeating a spelling for the SAME club is fine, and so are the shipped files
     reg = TeamRegistry.from_mapping("2026/27", {"A": {"Alpha": ["Alpha", "Alpha FC", "alpha"]}})
     assert reg.exact("Alpha FC") == "Alpha" and reg.aliases == {"alpha": "Alpha"}
-    for season in ("2025_26", "2026_27"):
-        assert load_registry(season).n_teams == 80 and load_registry(season, with_history=True).n_teams == 80
+    for season, n_teams in (("2025_26", 80), ("2026_27", 242)):
+        assert load_registry(season).n_teams == n_teams and load_registry(season, with_history=True).n_teams == n_teams
 
 
 # ----------------------------------------------------------------------------- coverage rule
-def test_coverage_rule_ignores_registry_competitions_that_were_never_harvested(registry: TeamRegistry) -> None:
+def test_coverage_rule_ignores_registry_competitions_that_were_never_harvested(serie_c_b: TeamRegistry) -> None:
     """Regression: Serie B in the registry but never harvested (every SofaScore-only installation) forced
     ``matches_per_team == 0.0`` and the MAP prior for ever, whatever Serie C showed."""
+    registry = serie_c_b
     label = registry.season_label
-    full = simulate_league(seed=7, n_rounds=37).matches
+    full = simulate_league(seed=7, n_rounds=37, registry=registry).matches
     assert matches_per_team(full, registry=registry, season=label) == pytest.approx(37.0) and not prior_recommended(full, registry=registry, season=label)
     serie_c_only = full.loc[full["girone"] != "SB"].reset_index(drop=True)
     report = coverage_report(serie_c_only, registry=registry, season=label)
@@ -369,7 +384,7 @@ def test_coverage_rule_ignores_registry_competitions_that_were_never_harvested(r
     assert matches_per_team(thin, registry=registry, season=label) == pytest.approx(4.0) and 4.0 < PRIOR_MIN_MATCHES_PER_TEAM
     assert prior_recommended(thin, registry=registry, season=label) and coverage_report(thin, registry=registry, season=label).ignored == (Girone.SB,)
     # ... and a competition with history but no current-season match keeps zero coverage (it exists, it is thin)
-    history = simulate_history(seed=7, seasons=("2025/26",)).matches
+    history = simulate_history(seed=7, seasons=("2025/26",), registry=registry).matches
     sb_history_only = validate_matches_df(pd.concat([history, serie_c_only], ignore_index=True))
     with_history = coverage_report(sb_history_only, registry=registry, season=label)
     assert with_history.ignored == () and with_history.per_competition[Girone.SB] == 0.0 and with_history.thinnest == 0.0
@@ -386,23 +401,25 @@ def test_coverage_rule_ignores_registry_competitions_that_were_never_harvested(r
     assert matches_per_team(full.iloc[0:0], registry=registry, season=label) == 0.0
 
 
-def test_dashboard_and_console_name_the_ignored_competition(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+def test_dashboard_and_console_name_the_ignored_competition(tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch, serie_c_b: TeamRegistry) -> None:
     """Serie C only (330 current matches, 11 rounds) through the dashboard and the console: the prior is
-    recommended because 11 < 15, not because Serie B is at zero, and the banners say Serie B was ignored."""
-    league = simulate_league(seed=7, as_of=TODAY)
+    recommended because 11 < 15, not because Serie B is at zero, and the banners say Serie B was ignored.
+    The perimeter is the Serie C + Serie B part of the dictionary (the console reads it through ``load_registry``)."""
+    monkeypatch.setattr(pipeline, "load_registry", lambda *args, **kwargs: serie_c_b)
+    league = simulate_league(seed=7, as_of=TODAY, registry=serie_c_b)
     serie_c = league.matches.loc[league.matches["girone"] != "SB"].reset_index(drop=True)
     assert len(serie_c) == 330
     processed = tmp_path / "processed"
     processed.mkdir()
     serie_c.to_csv(processed / "matches.csv", index=False)
-    state = build_state(processed_dir=processed, odds_dir=tmp_path / "odds", simulate=False, history_seasons=0)
+    state = build_state(processed_dir=processed, odds_dir=tmp_path / "odds", simulate=False, history_seasons=0, registry=serie_c_b)
     assert state.coverage is not None and state.coverage.ignored == (Girone.SB,) and state.coverage.thinnest == pytest.approx(11.0)
     assert state.prior_enabled and state.n_current_matches == 330
     fit_note = next(n for n in state.notes if n.startswith("Stima Dixon-Coles"))
     assert "copertura 11.0 partite per squadra nel girone meno coperto; Serie B senza partite nei dati (ignorata nel calcolo della copertura)" in fit_note
     # with every competition harvested nothing is ignored and the note is unchanged
     league.matches.to_csv(processed / "matches.csv", index=False)
-    full = build_state(processed_dir=processed, odds_dir=tmp_path / "odds", simulate=False, history_seasons=0)
+    full = build_state(processed_dir=processed, odds_dir=tmp_path / "odds", simulate=False, history_seasons=0, registry=serie_c_b)
     assert full.coverage is not None and full.coverage.ignored == () and "ignorata" not in " ".join(full.notes)
     # console: same wording after the threshold
     serie_c.to_csv(processed / "matches.csv", index=False)
@@ -416,7 +433,8 @@ def test_dashboard_and_console_name_the_ignored_competition(tmp_path: Path, caps
 
 
 # ----------------------------------------------------------------------------- simulator + engine
-def test_simulated_league_covers_every_competition_and_the_fit_has_a_separate_serie_b_gamma(registry: TeamRegistry) -> None:
+def test_simulated_league_covers_every_competition_and_the_fit_has_a_separate_serie_b_gamma(serie_c_b: TeamRegistry) -> None:
+    registry = serie_c_b
     serie_d = {g: 0.25 for g in Girone if g.family == "Serie D"}
     assert DEFAULT_HOME_ADVANTAGE["SB"] == 0.25 and default_home_advantage() == {Girone.A: 0.30, Girone.B: 0.22, Girone.C: 0.38, Girone.SB: 0.25, **serie_d}
     assert default_home_advantage([Girone.SB]) == {Girone.SB: 0.25} and FALLBACK_HOME_ADVANTAGE == 0.28
@@ -425,10 +443,10 @@ def test_simulated_league_covers_every_competition_and_the_fit_has_a_separate_se
     for g in Girone:
         assert sum(tp.alpha[t] for t in registry.teams(g)) == pytest.approx(0.0, abs=1e-9)
 
-    league = simulate_league(seed=7, as_of=TODAY)
+    league = simulate_league(seed=7, as_of=TODAY, registry=registry)
     assert sorted(set(league.matches["girone"])) == ["A", "B", "C", "SB"]
     assert len(league.matches) == 11 * 40 and len(league.fixtures) == 40 and sum(1 for fx in league.fixtures if fx.girone is Girone.SB) == 10
-    history = simulate_history(seed=7)
+    history = simulate_history(seed=7, registry=registry)
     assert len(history.matches) == 2 * 4 * 380
     s26, s25 = history.season_registries["2025/26"], history.season_registries["2024/25"]
     # cross-division movers: Pescara (Serie B 2025/26 -> girone B), Vicenza (girone A 2025/26 -> Serie B), Spezia, Arezzo ...
@@ -457,11 +475,12 @@ def test_simulated_league_covers_every_competition_and_the_fit_has_a_separate_se
     assert pred.matrix.sum() == pytest.approx(1.0) and pred.fixture.girone is Girone.SB
 
 
-def test_registry_competition_without_matches_keeps_its_teams_current_and_constrains_them_elsewhere(registry: TeamRegistry, caplog: pytest.LogCaptureFixture) -> None:
+def test_registry_competition_without_matches_keeps_its_teams_current_and_constrains_them_elsewhere(serie_c_b: TeamRegistry, caplog: pytest.LogCaptureFixture) -> None:
     """Serie B in the registry but only Serie C harvested: the promoted clubs (Arezzo, Vicenza, ...) appear in Serie C
     history only. They stay current teams of Serie B, no Serie B home advantage is estimated, and for the
     ``sum(alpha) == 0`` constraint they join the girone they played in instead of being centred on their own."""
-    past = simulate_history(seed=7, seasons=("2025/26",)).matches
+    registry = serie_c_b
+    past = simulate_history(seed=7, seasons=("2025/26",), registry=registry).matches
     serie_c_only = past.loc[past["girone"] != "SB"].reset_index(drop=True)
     with caplog.at_level(logging.WARNING, logger="src.engine.model"):
         index = build_team_index(validate_matches_df(serie_c_only), registry=registry)
@@ -522,7 +541,8 @@ def test_dashboard_tables_show_the_competition_label_and_filter_by_serie_b(sim_s
     assert any("Serie B" in n or "80 squadre" in n for n in state.notes)
 
 
-def test_main_full_mode_prints_the_80_team_perimeter_and_a_serie_b_recovery_row(capsys: pytest.CaptureFixture[str]) -> None:
+def test_main_full_mode_prints_the_80_team_perimeter_and_a_serie_b_recovery_row(capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch, serie_c_b: TeamRegistry) -> None:
+    monkeypatch.setattr(pipeline, "load_registry", lambda *args, **kwargs: serie_c_b)  # the Serie C + Serie B part of the dictionary
     out = pipeline.main(["--mode", "full", "--no-export", "--log-level", "ERROR", "--seed", "3", "--history", "0", "--as-of", "2026-11-06"])
     console = capsys.readouterr().out
     assert "Perimetro: Serie C 2026/27 Gironi A/B/C + Serie B (80 squadre) · stagione corrente: 440 partite · storico: nessuna partita di stagioni precedenti" in console

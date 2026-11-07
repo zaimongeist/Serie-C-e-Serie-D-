@@ -9,6 +9,7 @@ English, so the mapping tests build small synthetic dictionaries.
 """
 from __future__ import annotations
 
+import dataclasses
 import json
 import logging
 import os
@@ -127,6 +128,22 @@ def _restore_root_logging() -> Any:
     for handler in handlers:
         root.addHandler(handler)
     root.setLevel(level)
+
+
+def _repository_state() -> dict[str, str]:
+    """Digest of every tracked dictionary and of every file under ``data/`` (tests must never touch them)."""
+    import hashlib  # noqa: PLC0415
+
+    paths = [*sorted((fs.ROOT / "config").glob("*.json")), *sorted(p for p in (fs.ROOT / "data").rglob("*") if p.is_file())]
+    return {str(path.relative_to(fs.ROOT)): hashlib.sha256(path.read_bytes()).hexdigest() for path in paths}
+
+
+@pytest.fixture(autouse=True)
+def _repository_untouched() -> Any:
+    """The registry sync writes the dictionary it was read from: no test may let it write the repository's files."""
+    before = _repository_state()
+    yield
+    assert _repository_state() == before, "a test wrote config/*.json or data/ of the repository"
 
 
 @pytest.fixture
@@ -507,16 +524,25 @@ def test_parse_match_missing_statistics_rules() -> None:
 def test_parse_match_incomplete_suspended_canceled(caplog: pytest.LogCaptureFixture) -> None:
     report = fs.ParseReport()
     fixture = fs.parse_match(_match(900001), "A", {149: "Manchester Utd"}, now=NOW, report=report)
-    assert fixture == Fixture("FS-900001", date(2027, 1, 15), 38, Girone.A, "Manchester Utd", "Leicester City")
-    # the same incomplete match seen after kick-off is neither a fixture nor a result
-    assert fs.parse_match(_match(900001), "A", {}, now=datetime(2027, 1, 16, tzinfo=UTC), report=report) is None
-    # an incomplete match without goals is a fixture whatever its date
+    kickoff = datetime.fromtimestamp(int(_match(900001)["date_unix"]), tz=UTC)
+    assert fixture == Fixture("FS-900001", date(2027, 1, 15), 38, Girone.A, "Manchester Utd", "Leicester City", kickoff=kickoff, status="scheduled")
+    assert isinstance(fixture, Fixture) and fixture.kickoff is not None and fixture.kickoff.tzinfo is not None
+    # the same incomplete match seen more than three hours after kick-off is POSTPONED: kept, with its original kick-off
+    late = fs.parse_match(_match(900001), "A", {}, now=kickoff + timedelta(hours=3, minutes=1), report=report)
+    assert isinstance(late, Fixture) and late.status == "postponed" and late.kickoff == kickoff and late.date == date(2027, 1, 15) and late.round == 38
+    # within three hours of kick-off it is in play: kept as a SCHEDULED fixture with its (past) kick-off, never
+    # dropped, so the round still lists it (the score comes with the next harvest)
+    for elapsed in (timedelta(hours=2), fs.IN_PLAY_WINDOW):
+        playing = fs.parse_match(_match(900001), "A", {}, now=kickoff + elapsed, report=report)
+        assert isinstance(playing, Fixture) and playing.status == "scheduled" and playing.kickoff == kickoff and playing.round == 38
+    # the goal fields do not matter any more: the kick-off decides
     without_goals = {**_match(900001), "homeGoalCount": None, "awayGoalCount": None}
-    assert isinstance(fs.parse_match(without_goals, "A", {}, now=datetime(2027, 1, 16, tzinfo=UTC), report=report), Fixture)
+    assert fs.parse_match(without_goals, "A", {}, now=datetime(2027, 1, 16, tzinfo=UTC), report=report).status == "postponed"
     assert fs.parse_match(_match(900003), "A", {}, now=NOW, report=report) is None  # suspended
     assert fs.parse_match(_match(900004), "A", {}, now=NOW, report=report) is None  # canceled
     assert fs.parse_match({**_match(453873), "status": "live"}, "A", {}, now=NOW, report=report) is None
-    assert report.fixtures == 2 and report.incomplete_past == 1
+    assert report.fixtures == 5 and report.postponed == 2 and report.in_play == 2 and report.incomplete_past == 4
+    assert report.as_dict()["postponed"] == 2 and report.as_dict()["in_play"] == 2
     assert dict(report.skipped_status) == {"suspended": 1, "canceled": 1, "live": 1}
     with caplog.at_level(logging.WARNING):
         assert fs.parse_match({**_match(453873), "id": None}, "A", {}, now=NOW, report=report) is None
@@ -568,11 +594,16 @@ def test_mapper_exact_alias_fuzzy_and_unmapped(tmp_path: Path) -> None:
     burnley = mapper.resolve(team(teams, "Burnley"), "A", "2026/27")
     assert (burnley.canonical, burnley.method, burnley.current, burnley.historical) == ("Burnley", "none", False, False)
     assert mapper.unmapped_teams == {"Burnley": 1}
-    # a Serie B team restricted to the SB composition; a team of another competition is found unrestricted and flagged
+    # a Serie B team restricted to the SB composition; in the current season a club plays in ONE competition, so a
+    # spelling of a current Serie B club listed in girone A is not merged with it: it takes the sync's collision name
     chelsea = mapper.resolve(team(teams, "Chelsea"), "SB", "2026/27")
     assert (chelsea.canonical, chelsea.method) == ("Chelsea", "exact")
     cross = mapper.resolve(team(teams, "Liverpool"), "A", "2026/27")
-    assert (cross.canonical, cross.method, cross.current) == ("Liverpool", "exact", True)
+    assert (cross.canonical, cross.method, cross.current) == ("Liverpool Serie C", "none", False)
+    assert mapper.unmapped_teams == {"Burnley": 1, "Liverpool Serie C": 1}
+    # in a past season clubs do change competition: the same spelling is accepted there
+    past = fs.FootyStatsTeamMapper(registry, TeamMatcher(registry), mapping_path=tmp_path / "past.json")
+    assert past.resolve(team(teams, "Liverpool"), "A", "2025/26", current=False).canonical == "Liverpool"
     names = mapper.names_for(teams, "A", "2026/27")
     assert names[59] == "Arsenal" and names[92] == "Tottenham" and names[145] == "Burnley" and len(names) == 20
     path = mapper.save()
@@ -644,7 +675,9 @@ def provider_factory(http_cfg: HttpConfig, tmp_path: Path) -> Callable[..., tupl
         client, transport = make_client(http_cfg, router=router, cache=cache)
         reg = registry if registry is not None else synthetic_registry(with_history=True)
         mapper = fs.FootyStatsTeamMapper(reg, TeamMatcher(reg), mapping_path=tmp_path / "footystats_teams.json")
-        return fs.FootyStatsProvider(client, mapper, client.endpoints, now=lambda: now), transport
+        # an in-memory registry is never synchronised (it was not read from a dictionary file); config_dir points
+        # at an empty temporary directory anyway, so nothing could be written to the repository's config/
+        return fs.FootyStatsProvider(client, mapper, client.endpoints, now=lambda: now, config_dir=tmp_path / "no-config"), transport
 
     return make
 
@@ -667,8 +700,9 @@ async def test_harvest_end_to_end(provider_factory: Callable[..., Any], tmp_path
     assert len(df) == 72 == len(result.records) and sum(result.n_matches_by_season.values()) == 72
     # fixtures only from the current season of each competition, deduplicated; odds only for fixtures
     assert [f.match_id for f in result.fixtures] == [f"FS-{CURRENT_A * 1_000_000 + 900001}", f"FS-{CURRENT_A * 1_000_000 + 900002}", f"FS-{17404 * 1_000_000 + 900001}", f"FS-{17404 * 1_000_000 + 900002}"]
-    assert all(f.date == date(2027, 1, 15) for f in result.fixtures)
+    assert all(f.date == date(2027, 1, 15) and f.status == "scheduled" and f.kickoff is not None for f in result.fixtures)
     assert {f.girone for f in result.fixtures} == {Girone.A, Girone.SB}
+    assert result.registry_sync is None and result.n_postponed == 0  # an in-memory registry is never synchronised
     fixture_ids = {f.match_id for f in result.fixtures}
     assert result.odds and {q.match_id for q in result.odds} <= fixture_ids
     assert len(result.odds) == 2 * (5 + 3)  # per competition: full book for 900001, three OU markets for 900002
@@ -879,7 +913,17 @@ def test_launchers_detect_the_key_with_the_python_parser() -> None:
 # ============================================================================ CLI
 @pytest.fixture
 def cli_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> CountingTransport:
-    """No key in the environment or in a .env file; the client talks to the fixture router."""
+    """No key in the environment or in a .env file; the client talks to the fixture router.
+
+    The CLI defaults (``--config-dir``, ``--endpoints``, ``--mapping``) point at a private copy of ``config/``
+    and at a temporary mapping: the registry sync writes the dictionary it reads, never the repository's.
+    """
+    import shutil  # noqa: PLC0415
+
+    config_copy = tmp_path / "config-copy"
+    shutil.copytree(fs.CONFIG_DIR, config_copy)
+    monkeypatch.setattr(fs, "CONFIG_DIR", config_copy)
+    monkeypatch.setattr(fs, "DEFAULT_MAPPING_PATH", tmp_path / "data" / "footystats_teams.json")
     monkeypatch.delenv("FOOTYSTATS_API_KEY", raising=False)
     monkeypatch.setattr(fs, "DEFAULT_ENV_FILE", tmp_path / "absent.env")
     monkeypatch.setattr(fs, "_utc_now", lambda: NOW)
@@ -929,7 +973,7 @@ def test_cli_harvest_writes_csvs_and_odds(cli_env: CountingTransport, tmp_path: 
     out, fixtures_out, odds_out = tmp_path / "p" / "matches.csv", tmp_path / "p" / "fixtures.csv", tmp_path / "o" / "footystats.csv"
     code = fs.main(
         [
-            "--competitions", "A", "SB", "--seasons", "2", "--key", KEY,
+            "--competitions", "A", "SB", "--seasons", "2", "--key", KEY, "--no-sync",
             "--out", str(out), "--fixtures-out", str(fixtures_out), "--odds-out", str(odds_out),
             "--cache-dir", str(tmp_path / "raw"), "--mapping", str(tmp_path / "map.json"),
         ]
@@ -937,14 +981,17 @@ def test_cli_harvest_writes_csvs_and_odds(cli_env: CountingTransport, tmp_path: 
     captured = capsys.readouterr()
     assert code == 0, captured.err
     assert KEY not in captured.out and KEY not in captured.err
-    assert "matches=52 fixtures=4 odds=16" in captured.out and "perimeter: season 2026/27 (80 current teams)" in captured.out
+    assert "matches=52 fixtures=4 odds=16" in captured.out and "perimeter: season 2026/27 (242 current teams)" in captured.out
+    assert "registry_sync=-" in captured.out and f"fixtures -> {fixtures_out} (4 fixtures, 0 postponed)" in captured.out
+    header = fixtures_out.read_text(encoding="utf-8").splitlines()[0]
+    assert header == "match_id,date,round,girone,home_team,away_team,kickoff,status"
     assert "  A: 2026/27: 13 matches, 2025/26: 13 matches" in captured.out and f"odds -> {odds_out}" in captured.out
     from src.ingestion.harvester import load_fixtures, load_processed  # noqa: PLC0415
 
     frame = load_processed(out)
     assert len(frame) == 52 and sorted(frame["girone"].unique().tolist()) == ["A", "SB"]
     fixtures = load_fixtures(fixtures_out)
-    assert len(fixtures) == 4 and all(f.date == date(2027, 1, 15) for f in fixtures)
+    assert len(fixtures) == 4 and all(f.date == date(2027, 1, 15) and f.kickoff is not None and f.status == "scheduled" for f in fixtures)
     quotes = load_odds_quotes(odds_out.parent)  # the dashboard / main.py reader understands the file
     assert len(quotes) == 16 and {q.match_id for q in quotes} == {f.match_id for f in fixtures}
     assert all(q.bookmaker == "FootyStats" for q in quotes)
@@ -954,8 +1001,29 @@ def test_cli_harvest_writes_csvs_and_odds(cli_env: CountingTransport, tmp_path: 
 
     # --no-odds leaves the odds file alone; a failing history season is reported and keeps the CSV untouched
     fs.DEFAULT_ENV_FILE = tmp_path / "absent.env"
-    code = fs.main(["--competitions", "A", "--seasons", "1", "--key", KEY, "--no-odds", "--out", str(out), "--fixtures-out", str(fixtures_out), "--odds-out", str(tmp_path / "o" / "none.csv"), "--cache-dir", str(tmp_path / "raw"), "--mapping", str(tmp_path / "map.json")])
+    code = fs.main(["--competitions", "A", "--seasons", "1", "--key", KEY, "--no-odds", "--no-sync", "--out", str(out), "--fixtures-out", str(fixtures_out), "--odds-out", str(tmp_path / "o" / "none.csv"), "--cache-dir", str(tmp_path / "raw"), "--mapping", str(tmp_path / "map.json")])
     assert code == 0 and not (tmp_path / "o" / "none.csv").exists() and len(load_processed(out)) == 13
+
+
+def test_cli_no_odds_removes_the_stale_quotes_of_postponed_matches(
+    cli_env: CountingTransport, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Regression: with ``--no-odds`` the quotes of an earlier run kept pricing matches that were since postponed."""
+    out, fixtures_out, odds_out = tmp_path / "p" / "matches.csv", tmp_path / "p" / "fixtures.csv", tmp_path / "o" / "footystats.csv"
+    common = ["--competitions", "A", "--seasons", "1", "--key", KEY, "--no-sync", "--out", str(out), "--fixtures-out", str(fixtures_out), "--odds-out", str(odds_out), "--mapping", str(tmp_path / "map.json")]
+    assert fs.main([*common, "--cache-dir", str(tmp_path / "raw1")]) == 0
+    before = load_odds_quotes(odds_out.parent)
+    assert {q.match_id for q in before} == {f"FS-{CURRENT_A * 1_000_000 + 900001}", f"FS-{CURRENT_A * 1_000_000 + 900002}"}
+    with odds_out.open("a", encoding="utf-8") as handle:
+        handle.write("USER-1,MyBook,1X2,1,2.0\nUSER-1,MyBook,1X2,X,3.0\nUSER-1,MyBook,1X2,2,4.0\n")  # not a fixture of the run: kept
+    capsys.readouterr()
+    # a day after their kick-off the two matches are still incomplete: postponed, and their old prices are stale
+    monkeypatch.setattr(fs, "_utc_now", lambda: datetime(2027, 1, 16, 12, 0, tzinfo=UTC))
+    assert fs.main([*common, "--cache-dir", str(tmp_path / "raw2"), "--no-odds"]) == 0
+    captured = capsys.readouterr()
+    assert "(2 fixtures, 2 postponed)" in captured.out and KEY not in captured.out
+    assert f"odds: 17 stale quote rows removed from {odds_out}" in captured.out  # 11 selections of 900001, 6 of 900002
+    assert {q.match_id for q in load_odds_quotes(odds_out.parent)} == {"USER-1"}
 
 
 def test_cli_partial_harvest_exit_code_and_allow_partial(cli_env: CountingTransport, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
@@ -969,7 +1037,7 @@ def test_cli_partial_harvest_exit_code_and_allow_partial(cli_env: CountingTransp
 
     monkeypatch.setattr(fs, "FootyStatsClient", with_failing)
     out = tmp_path / "matches.csv"
-    args = ["--competitions", "A", "--seasons", "2", "--key", KEY, "--out", str(out), "--fixtures-out", str(tmp_path / "f.csv"), "--odds-out", str(tmp_path / "o.csv"), "--cache-dir", str(tmp_path / "raw"), "--mapping", str(tmp_path / "map.json")]
+    args = ["--competitions", "A", "--seasons", "2", "--key", KEY, "--no-sync", "--out", str(out), "--fixtures-out", str(tmp_path / "f.csv"), "--odds-out", str(tmp_path / "o.csv"), "--cache-dir", str(tmp_path / "raw"), "--mapping", str(tmp_path / "map.json")]
     assert fs.main(args) == 1
     captured = capsys.readouterr()
     assert "failure A:2025/26" in captured.err and "harvest incomplete: 1 failures" in captured.err and not out.exists()
@@ -1006,8 +1074,9 @@ def test_cli_harvest_failure_is_masked_and_exit_1(cli_env: CountingTransport, mo
 def test_cli_parser_defaults_and_endpoints_section(endpoints: FootyStatsEndpoints) -> None:
     args = fs._build_parser().parse_args([])
     assert args.competitions == list(fs.DEFAULT_COMPETITIONS) == [m.value for m in Girone] and len(args.competitions) == 13
-    assert args.seasons == 3 and args.key is None and not args.no_odds and not args.no_auto_init
+    assert args.seasons == 3 and args.key is None and not args.no_odds and not args.no_auto_init and not args.no_sync and not args.sync_registry
     assert args.odds_out == fs.ODDS_DIR / "footystats.csv" and args.mapping == fs.DEFAULT_MAPPING_PATH
+    assert fs.DEFAULT_MAPPING_PATH == fs.ROOT / "data" / "footystats_teams.json" and fs.LEGACY_MAPPING_PATH == fs.ROOT / "config" / "footystats_teams.json"
     assert endpoints.base_url == "https://api.football-data-api.com" and endpoints.key_env == "FOOTYSTATS_API_KEY"
     assert endpoints.url_league_list() == "https://api.football-data-api.com/league-list"
     assert endpoints.url_league_matches().endswith("/league-matches") and endpoints.url_league_teams().endswith("/league-teams")
@@ -1041,3 +1110,139 @@ def test_real_registry_mapper_keeps_one_name_across_divisions(tmp_path: Path) ->
     resolved = {t.id: mapper.resolve(t, code, "2026/27") for t, code in ((vicenza, "SB"), (pescara, "B"))}
     assert resolved[1].canonical in registry.canonical_names and resolved[2].canonical in registry.canonical_names
     assert registry.girone_of(resolved[1].canonical) == Girone.parse("SB") and registry.girone_of(resolved[2].canonical) == Girone.B
+
+
+# ============================================================================ calendar as of the download, in-play matches, stale quotes
+_LIVE_SEASON = 17487  # Serie C girone A 2026/27 in the league list below
+_LIVE_TEAMS = ((1, "Renate"), (2, "Trento"), (3, "Lecco"), (4, "Novara"))
+
+
+class LiveWorld:
+    """A one-competition FootyStats account whose ``/league-matches`` changes between two harvests."""
+
+    def __init__(self, matches: list[dict[str, Any]]) -> None:
+        self.matches = matches
+        self.paths: list[str] = []
+
+    @staticmethod
+    def match(match_id: int, home: int, away: int, kickoff: datetime, status: str = "incomplete", *, goals: tuple[int, int] = (-1, -1), odds: bool = False) -> dict[str, Any]:
+        row: dict[str, Any] = {
+            "id": match_id, "homeID": home, "awayID": away, "home_name": "", "away_name": "", "status": status,
+            "date_unix": int(kickoff.timestamp()), "game_week": 13, "homeGoalCount": goals[0], "awayGoalCount": goals[1],
+        }  # fmt: skip
+        if odds:
+            row.update(odds_ft_1=2.1, odds_ft_x=3.2, odds_ft_2=3.4)
+        return row
+
+    def router(self, request: httpx.Request) -> httpx.Response:
+        assert request.url.params.get("key") == KEY
+        self.paths.append(request.url.path)
+        envelope = {"success": True, "pager": {"current_page": 1, "max_page": 1}}
+        if request.url.path == "/league-list":
+            return json_response({**envelope, "data": [{"name": "Italy Serie C Group A", "country": "Italy", "season": [{"id": _LIVE_SEASON, "year": 20262027}]}]})
+        if request.url.path == "/league-teams":
+            return json_response({**envelope, "data": [{"id": i, "name": n, "cleanName": n, "english_name": n} for i, n in _LIVE_TEAMS]})
+        if request.url.path == "/league-matches":
+            return json_response({**envelope, "data": [dict(m) for m in self.matches]})
+        return json_response({"success": False, "message": "not found"}, status=404)
+
+
+def _live_provider(world: LiveWorld, http: HttpConfig, tmp_path: Path, *, now: datetime, cache: RawCache | None, live_minutes: float = 10.0) -> fs.FootyStatsProvider:
+    endpoints = dataclasses.replace(load_endpoints().footystats, live_matches_cache_minutes=live_minutes)
+    client, _ = make_client(http, router=world.router, cache=cache, endpoints=endpoints)
+    registry = TeamRegistry.from_teams("2026/27", {"A": [n for _, n in _LIVE_TEAMS]})
+    mapper = fs.FootyStatsTeamMapper(registry, TeamMatcher(registry), mapping_path=tmp_path / "map.json")
+    return fs.FootyStatsProvider(client, mapper, endpoints, now=lambda: now, config_dir=tmp_path / "no-config")
+
+
+def _back_date(cache_dir: Path, when: datetime) -> int:
+    count = 0
+    for path in cache_dir.glob("*.json"):
+        record = json.loads(path.read_text(encoding="utf-8"))
+        record["fetched_at"] = when.isoformat(timespec="seconds")
+        path.write_text(json.dumps(record), encoding="utf-8")
+        count += 1
+    return count
+
+
+@pytest.mark.asyncio
+async def test_a_cached_calendar_is_judged_as_of_its_download_never_as_postponed(http_cfg: HttpConfig, tmp_path: Path) -> None:
+    """Regression: a five-hour-old cached payload made a match that kicked off 3h30 ago look 'postponed'."""
+    real_now = datetime.now(UTC).replace(microsecond=0)
+    kickoff = real_now - timedelta(hours=3, minutes=30)  # kicked off after the download below, played by now
+    world = LiveWorld([LiveWorld.match(100, 1, 2, kickoff), LiveWorld.match(101, 3, 4, real_now + timedelta(days=1))])
+    cache = RawCache(tmp_path / "raw", ttl=timedelta(hours=6))
+    first = _live_provider(world, http_cfg, tmp_path, now=real_now - timedelta(hours=5), cache=cache)
+    async with first.client:
+        earlier = await first.harvest(["A"], seasons=1, with_odds=False)
+    assert [(f.match_id, f.status) for f in earlier.fixtures] == [("FS-100", "scheduled"), ("FS-101", "scheduled")]
+    assert _back_date(tmp_path / "raw", real_now - timedelta(hours=5)) >= 3  # the download really happened five hours ago
+    world.matches[0].update(status="complete", homeGoalCount=2, awayGoalCount=1)  # meanwhile FootyStats has the result
+
+    # the cache may serve the old payload (a cap longer than its age): its matches are judged as of the download
+    cached = _live_provider(world, http_cfg, tmp_path, now=real_now, cache=cache, live_minutes=600)
+    world.paths.clear()
+    async with cached.client:
+        stale = await cached.harvest(["A"], seasons=1, with_odds=False)
+    assert world.paths == [] and stale.stats["cache_hits"] >= 3, "served from the raw cache"
+    assert [(f.match_id, f.status) for f in stale.fixtures] == [("FS-100", "scheduled"), ("FS-101", "scheduled")]
+    assert stale.n_postponed == 0, "a match still to play in an old payload is never 'rinviata'"
+
+    # the default cap (10 minutes) re-downloads the season being played: the result is there
+    fresh = _live_provider(world, http_cfg, tmp_path, now=real_now, cache=cache)
+    async with fresh.client:
+        result = await fresh.harvest(["A"], seasons=1, with_odds=False)
+    assert "/league-matches" in world.paths
+    assert result.matches["match_id"].tolist() == ["FS-100"] and (int(result.matches["home_goals"].iloc[0]), int(result.matches["away_goals"].iloc[0])) == (2, 1)
+    assert [f.match_id for f in result.fixtures] == ["FS-101"] and result.n_postponed == 0
+
+
+def test_matches_snapshot_reference_time_is_never_after_the_download() -> None:
+    now = datetime(2026, 11, 7, 15, 30, tzinfo=UTC)
+    assert fs.MatchesSnapshot([], None).reference_time(now) == now
+    assert fs.MatchesSnapshot([], now - timedelta(hours=5)).reference_time(now) == now - timedelta(hours=5)
+    assert fs.MatchesSnapshot([], now + timedelta(hours=1)).reference_time(now) == now  # an injected clock earlier than the file
+    assert fs.MatchesSnapshot([], datetime(2026, 11, 7, 10, 0)).reference_time(now.replace(tzinfo=None)) == datetime(2026, 11, 7, 10, 0, tzinfo=UTC)
+    assert load_endpoints().footystats.live_matches_cache_ttl == timedelta(minutes=10)
+    with pytest.raises(ValueError, match="live_matches_cache_minutes"):
+        FootyStatsEndpoints(live_matches_cache_minutes=-1)
+
+
+@pytest.mark.asyncio
+async def test_matches_in_play_stay_in_the_round_without_odds(http_cfg: HttpConfig, tmp_path: Path) -> None:
+    """Regression: a match that kicked off less than 3 hours ago was dropped (neither played nor a fixture)."""
+    now = datetime(2026, 11, 7, 14, 30, tzinfo=UTC)  # 15:30 in Rome
+    world = LiveWorld([
+        LiveWorld.match(200, 1, 2, now - timedelta(hours=1), odds=True),  # in play
+        LiveWorld.match(201, 3, 4, now + timedelta(hours=2), odds=True),  # later today
+        LiveWorld.match(202, 2, 3, now - timedelta(days=4), odds=True),  # postponed
+    ])  # fmt: skip
+    provider = _live_provider(world, http_cfg, tmp_path, now=now, cache=None)
+    async with provider.client:
+        result = await provider.harvest(["A"], seasons=1, with_odds=True)
+    by_id = {f.match_id: f for f in result.fixtures}
+    assert set(by_id) == {"FS-200", "FS-201", "FS-202"}, "the match in play is still a fixture of its round"
+    assert by_id["FS-200"].status == "scheduled" and by_id["FS-200"].kickoff == now - timedelta(hours=1)
+    assert by_id["FS-202"].status == "postponed" and result.n_postponed == 1
+    assert {q.match_id for q in result.odds} == {"FS-201"}, "no pre-match price for a match in play or postponed"
+
+
+def test_prune_stale_odds_drops_quotes_of_postponed_and_kicked_off_matches(tmp_path: Path) -> None:
+    now = datetime(2026, 11, 7, 14, 30, tzinfo=UTC)
+    fixtures = [
+        Fixture("FS-1", date(2026, 11, 8), 13, "A", "Lecco", "Trento", kickoff=now + timedelta(days=1)),
+        Fixture("FS-2", date(2026, 11, 7), 13, "A", "Renate", "Novara", kickoff=now - timedelta(minutes=30)),
+        Fixture("FS-3", date(2026, 9, 30), 1, "A", "Trento", "Renate", kickoff=datetime(2026, 9, 30, 13, 0, tzinfo=UTC), status="postponed"),
+        Fixture("FS-4", date(2026, 11, 8), 13, "A", "Novara", "Lecco"),  # no kick-off time: judged by nothing, kept
+    ]
+    assert fs.stale_quote_ids(fixtures, now=now) == {"FS-2", "FS-3"}
+    path = tmp_path / "footystats.csv"
+    pd.DataFrame(
+        [{"match_id": mid, "bookmaker": "FootyStats", "market": "1X2", "selection": sel, "odds": 2.5} for mid in ("FS-1", "FS-2", "FS-3", "FS-4", "FS-9") for sel in ("1", "X", "2")]
+    ).to_csv(path, index=False)
+    assert fs.prune_stale_odds(path, fixtures, now=now) == 6
+    kept = pd.read_csv(path, dtype="string")
+    assert sorted(set(kept["match_id"])) == ["FS-1", "FS-4", "FS-9"] and len(kept) == 9 and list(kept.columns) == ["match_id", "bookmaker", "market", "selection", "odds"]
+    assert fs.prune_stale_odds(path, fixtures, now=now) == 0 and fs.prune_stale_odds(tmp_path / "absent.csv", fixtures, now=now) == 0
+    # the quotes the dashboard reads no longer price the postponed match
+    assert {q.match_id for q in load_odds_quotes(tmp_path)} == {"FS-1", "FS-4", "FS-9"}

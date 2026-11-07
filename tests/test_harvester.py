@@ -146,6 +146,23 @@ def _restore_root_logging() -> Any:
     root.setLevel(level)
 
 
+def _repository_state() -> dict[str, str]:
+    """Digest of the tracked dictionaries and of every file under ``data/``."""
+    import hashlib  # noqa: PLC0415
+
+    root = hv.CONFIG_DIR.parent
+    paths = [*sorted(hv.CONFIG_DIR.glob("*.json")), *sorted(p for p in (root / "data").rglob("*") if p.is_file())]
+    return {str(path.relative_to(root)): hashlib.sha256(path.read_bytes()).hexdigest() for path in paths}
+
+
+@pytest.fixture(autouse=True)
+def _repository_untouched() -> Any:
+    """The FootyStats registry sync writes the dictionary it was read from: no facade test may write the repository's."""
+    before = _repository_state()
+    yield
+    assert _repository_state() == before, "a test wrote config/*.json or data/ of the repository"
+
+
 @pytest.fixture(autouse=True)
 def _no_footystats_key(monkeypatch: pytest.MonkeyPatch) -> None:
     """A developer's FootyStats key (environment or ``.env``) must not change the default provider
@@ -1025,6 +1042,42 @@ def test_save_and_load_fixtures_round_trip(tmp_path: Path) -> None:
         Harvester.load_fixtures(tmp_path / "bad.csv")
 
 
+def test_fixtures_csv_carries_kickoff_and_status_and_reads_old_files(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    kickoff = datetime(2026, 11, 7, 14, 30, tzinfo=timezone.utc)
+    fixtures = [
+        Fixture("FS-1", date(2026, 11, 7), 13, Girone.A, "Lecco", "Trento", kickoff=kickoff),
+        Fixture("FS-2", date(2026, 9, 30), 1, Girone.DA, "Chisola", "Borgosesia", kickoff=datetime(2026, 9, 30, 13, 0, tzinfo=timezone.utc), status="postponed"),
+        Fixture("SIM-3", date(2026, 11, 8), 13, Girone.B, "Perugia", "Ravenna"),  # no time (simulator, SofaScore)
+    ]
+    path = Harvester.save_fixtures(fixtures, tmp_path / "fixtures.csv")
+    lines = path.read_text(encoding="utf-8").splitlines()
+    assert lines[0] == ",".join(hv.FIXTURE_COLUMNS) == "match_id,date,round,girone,home_team,away_team,kickoff,status"
+    assert lines[1] == "FS-1,2026-11-07,13,A,Lecco,Trento,2026-11-07T14:30:00Z,scheduled"
+    assert lines[2].endswith(",2026-09-30T13:00:00Z,postponed") and lines[3].endswith(",,scheduled")
+    loaded = Harvester.load_fixtures(path)
+    assert loaded == fixtures and loaded[0].kickoff == kickoff and loaded[0].kickoff_local.hour == 15 and loaded[1].is_postponed
+    # a file of the old six-column layout still loads: no time, scheduled
+    old = tmp_path / "old.csv"
+    old.write_text("match_id,date,round,girone,home_team,away_team\nSS-9,2026-11-08,13,B,Perugia,Ravenna\n", encoding="utf-8")
+    assert Harvester.load_fixtures(old) == [Fixture("SS-9", date(2026, 11, 8), 13, Girone.B, "Perugia", "Ravenna")]
+    assert hv.REQUIRED_FIXTURE_COLUMNS == hv.FIXTURE_COLUMNS[:6]
+    # blank cells are the defaults; an unreadable kick-off or an unknown status is logged and read as scheduled without a time
+    odd = tmp_path / "odd.csv"
+    odd.write_text(
+        "match_id,date,round,girone,home_team,away_team,kickoff,status\n"
+        "X1,2026-11-08,13,B,Perugia,Ravenna,,\n"
+        "X2,2026-11-08,13,B,Pineto,Gubbio,domenica,rinviata\n"
+        "X3,2026-11-08,13,B,Vado,Spezia,2026-11-08 15:00:00+01:00,POSTPONED\n",
+        encoding="utf-8",
+    )
+    with caplog.at_level(logging.WARNING):
+        read = Harvester.load_fixtures(odd)
+    assert [(f.kickoff, f.status) for f in read[:2]] == [(None, "scheduled"), (None, "scheduled")]
+    assert read[2].kickoff == datetime(2026, 11, 8, 14, 0, tzinfo=timezone.utc) and read[2].status == "postponed"
+    record = next(r for r in caplog.records if r.getMessage().startswith("fixtures with an unreadable kickoff or status"))
+    assert record.cells == {"kickoff": ["X2"], "status": ["X2"]}
+
+
 # ============================================================================ CLI
 def test_cli_parser_defaults() -> None:
     args = hv._build_parser().parse_args([])
@@ -1161,10 +1214,11 @@ async def test_cache_read_failure_falls_back_to_network(
 ) -> None:
     cache = RawCache(tmp_path)
 
-    def unreadable(url: str, params: Any = None, *, stable: bool = False) -> Any:
+    def unreadable(url: str, params: Any = None, *, stable: bool = False, max_age: Any = None) -> Any:
         raise PermissionError(13, "Permission denied", str(tmp_path))
 
     monkeypatch.setattr(cache, "get", unreadable)
+    monkeypatch.setattr(cache, "get_entry", unreadable)  # the client reads entries (payload + fetch time)
     client, transport, _ = make_client(lambda request: json_response({"n": 1}), http_cfg, cache=cache)
     with caplog.at_level(logging.WARNING, logger="src.ingestion.harvester"):
         async with client:
@@ -1492,10 +1546,14 @@ def test_season_label_helpers() -> None:
 def test_registry_with_history_merges_older_dictionaries(current_registry: TeamRegistry, tmp_path: Path) -> None:
     merged = Harvester.registry_with_history(current_registry)
     assert merged.canonical_names == current_registry.canonical_names  # perimeter unchanged
-    # Vicenza and Arezzo play Serie B in the 2026/27 perimeter (code SB), so they are current, not historical.
-    assert {"Ternana", "Pontedera", "Pro Patria", "Rimini"} <= set(merged.historical_names)
-    assert merged.is_current_team("Vicenza") and merged.is_current_team("Arezzo")
+    # Vicenza and Arezzo play Serie B in the 2026/27 perimeter (code SB), so they are current, not historical; Ternana,
+    # Pontedera and Pro Patria (Serie C 2025/26) play Serie D 2026/27: still current, under the same canonical name.
+    assert {"Rimini", "Guidonia Montecelio", "Frosinone", "Monza", "Venezia"} <= set(merged.historical_names)
+    assert not {"Ternana", "Pontedera", "Pro Patria", "Bra", "Triestina"} & set(merged.historical_names)
+    assert merged.is_current_team("Vicenza") and merged.is_current_team("Arezzo") and merged.is_current_team("Ternana")
+    assert merged.girone_of("Ternana") is Girone.DE and merged.girone_of("Pontedera") is Girone.DD
     assert merged.exact("Ternana Calcio") == "Ternana" and merged.exact("Juventus U23") == "Juventus Next Gen"
+    assert merged.exact("Juventus II") == "Juventus Next Gen" and merged.exact("FC Trapani 1905") == "Trapani"
     legacy = Harvester.registry_with_history(load_registry(LEGACY_SEASON))
     assert legacy.historical_names == ()  # nothing older than 2025/26 ships
     synthetic = TeamRegistry.from_teams("test", {"A": ["Alpha", "Beta"]})
@@ -1504,7 +1562,7 @@ def test_registry_with_history_merges_older_dictionaries(current_registry: TeamR
 
     cfg = load_endpoints()
     by_season = Harvester(endpoints=cfg, season=CURRENT_SEASON, cache_dir=tmp_path)
-    assert by_season.registry.season_label == "2026/27" and "Ternana" in by_season.matcher.historical_names
+    assert by_season.registry.season_label == "2026/27" and "Rimini" in by_season.matcher.historical_names
     plain = Harvester(endpoints=cfg, season=CURRENT_SEASON, cache_dir=tmp_path, historical_aliases=False)
     assert plain.matcher.historical_names == frozenset()
     default = Harvester(endpoints=cfg, cache_dir=tmp_path)
@@ -1557,8 +1615,9 @@ async def test_harvest_all_three_seasons_on_current_registry(tmp_path: Path, cur
     # perimeter bookkeeping
     assert result.registry_season == "2026/27" == result.perimeter_season
     assert result.n_historical_matches == 5
-    # Arezzo and Ascoli are Serie B teams of the 2026/27 perimeter (current); Ascoli only appears in the dropped fixture anyway
-    assert result.historical_teams == ("Pontedera", "Rimini", "Ternana")
+    # Arezzo and Ascoli are Serie B teams of the 2026/27 perimeter (current); Ascoli only appears in the dropped fixture
+    # anyway; Ternana and Pontedera play Serie D 2026/27 (current too): only Rimini left the perimeter
+    assert result.historical_teams == ("Rimini",)
     assert result.unmapped_teams == {"SPAL": 1}
     assert set(result.historical_teams).isdisjoint(result.unmapped_teams)
     assert result.season_lines() == [
@@ -1566,7 +1625,7 @@ async def test_harvest_all_three_seasons_on_current_registry(tmp_path: Path, cur
         "  2025/26: 3 matches (history)",
         "  2024/25: 2 matches (history)",
     ]
-    assert "season=2026/27 seasons=2026/27,2025/26,2024/25 historical_matches=5 historical_teams=3 unmapped_teams=1" in result.summary()
+    assert "season=2026/27 seasons=2026/27,2025/26,2024/25 historical_matches=5 historical_teams=1 unmapped_teams=1" in result.summary()
 
     # seasons=1 restricts to the current season
     only_current = await Harvester(
@@ -1622,7 +1681,7 @@ async def test_pinned_past_season_is_historical_relative_to_the_perimeter(
     result = await harvester.harvest_all([Girone.B], season_id=SEASON_B_2526, with_stats=False)
     assert result.seasons == ("2025/26",) and result.registry_season == "2026/27"
     assert result.n_historical_matches == 3 == len(result.matches)  # everything is history for the perimeter
-    assert result.historical_teams == ("Pontedera", "Rimini", "Ternana")  # Arezzo and Ascoli: current Serie B teams
+    assert result.historical_teams == ("Rimini",)  # Arezzo and Ascoli: Serie B; Ternana and Pontedera: Serie D 2026/27
 
 
 @pytest.mark.asyncio
@@ -1701,11 +1760,11 @@ def test_cli_seasons_flags_and_season_report(tmp_path: Path, monkeypatch: pytest
     out, fixtures_out = tmp_path / "matches.csv", tmp_path / "fixtures.csv"
     code = hv.main(["--gironi", "B", "--seasons", "2", "--out", str(out), "--fixtures-out", str(fixtures_out), "--cache-dir", str(tmp_path / "raw")])
     assert code == 0
-    assert seen == {"seasons": 2, "season_id": None, "registry": "2026/27", "historical": ["Bra"]}
+    assert seen == {"seasons": 2, "season_id": None, "registry": "2026/27", "historical": ["Frosinone"]}
     loaded = Harvester.load_processed(out)
     assert list(loaded.columns) == list(MATCH_COLUMNS) and len(loaded) == 3  # one CSV, no season column
     printed = capsys.readouterr().out
-    assert "perimeter: season 2026/27 (config/teams_2026_27.json, 80 current teams)" in printed  # 60 Serie C + 20 Serie B
+    assert "perimeter: season 2026/27 (config/teams_2026_27.json, 242 current teams)" in printed  # 60 Serie C + 20 Serie B + 162 Serie D
     assert "  2026/27: 1 matches (perimeter)" in printed and "  2024/25: 1 matches (history)" in printed
     assert "historical matches used: 2" in printed
     assert "historical teams (not in the 2026/27 perimeter, history only): Ternana (1)" in printed
@@ -1793,6 +1852,41 @@ def test_raw_cache_stable_reads_use_the_stable_ttl(tmp_path: Path) -> None:
     record["fetched_at"] = (datetime.now(UTC) - timedelta(days=400)).isoformat(timespec="seconds")
     path.write_text(json.dumps(record), encoding="utf-8")
     assert aged.get("https://a/y", stable=True) is None
+
+
+def test_raw_cache_entries_carry_their_fetch_time_and_max_age_caps_them(tmp_path: Path) -> None:
+    """A cached payload is served WITH the instant it was downloaded; ``max_age`` makes one read stricter than the TTL."""
+    cache = RawCache(tmp_path, ttl=timedelta(hours=6))
+    before = datetime.now(UTC).replace(microsecond=0)
+    path = cache.put("https://a/league-matches", {"data": [1]}, {"season_id": 7})
+    entry = cache.get_entry("https://a/league-matches", {"season_id": 7})
+    assert isinstance(entry, hv.CachedPayload) and entry.payload == {"data": [1]}
+    assert entry.fetched_at.tzinfo is not None and before <= entry.fetched_at <= datetime.now(UTC)
+    # back-date the record by five hours: still within the 6 h TTL, but older than a 10-minute cap
+    five_hours_ago = (datetime.now(UTC) - timedelta(hours=5)).replace(microsecond=0)
+    record = json.loads(path.read_text(encoding="utf-8"))
+    record["fetched_at"] = five_hours_ago.isoformat()
+    path.write_text(json.dumps(record), encoding="utf-8")
+    aged = cache.get_entry("https://a/league-matches", {"season_id": 7})
+    assert aged is not None and aged.fetched_at == five_hours_ago
+    assert cache.get_entry("https://a/league-matches", {"season_id": 7}, max_age=timedelta(minutes=10)) is None
+    assert cache.get("https://a/league-matches", {"season_id": 7}, max_age=timedelta(hours=8)) == {"data": [1]}  # the TTL still applies
+    record["fetched_at"] = (datetime.now(UTC) - timedelta(hours=7)).replace(tzinfo=None).isoformat()  # naive stamp = UTC
+    path.write_text(json.dumps(record), encoding="utf-8")
+    assert cache.get("https://a/league-matches", {"season_id": 7}, max_age=timedelta(hours=8)) is None
+
+
+@pytest.mark.asyncio
+async def test_client_reports_when_a_payload_was_downloaded(http_cfg: HttpConfig, tmp_path: Path) -> None:
+    cache = RawCache(tmp_path, ttl=timedelta(hours=6))
+    client, transport, _ = make_client(lambda request: json_response({"n": 1}), http_cfg, cache=cache)
+    async with client:
+        payload, fetched_at = await client.get_json_entry("/x")
+        assert payload == {"n": 1} and fetched_at is None  # fetched by this call: as fresh as the caller's clock
+        again, cached_at = await client.get_json_entry("/x")
+        assert again == {"n": 1} and cached_at is not None and cached_at.tzinfo is not None
+        assert transport.calls == 1 and client.stats.cache_hits == 1
+        assert await client.get_json("/x", max_age=timedelta(0)) == {"n": 1} and transport.calls == 2  # a zero cap refetches
 
 
 def test_season_is_completed_rule() -> None:

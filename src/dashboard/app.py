@@ -4,37 +4,66 @@ Run from the repository root::
 
     streamlit run src/dashboard/app.py
 
+Data
+----
+The dashboard shows **real FootyStats data only**, downloaded at runtime with
+the user's own key and kept locally (``data/processed``, ``data/odds``,
+git-ignored: FootyStats data is never committed to the public repository).
+At start, when a key is configured (``FOOTYSTATS_API_KEY`` in the environment,
+in ``.env`` or in the Streamlit secrets -- on Streamlit Cloud *App settings ->
+Secrets*: ``FOOTYSTATS_API_KEY = "..."``) and the local data is missing or
+older than 6 hours, it is downloaded again (:mod:`src.dashboard.data_refresh`,
+once per 6 hours per server, with a progress bar); the sidebar says when the
+data was last downloaded and offers *Aggiorna dati ora*. While the data stays
+older than 6 hours (no key, a failed download) a warning with its age is shown
+on every run, and so is one per competition that still carries the data of an
+earlier download. Without data the page is a **setup page** (what is missing,
+how to provide the key, *Scarica i dati da FootyStats adesso* when a key
+exists) and no tab is shown: the dashboard never invents numbers silently.
+
 Environment variables
 ---------------------
-``SERIEC_FORCE_SIMULATE=1``
-    Always use the synthetic league, even when ``data/processed/matches.csv`` exists.
+``SERIEC_DEMO=1``
+    Demo mode: the synthetic league (invented results, dates, pairings and
+    odds) instead of real data, with the red banner :data:`DEMO_WARNING` at the
+    top of the page and of every tab and the sidebar badge *Demo*; every CSV
+    download is named ``DEMO_...`` and starts with the column ``AVVISO`` =
+    ``DATI SIMULATI - NON USARE PER SCOMMETTERE``. Never on by default.
+    ``SERIEC_FORCE_SIMULATE=1`` is a deprecated alias.
+``SERIEC_PROCESSED_DIR`` / ``SERIEC_ODDS_DIR`` (default ``data/processed`` / ``data/odds``)
+    Where the real data is read from and downloaded to.
 ``SERIEC_SEASON`` (default ``2026_27``)
     Registry season (``config/teams_<season>.json``): the perimeter of teams that
     are ranked, predicted and priced, in every competition the file holds (the
-    three Serie C gironi and Serie B; the competition selector, the tables and
-    the perimeter banner follow ``config/competitions.toml``). Older seasons in
-    the data are history only; the simulated league of another season runs on
-    that season's calendar.
-``SERIEC_HISTORY`` (int 0-2, default 2)
-    Synthetic seasons before the registry season (2024/25 and 2025/26 for
-    2026/27) prepended to the simulated league.
+    competition selector, the tables and the perimeter banner follow
+    ``config/competitions.toml``). Older seasons in the data are history only.
 ``SERIEC_AS_OF`` (ISO date, default today)
-    Calendar position of the simulated league: rounds dated before it are
-    played, the next round is the fixture list. It is resolved on every run
-    (:func:`resolve_as_of`), so without the variable the position advances
-    with the real calendar while the server runs instead of being cached.
-``SERIEC_SIM_ROUNDS`` (int >= 1, optional)
-    Fixed number of played rounds of the simulated league instead of the
-    calendar; values above the season length are clamped by the data layer so
-    one round of fixtures always remains.
-``SERIEC_SEED`` (int >= 0, default 7)
-    Random seed of the simulated league.
+    Calendar position: for real data the official-round rule is evaluated at
+    midnight of that day (without the variable: at the current instant, on
+    every run); in the demo the rounds dated before it are played and the next
+    round is the fixture list. Resolved on every run (:func:`resolve_as_of`).
+``SERIEC_HISTORY`` (int 0-2, default 2), ``SERIEC_SIM_ROUNDS`` (int >= 1, optional), ``SERIEC_SEED`` (int >= 0, default 7)
+    Demo only: synthetic past seasons, fixed number of played rounds (clamped so
+    one round of fixtures remains) and random seed of the simulated league.
 
 Invalid or out-of-range values (non-integers, a negative seed, zero rounds, an
 unparseable date, an unknown season file) are logged and replaced by the
 defaults instead of crashing the page; should the pipeline itself refuse a
 valid-looking combination (``ValueError``), the page shows the error and falls
 back to the default season, calendar and seed.
+
+Giornata
+--------
+The *Giornata* tab lists **every match** of the selected rounds
+(:func:`src.dashboard.state.matchday_table_for`): the current round of each
+competition with the matches already played (``Stato`` ``giocata 2-1``, no
+prediction), the ones that have kicked off without a result in the data
+(``in corso / risultato in attesa``, no prediction: never a pre-match bet), the
+ones to play with their kick-off in ``Europe/Rome`` and the model's numbers,
+and the postponed ones (``rinviata``). With one competition
+selected in the sidebar a *Giornata n.* selector shows any official round of it;
+the *Recuperi e rinvii* expander lists the postponed matches and the isolated
+recoveries with their original date.
 
 Sections
 --------
@@ -63,6 +92,9 @@ from __future__ import annotations
 
 import os
 import sys
+import threading
+import time
+from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Final
@@ -79,9 +111,11 @@ st.set_page_config(page_title="Serie C Quant Lab", page_icon="⚽", layout="wide
 
 from src.common.competitions import describe_competitions
 from src.common.logging_config import get_logger
+from src.common.paths import ODDS_DIR, PROCESSED_DIR, ROOT
 from src.common.schemas import Girone, Market, MatchPrediction
 from src.common.teams import DEFAULT_SEASON, list_seasons, season_file_stem
 from src.dashboard import container_width_kwargs
+from src.dashboard import data_refresh
 from src.dashboard.legend import (
     POOR_EXAMPLE_FLAGS,
     SYNTHETIC_REASON_NO_QUOTES,
@@ -95,21 +129,27 @@ from src.dashboard.state import (
     ALL_MATCHDAYS,
     DEFAULT_HISTORY_SEASONS,
     DEFAULT_SECTION,
+    DEMO_BADGE,
+    DEMO_WARNING,
     MATCHDAY_TABLE_KEY_PREFIX,
     MAX_HISTORY_SEASONS,
     MIN_SIM_ROUNDS,
     SECTION_D,
     Matchday,
+    NoDataError,
     PipelineState,
     btts_picks_table,
     build_state,
     competition_options,
+    competition_rounds,
     coverage_text,
+    current_round_for,
+    demo_file_name,
+    demo_requested,
     draw_picks_table,
     export_csv_bytes,
     find_matchday,
     fixture_label,
-    fixtures_for,
     heatmap_figure,
     in_section,
     markets_table,
@@ -123,6 +163,7 @@ from src.dashboard.state import (
     predictions_table,
     quotes_for,
     ranking_table,
+    recoveries_table_for,
     results_table_for,
     results_team_options,
     seasons_available,
@@ -136,13 +177,15 @@ from src.dashboard.state import (
     selected_row_match_id,
     serie_d_gironi,
     serie_d_harvest_command,
+    state_at,
     strength_figure,
     traps_table,
     value_opportunities,
     value_table,
 )
+from src.engine.calendar import IN_PLAY_TEXT, STATUS_TO_PLAY, rome_midnight
 from src.engine.picks import DEFAULT_N_BTTS, DEFAULT_N_DRAWS
-from src.engine.tables import DEFAULT_FORM_N, DEFAULT_XG_N
+from src.engine.tables import DEFAULT_FORM_N, DEFAULT_XG_N, RECOVERIES_COLUMNS
 
 log = get_logger(__name__)
 
@@ -192,6 +235,20 @@ RESULTS_TABLE_KEY: Final[str] = "results_table"
 ALL_TEAMS_LABEL: Final[str] = "Tutte"
 #: Height (pixels) of the matchday and results tables: about 17 rows, a whole Serie C round of a girone and more.
 TABLE_HEIGHT: Final[int] = 600
+#: ``st.session_state`` key prefix of the *Giornata n.* selector of the Giornata tab (one per competition and section).
+ROUND_STATE_KEY: Final[str] = "round"
+#: Labels and keys of the data controls: the sidebar refresh button, the setup page's download button, the expander
+#: of the recoveries and the session key holding the last :class:`~src.dashboard.data_refresh.RefreshResult`.
+REFRESH_NOW_LABEL: Final[str] = "Aggiorna dati ora"
+REFRESH_BUTTON_KEY: Final[str] = "refresh_now"
+SETUP_DOWNLOAD_LABEL: Final[str] = "Scarica i dati da FootyStats adesso"
+SETUP_DOWNLOAD_KEY: Final[str] = "setup_download"
+RECOVERIES_LABEL: Final[str] = "Recuperi e rinvii"
+LAST_REFRESH_STATE_KEY: Final[str] = "last_refresh"
+#: The line to paste in Streamlit Cloud, App settings -> Secrets.
+SECRETS_LINE: Final[str] = 'FOOTYSTATS_API_KEY = "..."'
+#: Title of the page (the sidebar title repeats it).
+PAGE_TITLE: Final[str] = "⚽ Serie C Quant Lab"
 #: Tab labels, in order.
 TAB_LABELS: Final[tuple[str, ...]] = (
     "Classifica Forza",
@@ -283,6 +340,47 @@ def env_season(name: str, default: str = DEFAULT_SEASON) -> str:
     return stem
 
 
+def env_path(name: str, default: Path) -> Path:
+    """Directory from the environment (``~`` expanded), ``default`` when unset or blank."""
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    return Path(raw.strip()).expanduser()
+
+
+def processed_dir() -> Path:
+    """Directory of the real matches / fixtures CSVs: ``SERIEC_PROCESSED_DIR`` or ``data/processed``."""
+    return env_path("SERIEC_PROCESSED_DIR", PROCESSED_DIR)
+
+
+def odds_dir() -> Path:
+    """Directory of the odds CSVs: ``SERIEC_ODDS_DIR`` or ``data/odds``."""
+    return env_path("SERIEC_ODDS_DIR", ODDS_DIR)
+
+
+def data_stamp(directory: Path) -> float | None:
+    """Modification time of the newest local data file (``matches.csv``, ``fixtures.csv``, the refresh stamp): the cache key of the data.
+
+    A refresh writes new files, so the cached pipeline state of the old data is
+    never reused; ``None`` when there is no data.
+    """
+    stamps: list[float] = []
+    for name in ("matches.csv", "fixtures.csv", data_refresh.STAMP_FILE):
+        try:
+            stamps.append((Path(directory) / name).stat().st_mtime)
+        except OSError:
+            continue
+    return max(stamps) if stamps else None
+
+
+def calendar_now() -> datetime:
+    """Reference instant of the official-round rule for real data: midnight of ``SERIEC_AS_OF`` in Rome, else now (to the minute)."""
+    day = env_date("SERIEC_AS_OF")
+    if day is not None:
+        return rome_midnight(day)
+    return datetime.now(UTC).replace(second=0, microsecond=0)
+
+
 def resolve_as_of() -> date:
     """Calendar position of the simulated league: ``SERIEC_AS_OF`` when valid, otherwise today.
 
@@ -297,7 +395,7 @@ def resolve_as_of() -> date:
 # =============================================================================
 # Cached pipeline
 # =============================================================================
-@st.cache_resource(show_spinner="Stima del modello Dixon-Coles in corso…")
+@st.cache_resource(show_spinner="Stima del modello Dixon-Coles in corso…", max_entries=8)
 def load_state(
     *,
     min_ev: float,
@@ -309,9 +407,22 @@ def load_state(
     season: str = DEFAULT_SEASON,
     history_seasons: int = DEFAULT_HISTORY_SEASONS,
     as_of: date | None = None,
+    processed: str | None = None,
+    odds: str | None = None,
+    stamp: float | None = None,
 ) -> PipelineState:
-    """Build (and cache) the pipeline state for one combination of sidebar parameters."""
+    """Build (and cache) the pipeline state for one combination of sidebar parameters and one version of the local data.
+
+    ``processed`` / ``odds`` are the data directories (default ``data/processed``
+    / ``data/odds``) and ``stamp`` the data version (:func:`data_stamp`): it is
+    only part of the cache key, so new data downloaded by a refresh yields a new
+    state. Raises :class:`~src.dashboard.state.NoDataError` without real data
+    (``simulate`` not ``True``): the exception is not cached, the next run tries
+    again.
+    """
     return build_state(
+        processed_dir=Path(processed) if processed else PROCESSED_DIR,
+        odds_dir=Path(odds) if odds else ODDS_DIR,
         min_ev=min_ev,
         kelly_fraction=kelly_fraction,
         bankroll_units=bankroll_units,
@@ -322,6 +433,185 @@ def load_state(
         history_seasons=history_seasons,
         as_of=as_of,
     )
+
+
+@st.cache_resource(max_entries=16)
+def calendar_state(_state: PipelineState, built_at: str, now: datetime) -> PipelineState:
+    """The cached state with its calendar regrouped at ``now`` (:func:`src.dashboard.state.state_at`), cached per minute.
+
+    ``_state`` is not hashed (Streamlit skips arguments with a leading
+    underscore): ``built_at`` identifies it.
+    """
+    return state_at(_state, now)
+
+
+# =============================================================================
+# Data download (FootyStats, runtime)
+# =============================================================================
+@dataclass
+class RefreshGuard:
+    """Server-wide record of the automatic refreshes: one attempt per data directory per :data:`~src.dashboard.data_refresh.DEFAULT_MAX_AGE`.
+
+    Shared by every session (``st.cache_resource``), so a failing download is
+    not retried on every rerun and two sessions never download at once.
+    ``results`` keeps the last :class:`~src.dashboard.data_refresh.RefreshResult`
+    of each data directory, so every session -- not only the one that ran the
+    download -- can say why the data was not renewed.
+    """
+
+    lock: threading.Lock = field(default_factory=threading.Lock)
+    attempts: dict[str, float] = field(default_factory=dict)
+    results: dict[str, data_refresh.RefreshResult] = field(default_factory=dict)
+
+
+@st.cache_resource
+def refresh_guard() -> RefreshGuard:
+    """The process-wide :class:`RefreshGuard`."""
+    return RefreshGuard()
+
+
+def run_refresh(key: str, *, data_dir: Path, quotes_dir: Path, force: bool) -> data_refresh.RefreshResult | None:
+    """Download the FootyStats data now, with a spinner and a progress bar; ``None`` when skipped by the guard.
+
+    Without ``force`` the download runs at most once per 6 hours per data
+    directory (:class:`RefreshGuard`); the button *Aggiorna dati ora* and the
+    setup page pass ``force=True``. The result is kept in
+    ``st.session_state[LAST_REFRESH_STATE_KEY]`` for the *Dettagli pipeline*
+    expander; when files were written the cached pipeline states are dropped
+    (the new data has a new cache key anyway). The key is passed to the
+    downloader only, never shown.
+    """
+    guard = refresh_guard()
+    slot = str(Path(data_dir).resolve())
+    if not guard.lock.acquire(blocking=False):
+        st.info("Un aggiornamento dei dati FootyStats è già in corso: riprova tra poco.", icon="⏳")
+        return None
+    try:
+        last = guard.attempts.get(slot)
+        if not force and last is not None and time.time() - last < data_refresh.DEFAULT_MAX_AGE.total_seconds():
+            return None
+        guard.attempts[slot] = time.time()
+        bar = st.progress(0.0, text="Aggiornamento dei dati FootyStats…")
+
+        def progress(fraction: float, message: str) -> None:
+            bar.progress(min(max(float(fraction), 0.0), 1.0), text=message)
+
+        with st.spinner("Scarico i dati da FootyStats con la tua chiave…"):
+            result = data_refresh.refresh(data_dir, quotes_dir, key=key, progress=progress)
+        bar.empty()
+        guard.results[slot] = result
+    finally:
+        guard.lock.release()
+    st.session_state[LAST_REFRESH_STATE_KEY] = result
+    if result.written:
+        load_state.clear()
+        calendar_state.clear()
+    log.info("dashboard refresh", extra={"written": result.written, "errors": list(result.errors), "forced": force})
+    return result
+
+
+def render_refresh_outcome(result: data_refresh.RefreshResult | None) -> None:
+    """``st.success`` / ``st.warning`` for a refresh that just ran: what was saved and which competitions were skipped."""
+    if result is None:
+        return
+    if result.written:
+        st.success(result.summary_text(), icon="✅")
+    for line in result.warnings():
+        st.warning(line, icon="⚠️")
+
+
+def render_data_panel(container: st.delta_generator.DeltaGenerator, *, data_dir: Path, quotes_dir: Path) -> data_refresh.RefreshResult | None:
+    """Sidebar data box: automatic refresh when the data is missing or old, the timestamp and *Aggiorna dati ora*.
+
+    The automatic refresh runs only with a key and at most once per 6 hours
+    (:func:`run_refresh`); its progress and outcome are shown in the main area.
+    Returns the result of a refresh that ran in this script run (``None``
+    otherwise).
+    """
+    location = data_refresh.locate_key()
+    result: data_refresh.RefreshResult | None = None
+    if location is not None and data_refresh.needs_refresh(data_dir):
+        result = run_refresh(location.value, data_dir=data_dir, quotes_dir=quotes_dir, force=False)
+    with container:
+        label = data_refresh.refresh_label(data_dir)
+        st.caption(label or "Dati FootyStats non ancora scaricati.")
+        if location is not None:
+            pressed = st.button(
+                REFRESH_NOW_LABEL,
+                key=REFRESH_BUTTON_KEY,
+                help="Scarica di nuovo partite, calendario e quote da FootyStats con la tua chiave (i dati restano solo su questo computer o server).",
+                **FULL_WIDTH["button"],
+            )
+        else:
+            pressed = False
+            st.caption("Chiave FootyStats non configurata: i dati non si aggiornano.")
+    if pressed and location is not None:
+        result = run_refresh(location.value, data_dir=data_dir, quotes_dir=quotes_dir, force=True)
+    render_refresh_outcome(result)
+    render_data_warnings(data_dir, key_available=location is not None, refreshed_now=result is not None)
+    return result
+
+
+def render_data_warnings(data_dir: Path, *, key_available: bool, refreshed_now: bool) -> None:
+    """The warnings shown on **every** run while the local data is old or partly old (not only after a download).
+
+    * data older than :data:`~src.dashboard.data_refresh.DEFAULT_MAX_AGE`:
+      ``'Dati vecchi di 2 giorni (...): aggiornamento non riuscito / chiave
+      mancante'`` (:func:`~src.dashboard.data_refresh.stale_warning`), with the
+      error of the last attempt of any session (:class:`RefreshGuard`);
+    * a competition that still carries the data of an earlier download (its
+      download, or its current season, failed last time:
+      :func:`~src.dashboard.data_refresh.kept_data_warnings`), unless a
+      download ran in this script run (its own warnings already say so).
+    """
+    last = refresh_guard().results.get(str(Path(data_dir).resolve()))
+    error = last.error if last is not None and not last.written else None
+    stale = data_refresh.stale_warning(data_dir, key_available=key_available, last_error=error)
+    if stale:
+        st.warning(stale, icon="⏰")
+    if not refreshed_now:
+        for line in data_refresh.kept_data_warnings(data_dir):
+            st.warning(line, icon="⚠️")
+
+
+def render_setup_page(error: NoDataError, *, data_dir: Path, quotes_dir: Path) -> None:
+    """The page shown without real data: what is missing, how to provide the key, the download button. No tabs, no numbers."""
+    location = data_refresh.locate_key()
+    st.title(PAGE_TITLE)
+    st.error("Nessun dato reale disponibile: la dashboard non mostra numeri inventati.", icon="🛑")
+    st.markdown("**Cosa manca**\n\n" + "\n".join(f"- {reason}" for reason in error.reasons))
+    try:
+        shown_dir = Path(data_dir).resolve().relative_to(ROOT).as_posix()
+    except ValueError:
+        shown_dir = str(data_dir)
+    st.markdown(
+        "**Come fornire la chiave FootyStats** (la chiave non va mai pubblicata né scritta nel codice)\n\n"
+        "- **In locale**: copia `.env.example` in `.env` nella cartella del progetto e scrivi la riga "
+        "`FOOTYSTATS_API_KEY=la_tua_chiave` (il file `.env` è escluso da git).\n"
+        f"- **Su Streamlit Cloud**: *App settings → Secrets*, incolla `{SECRETS_LINE}` con la tua chiave e salva.\n"
+        "- Su footystats.org aggiungi all'account le leghe delle competizioni (*Choose leagues*): una lega non scelta "
+        "viene saltata e segnalata.\n\n"
+        f"I dati scaricati restano solo in `{shown_dir}` e nella cartella delle quote, mai nel repository pubblico."
+    )
+    if location is None:
+        st.info("Nessuna chiave FootyStats trovata (ambiente, file .env, secrets di Streamlit): configurala e ricarica la pagina.", icon="🔑")
+    else:
+        st.success(f"Chiave FootyStats trovata ({location.source}).", icon="🔑")
+        if st.button(SETUP_DOWNLOAD_LABEL, key=SETUP_DOWNLOAD_KEY, type="primary", **FULL_WIDTH["button"]):
+            result = run_refresh(location.value, data_dir=data_dir, quotes_dir=quotes_dir, force=True)
+            render_refresh_outcome(result)
+            if result is not None and result.written:
+                st.rerun()
+    st.caption(
+        "Vuoi solo provare l'interfaccia? Avvia con SERIEC_DEMO=1: lega simulata (squadre vere, calendari e risultati "
+        "inventati) con un avviso rosso su ogni pagina."
+    )
+
+
+def demo_banner(state: PipelineState) -> None:
+    """The red :data:`~src.dashboard.state.DEMO_WARNING` banner, for the demo only (called at the top of the page and of every tab)."""
+    if state.is_demo:
+        st.error(DEMO_WARNING, icon="🚨")
 
 
 def selected_girone(label: str) -> Girone | None:
@@ -425,7 +715,7 @@ def render_section_controls(container: st.delta_generator.DeltaGenerator, state:
 
 
 def render_source_badge(container: st.delta_generator.DeltaGenerator, state: PipelineState, section: str | None = None) -> None:
-    """Data-source badge: the section's perimeter (season, teams, current vs historical matches), fit diagnostics, Serie D status."""
+    """Data-source badge: *Dati reali FootyStats* or *Demo* (red, with the warning), the section's perimeter, fit diagnostics, Serie D status."""
     params = state.params
     body = (
         f"**{perimeter_text(state, section)}**  \n"
@@ -441,10 +731,10 @@ def render_source_badge(container: st.delta_generator.DeltaGenerator, state: Pip
         body += f"  \n{coverage}"
     if serie_d_gironi():
         body += f"  \nSerie D: {state.serie_d_status}"
-    if state.source == "processed":
-        container.success(f"**Dati reali** (data/processed)  \n{body}", icon="✅")
+    if state.is_demo:
+        container.error(f"**{DEMO_BADGE}** · {DEMO_WARNING}  \n{body}", icon="🧪")
     else:
-        container.info(f"**Dati simulati** (generatore sintetico)  \n{body}", icon="🧪")
+        container.success(f"**Dati reali FootyStats** (scaricati con la tua chiave)  \n{body}", icon="✅")
 
 
 def render_section_notice(state: PipelineState, section: str) -> bool:
@@ -461,8 +751,8 @@ def render_section_notice(state: PipelineState, section: str) -> bool:
     if section == SECTION_D:
         st.info(
             f"Serie D {state.serie_d_status}. Comando: `{serie_d_harvest_command(season=state.season_label)}` — oppure {LAUNCHERS_HINT} con la chiave "
-            "FootyStats in .env. La prima raccolta inizializza i nove gironi (18 squadre ciascuno, 34 giornate) in "
-            f"config/teams_{state.season_label.replace('/', '_')}.json dalle liste squadre dell'API; poi la sezione mostra "
+            "FootyStats in .env, o «Aggiorna dati ora» nella sidebar. La raccolta allinea i nove gironi (18 squadre ciascuno, 34 giornate) in "
+            f"config/teams_{state.season_label.replace('/', '_')}.json alle liste squadre dell'API e ne scarica partite e calendario; poi la sezione mostra "
             "classifica, giornate, risultati, valore e selezioni come quella di Serie B e Serie C.",
             icon="ℹ️",
         )
@@ -476,6 +766,7 @@ def render_section_notice(state: PipelineState, section: str) -> bool:
 # =============================================================================
 def render_ranking_tab(state: PipelineState, girone: Girone | None, section: str = DEFAULT_SECTION) -> None:
     """*Classifica Forza*: the strength ranking of the section (one competition with ``girone``) and its α/β charts."""
+    demo_banner(state)
     st.subheader(f"Classifica di forza · {section}")
     if render_section_notice(state, section):
         return
@@ -553,9 +844,21 @@ def matchday_column_config() -> dict[str, object]:
     config: dict[str, object] = {
         "Competizione": cc.TextColumn("Competizione", width="small", pinned=True),
         "Data": cc.DateColumn("Data", format="DD/MM/YYYY", width="small"),
-        "Giornata": cc.NumberColumn("Giornata", format="%d", width="small", help="Numero di turno della competizione."),
+        "Calcio d'inizio": cc.TextColumn(
+            "Calcio d'inizio", width="small", help="Giorno e ora del calcio d'inizio (ora italiana); solo il giorno quando la fonte non dà l'orario."
+        ),
+        "Giornata": cc.NumberColumn("Giornata", format="%d", width="small", help="Giornata ufficiale della competizione (game_week di FootyStats)."),
         "Casa": cc.TextColumn("Casa", pinned=True),
         "Ospiti": cc.TextColumn("Ospiti", pinned=True),
+        "Stato": cc.TextColumn(
+            "Stato",
+            width="small",
+            help=(
+                "giocata con il risultato finale (niente previsione) · da giocare (previsione del modello) · in corso / risultato "
+                "in attesa (calcio d'inizio passato, risultato non ancora nei dati: niente previsione né selezioni) · rinviata "
+                "(nessun risultato 48 ore dopo il calcio d'inizio, recupero da fissare)."
+            ),
+        ),
         "Tot. att.": cc.NumberColumn("Tot. att.", format="%.2f", help="λ + μ: gol totali attesi della partita."),
         "Ris. prob.": cc.TextColumn("Ris. prob.", help="Risultato esatto più probabile e sua probabilità (la cella più alta della matrice)."),
         "EV max (%)": cc.NumberColumn("EV max (%)", format="%+.2f %%", help="Miglior valore atteso fra tutte le selezioni quotate della partita; vuoto senza quote."),
@@ -610,51 +913,143 @@ def results_column_config() -> dict[str, object]:
     }
 
 
-def render_match_tab(state: PipelineState, girone: Girone | None, matchday: Matchday | None, section: str = DEFAULT_SECTION) -> None:
-    """*Giornata*: the whole matchday of the section as one table, then the detail of the selected fixture.
+def round_selector(state: PipelineState, girone: Girone, matchday: Matchday | None, section: str) -> int | None:
+    """The *Giornata n.* selectbox of one competition (every official round with matches); returns the chosen round.
 
-    The table (:func:`matchday_table_for`) has one row per fixture of the
-    selected matchday and sidebar competition. Clicking a row
-    (``selection_mode='single-row'``, ``on_select='rerun'``) selects that fixture:
-    the *Partita* selectbox (key :data:`FIXTURE_STATE_KEY`) follows the click and
+    The default is the competition's round in the selected matchday (its
+    current round when it is not in it, the last round otherwise); the choice
+    follows the matchday until the user picks another round (the key is
+    scoped to the competition and the section). ``None`` when the competition
+    has no match at all.
+    """
+    rounds = competition_rounds(state, girone)
+    if not rounds:
+        return None
+    current = current_round_for(state, girone)
+    current_no = None if current is None else current.round
+    default = matchday.rounds.get(girone) if matchday is not None else None
+    if default is None:
+        default = current_no if current_no is not None else rounds[-1]
+    if default not in rounds:
+        default = rounds[-1]
+    key = section_key(f"{ROUND_STATE_KEY}_{girone.value}", section)
+    seed_key = f"{key}_default"
+    if st.session_state.get(key) not in rounds or st.session_state.get(key) == st.session_state.get(seed_key):
+        st.session_state[key] = default
+    st.session_state[seed_key] = default
+    return int(
+        st.selectbox(
+            "Giornata n.",
+            rounds,
+            key=key,
+            format_func=lambda r: f"Giornata {r}" + (" (corrente)" if r == current_no else ""),
+            help=(
+                f"Ogni giornata ufficiale di {girone.short} con almeno una partita: la tabella mostra tutte le sue partite, "
+                "le giocate con il risultato, quelle iniziate senza risultato nei dati (in corso / risultato in attesa), "
+                "le da giocare con la previsione, le rinviate."
+            ),
+        )
+    )
+
+
+def render_recoveries(state: PipelineState, girone: Girone | None, section: str) -> None:
+    """The *Recuperi e rinvii* expander: postponed matches and recoveries outside the current rounds, with their original date."""
+    table = recoveries_table_for(state, section, girone)
+    with st.expander(f"{RECOVERIES_LABEL} ({len(table)})", expanded=False):
+        if table.empty:
+            st.caption("Nessuna partita rinviata o da recuperare fuori dalle giornate correnti.")
+            return
+        st.caption(
+            "Partite rinviate (data originale passata da oltre 48 ore senza risultato, recupero non ancora fissato) e recuperi "
+            "ancora da giocare fissati fuori dalla giornata corrente della loro competizione: non spostano la giornata e non "
+            "entrano nelle selezioni di giornata. Data originale = il giorno in cui si giocava il resto del turno, solo per una "
+            "partita spostata davvero. Una partita già iniziata senza risultato resta nel suo turno (in corso / risultato in attesa)."
+        )
+        st.dataframe(
+            table,
+            hide_index=True,
+            column_order=[c for c in RECOVERIES_COLUMNS if c != "match_id"],
+            column_config={
+                "Giornata": st.column_config.NumberColumn("Giornata", format="%d", width="small"),
+                "Data originale": st.column_config.TextColumn("Data originale", help="Il giorno in cui la partita era in calendario."),
+                "Nuova data": st.column_config.TextColumn("Nuova data", help="Calcio d'inizio del recupero (ora italiana); da definire per un rinvio."),
+                **{c: st.column_config.NumberColumn(c, format="%.1f %%") for c in ("P1 (%)", "PX (%)", "P2 (%)", "GG (%)")},
+            },
+            key=section_key(f"recoveries_{'all' if girone is None else girone.value}", section),
+            **FULL_WIDTH["dataframe"],
+        )
+
+
+def render_match_tab(state: PipelineState, girone: Girone | None, matchday: Matchday | None, section: str = DEFAULT_SECTION) -> None:
+    """*Giornata*: every match of the selected rounds in one table, the recoveries, then the detail of the selected fixture.
+
+    Without a sidebar competition the table is the selected matchday (the
+    current round of every competition of the section by default); with one
+    competition the *Giornata n.* selector (:func:`round_selector`) picks any of
+    its official rounds. The table (:func:`matchday_table_for`) lists every
+    match: played (``Stato`` *giocata 2-1*, no prediction), kicked off without a
+    result in the data (*in corso / risultato in attesa*, no prediction), to play
+    (kick-off and the model's numbers) and postponed. Clicking the row of a match to play
+    (``selection_mode='single-row'``, ``on_select='rerun'``) selects it: the
+    *Partita* selectbox (key :data:`FIXTURE_STATE_KEY`) follows the click and
     stays available as the fallback; a choice made in the selectbox afterwards
     is kept until the next click (:data:`APPLIED_ROW_STATE_KEY`); both keys are
-    scoped to the section (:func:`src.dashboard.state.section_key`). The widget
-    key is scoped to the matchday, competition and section (:func:`matchday_table_key`):
-    Streamlit keeps a selection per widget key regardless of the data, so a
-    fixed key would carry the clicked row position onto the table of another
-    competition or matchday and silently open a fixture never clicked; a new
-    scope is a new widget, without a selection, and the detail falls back to
-    the first fixture. Below the table: the metrics row, the score-matrix
-    heatmap and the markets table of the selected fixture, as before.
+    scoped to the section. The widget key is scoped to the matchday (or round),
+    competition and section (:func:`matchday_table_key`), so a selection never
+    outlives its table. Below: the metrics row, the score-matrix heatmap and
+    the markets table of the selected fixture.
     """
-    st.subheader(f"Giornata: tutte le partite in tabella · {section}")
+    demo_banner(state)
+    st.subheader(f"Giornata: tutte le partite del turno · {section}")
     if render_section_notice(state, section):
         return
     fixture_key = section_key(FIXTURE_STATE_KEY, section)
     applied_key = section_key(APPLIED_ROW_STATE_KEY, section)
-    preds = fixtures_for(state, girone, matchday=matchday, section=section)
-    if not preds:
-        message = "Nessuna partita in programma per la competizione selezionata"
-        message += "." if matchday is None else f" nella {matchday.label}."
+    round_number: int | None = None
+    if girone is not None:
+        selector, _ = st.columns([1, 3])
+        with selector:
+            round_number = round_selector(state, girone, matchday, section)
+        table = matchday_table_for(state, None, girone, section, round_number=round_number) if round_number is not None else matchday_table_for(state, None, girone, section)
+        scope_label = f"{girone.short} · Giornata {round_number}" if round_number is not None else girone.short
+    else:
+        table = matchday_table_for(state, matchday, None, section)
+        scope_label = matchday.label if matchday is not None else f"tutte le competizioni di {section}"
+    if table.empty:
+        message = f"Nessuna partita in calendario per {scope_label}."
         if state.skipped_fixtures:
             message += (
                 f" {len(state.skipped_fixtures)} partite caricate sono state saltate perché di un'altra stagione o con squadre "
                 f"fuori dal perimetro {state.season_label} (dettagli in *Dettagli pipeline*)."
             )
         st.info(message)
+        render_recoveries(state, girone, section)
         return
-    table = matchday_table_for(state, matchday, girone, section)
-    scope = f"tutte le competizioni di {section}" if girone is None else girone.short
+    status = table["Stato"].astype(str)
+    n_played = int(status.str.startswith("giocata").sum())
+    n_postponed = int((status == "rinviata").sum())
+    n_in_play = int((status == IN_PLAY_TEXT).sum())
+    to_play_ids = set(table.loc[(status == STATUS_TO_PLAY).to_numpy(dtype=bool), "match_id"].astype(str))
+    preds = sorted(
+        (p for p in section_predictions(state, section) if p.fixture.match_id in to_play_ids),
+        key=lambda p: (p.fixture.date, p.fixture.kickoff or datetime.min.replace(tzinfo=UTC), p.fixture.label),
+    )
     n_matchdays = len(matchdays(state, section))
     st.caption(
-        (f"{matchday.label} · " if matchday is not None else "")
-        + f"{len(table)} partite ({scope}) · una riga per partita: forza (α/β), forma delle ultime {DEFAULT_FORM_N} gare, "
+        f"{scope_label} · {len(table)} partite: {n_played} giocate, {len(to_play_ids)} da giocare"
+        + (f", {n_in_play} in corso o in attesa del risultato (senza previsione)" if n_in_play else "")
+        + (f", {n_postponed} rinviate" if n_postponed else "")
+        + f" · orari di calcio d'inizio in ora italiana · per le partite da giocare forza (α/β), forma delle ultime {DEFAULT_FORM_N} gare, "
         f"xG delle ultime {DEFAULT_XG_N}" + (" ('-' quando il dato manca: in Serie D gli xG sono spesso assenti)" if section == SECTION_D else "")
-        + ", gol attesi, probabilità, quote fair, miglior quota book, EV massimo e flag. Clicca una riga per aprire la partita qui sotto"
-        + (f"; la giornata si cambia nel tab *Selezioni di giornata* ({n_matchdays} in programma)." if matchday is not None else ".")
+        + ", gol attesi, probabilità, quote fair, miglior quota book, EV massimo e flag; le giocate mostrano solo il risultato. "
+        "Clicca una partita da giocare per aprirla qui sotto"
+        + (
+            f"; la giornata si cambia nel tab *Selezioni di giornata* ({n_matchdays} in programma)."
+            if girone is None and matchday is not None
+            else "; scegli un'altra giornata dal menù «Giornata n.»." if girone is not None else "."
+        )
     )
-    table_key = matchday_table_key(matchday, girone, section)
+    table_key = matchday_table_key(matchday if girone is None else None, girone, section, round_number=round_number)
     event = st.dataframe(
         table,
         hide_index=True,
@@ -666,16 +1061,27 @@ def render_match_tab(state: PipelineState, girone: Girone | None, matchday: Matc
         column_config=matchday_column_config(),
         **FULL_WIDTH["dataframe"],
     )
-    stem = "tutte" if matchday is None else matchday.key.replace("#", "_")
+    if round_number is not None and girone is not None:
+        stem = f"g{round_number}_{girone.value}"
+    else:
+        stem = ("tutte" if matchday is None else matchday.key.replace("#", "_")) + ("" if girone is None else "_" + girone.value)
     st.download_button(
         "Scarica tabella giornata (CSV)",
-        data=export_csv_bytes(table),
-        file_name=f"giornata_{section_slug(section)}_{stem}{'' if girone is None else '_' + girone.value}.csv",
+        data=export_csv_bytes(table, demo=state.is_demo),
+        file_name=demo_file_name(f"giornata_{section_slug(section)}_{stem}.csv", state.is_demo),
         mime="text/csv",
         key="dl_matchday",
         help="Tutte le colonne della tabella più match_id.",
         **FULL_WIDTH["download_button"],
     )
+    render_recoveries(state, girone, section)
+    if not preds:
+        st.info(
+            "Nessuna partita da giocare con una previsione in questa giornata: le partite sono giocate, già iniziate "
+            "(in corso / risultato in attesa) o rinviate.",
+            icon="ℹ️",
+        )
+        return
     labels = [fixture_label(p) for p in preds]
     label_by_id = {p.fixture.match_id: label for p, label in zip(preds, labels)}
     clicked = selected_row_match_id(event, table)
@@ -683,7 +1089,7 @@ def render_match_tab(state: PipelineState, girone: Girone | None, matchday: Matc
     if clicked is None:
         st.session_state.pop(applied_key, None)
     elif clicked in label_by_id and st.session_state.get(applied_key) != applied:
-        # a new click: the selectbox follows the table (a later manual choice in the selectbox is then respected)
+        # a new click on a match to play: the selectbox follows the table (a later manual choice is then respected)
         st.session_state[applied_key] = applied
         st.session_state[fixture_key] = label_by_id[clicked]
     if st.session_state.get(fixture_key) not in labels:
@@ -742,6 +1148,7 @@ def render_results_tab(state: PipelineState, girone: Girone | None, section: str
     (:func:`results_team_options`). The table is :func:`results_table_for`,
     sortable by clicking a header, with a CSV download.
     """
+    demo_banner(state)
     st.subheader(f"Risultati: partite giocate · {section}")
     if render_section_notice(state, section):
         return
@@ -801,8 +1208,11 @@ def render_results_tab(state: PipelineState, girone: Girone | None, section: str
     )
     st.download_button(
         "Scarica risultati (CSV)",
-        data=export_csv_bytes(table),
-        file_name=f"risultati_{section_slug(section)}_{season.replace('/', '_')}{'' if girone is None else '_' + girone.value}{'' if team is None else '_' + team.replace(' ', '_')}.csv",
+        data=export_csv_bytes(table, demo=state.is_demo),
+        file_name=demo_file_name(
+            f"risultati_{section_slug(section)}_{season.replace('/', '_')}{'' if girone is None else '_' + girone.value}{'' if team is None else '_' + team.replace(' ', '_')}.csv",
+            state.is_demo,
+        ),
         mime="text/csv",
         key="dl_results",
         help="Tutte le colonne della tabella più match_id.",
@@ -812,6 +1222,7 @@ def render_results_tab(state: PipelineState, girone: Girone | None, section: str
 
 def render_value_tab(state: PipelineState, girone: Girone | None, min_ev: float, matchday: Matchday | None, section: str = DEFAULT_SECTION) -> None:
     """*Opportunità di Valore*: the value selections of the section's matchday and its REGRESSION_TRAP alerts."""
+    demo_banner(state)
     st.subheader(f"Opportunità di valore · {section}")
     if render_section_notice(state, section):
         return
@@ -888,6 +1299,7 @@ def render_value_tab(state: PipelineState, girone: Girone | None, min_ev: float,
 
 def render_picks_tab(state: PipelineState, matchday: Matchday | None, section: str = DEFAULT_SECTION) -> None:
     """*Selezioni di giornata*: the section's matchday selector and its top-N draw / both-teams-to-score lists."""
+    demo_banner(state)
     st.subheader(f"Selezioni di giornata · {section}")
     if render_section_notice(state, section):
         return
@@ -908,8 +1320,10 @@ def render_picks_tab(state: PipelineState, matchday: Matchday | None, section: s
             format_func=lambda k: labels.get(k, k),
             key=section_key(MATCHDAY_STATE_KEY, section),
             help=(
-                f"I turni delle competizioni di {section} giocati nello stesso blocco della settimana (fine settimana ven-lun o "
-                "infrasettimanale mar-gio), con i recuperi aggregati alla giornata più vicina; vale anche per Giornata e Opportunità di Valore."
+                f"La prima è la giornata ufficiale corrente di ogni competizione di {section} (con le partite già giocate); le "
+                "successive raggruppano i turni seguenti giocati nello stesso blocco della settimana (fine settimana ven-lun o "
+                "infrasettimanale mar-gio). Rinvii e recuperi fuori turno non spostano le giornate. Vale anche per Giornata e "
+                "Opportunità di Valore."
             ),
         )
     with c_draws:
@@ -918,7 +1332,9 @@ def render_picks_tab(state: PipelineState, matchday: Matchday | None, section: s
         n_btts = int(st.number_input("N partite GG", min_value=1, max_value=MAX_PICKS, value=DEFAULT_N_BTTS, step=1, key="n_btts"))
     chosen = find_matchday(state, str(chosen_key), section) or matchday
     st.caption(
-        f"{chosen.label} · {chosen.n_fixtures} partite · {chosen.start.strftime('%d/%m/%Y')}"
+        f"{chosen.label} · {chosen.n_fixtures} partite da giocare"
+        + (f" ({chosen.n_played} già giocate, escluse dalle liste)" if chosen.n_played else "")
+        + f" · {chosen.start.strftime('%d/%m/%Y')}"
         + (f" - {chosen.end.strftime('%d/%m/%Y')}" if chosen.end != chosen.start else "")
         + f". Le liste considerano tutte le competizioni di {section}, qualunque sia il filtro Competizione della sidebar."
     )
@@ -958,8 +1374,8 @@ def render_picks_tab(state: PipelineState, matchday: Matchday | None, section: s
     )
     st.download_button(
         "Scarica le due liste (CSV)",
-        data=picks_csv_bytes(draws, btts, chosen),
-        file_name=f"selezioni_{section_slug(section)}_{chosen.key.replace('#', '_')}.csv",
+        data=picks_csv_bytes(draws, btts, chosen, demo=state.is_demo),
+        file_name=demo_file_name(f"selezioni_{section_slug(section)}_{chosen.key.replace('#', '_')}.csv", state.is_demo),
         mime="text/csv",
         key="dl_picks",
         help="Un solo CSV: colonna Lista = X oppure GG, poi le colonne delle tabelle.",
@@ -995,6 +1411,7 @@ def render_legend_tab(
     example is synthetic and its header says why (no quotes at all, or no value
     row with the current filters).
     """
+    demo_banner(state)
     st.markdown(legend_markdown())
     if section == SECTION_D:
         st.info(f"Sezione Serie D: {state.serie_d_status}.", icon="ℹ️")
@@ -1022,6 +1439,7 @@ def render_legend_tab(
 
 def render_export_tab(state: PipelineState, section: str = DEFAULT_SECTION) -> None:
     """*Export*: the value report and the full predictions of the section as CSV."""
+    demo_banner(state)
     st.subheader(f"Export CSV · {section}")
     if render_section_notice(state, section):
         return
@@ -1034,8 +1452,8 @@ def render_export_tab(state: PipelineState, section: str = DEFAULT_SECTION) -> N
         st.markdown(f"**Report valore** · {len(value_frame)} selezioni valutate (EV, edge, Kelly, flag) · {section}")
         st.download_button(
             "Scarica report valore (CSV)",
-            data=export_csv_bytes(value_frame),
-            file_name=f"report_valore_{slug}_{today}.csv",
+            data=export_csv_bytes(value_frame, demo=state.is_demo),
+            file_name=demo_file_name(f"report_valore_{slug}_{today}.csv", state.is_demo),
             mime="text/csv",
             key="dl_value",
             **FULL_WIDTH["download_button"],
@@ -1044,13 +1462,20 @@ def render_export_tab(state: PipelineState, section: str = DEFAULT_SECTION) -> N
         st.markdown(f"**Previsioni complete** · {len(preds_frame)} partite (λ, μ, probabilità e quote fair di ogni mercato) · {section}")
         st.download_button(
             "Scarica previsioni (CSV)",
-            data=export_csv_bytes(preds_frame),
-            file_name=f"previsioni_{slug}_{today}.csv",
+            data=export_csv_bytes(preds_frame, demo=state.is_demo),
+            file_name=demo_file_name(f"previsioni_{slug}_{today}.csv", state.is_demo),
             mime="text/csv",
             key="dl_predictions",
             **FULL_WIDTH["download_button"],
         )
-    st.caption("CSV UTF-8, separatore virgola, decimale punto, date ISO (AAAA-MM-GG).")
+    st.caption(
+        "CSV UTF-8, separatore virgola, decimale punto, date ISO (AAAA-MM-GG)."
+        + (
+            " Modalità demo: i file si chiamano DEMO_... e la prima colonna AVVISO dice DATI SIMULATI - NON USARE PER SCOMMETTERE."
+            if state.is_demo
+            else " Le previsioni coprono solo le partite non ancora iniziate."
+        )
+    )
     with st.expander("Anteprima previsioni"):
         st.dataframe(preds_frame, hide_index=True, **FULL_WIDTH["dataframe"])
 
@@ -1059,29 +1484,49 @@ def render_export_tab(state: PipelineState, section: str = DEFAULT_SECTION) -> N
 # Page
 # =============================================================================
 def main() -> None:
-    """Compose the page: sidebar parameters, cached state, section controls, badge, subtitle, tabs of the section."""
+    """Compose the page: demo banner or data refresh, cached state (or the setup page), section controls, badge, tabs.
+
+    Real data by default: the sidebar data box refreshes it from FootyStats
+    when it is missing or older than 6 hours (with a key) and without data the
+    setup page replaces the tabs (:func:`render_setup_page`). ``SERIEC_DEMO=1``
+    switches to the simulated league, flagged by a red banner on the page and
+    on every tab.
+    """
+    demo = demo_requested()
     controls, min_ev, kelly_fraction, bankroll = render_sidebar()
     badge = st.sidebar.empty()
+    data_box = st.sidebar.container()
+    data_dir, quotes_dir = processed_dir(), odds_dir()
+    if demo:
+        st.error(DEMO_WARNING, icon="🚨")
+        with data_box:
+            st.caption("Modalità demo (SERIEC_DEMO=1): nessun dato FootyStats viene letto o scaricato.")
+    else:
+        render_data_panel(data_box, data_dir=data_dir, quotes_dir=quotes_dir)
 
-    simulate: bool | None = True if env_flag("SERIEC_FORCE_SIMULATE") else None
     seed = env_int("SERIEC_SEED", DEFAULT_SEED, minimum=0)
     n_rounds = env_optional_int("SERIEC_SIM_ROUNDS", minimum=MIN_SIM_ROUNDS)
     season = env_season("SERIEC_SEASON")
     history_seasons = env_optional_int("SERIEC_HISTORY", minimum=0, maximum=MAX_HISTORY_SEASONS)
     history = DEFAULT_HISTORY_SEASONS if history_seasons is None else history_seasons
     as_of = resolve_as_of()
+    common = dict(
+        min_ev=min_ev,
+        kelly_fraction=kelly_fraction,
+        bankroll_units=bankroll,
+        simulate=True if demo else False,
+        as_of=as_of,
+        processed=str(data_dir),
+        odds=str(quotes_dir),
+        stamp=None if demo else data_stamp(data_dir),
+    )
     try:
-        state = load_state(
-            min_ev=min_ev,
-            kelly_fraction=kelly_fraction,
-            bankroll_units=bankroll,
-            simulate=simulate,
-            seed=seed,
-            n_rounds=n_rounds,
-            season=season,
-            history_seasons=history,
-            as_of=as_of,
-        )
+        state = load_state(seed=seed, n_rounds=n_rounds, season=season, history_seasons=history, **common)
+    except NoDataError as exc:
+        log.warning("no real data: setup page", extra={"reasons": list(exc.reasons), "processed_dir": str(exc.processed_dir)})
+        badge.warning("**Nessun dato reale**: configura la chiave FootyStats e scarica i dati.", icon="🛑")
+        render_setup_page(exc, data_dir=data_dir, quotes_dir=quotes_dir)
+        return
     except ValueError as exc:
         # the page never crashes on a configuration the data layer refuses: say so and use the defaults
         log.warning(
@@ -1094,21 +1539,17 @@ def main() -> None:
             f"Uso la configurazione predefinita: stagione {DEFAULT_SEASON.replace('_', '/')}, calendario al {as_of.isoformat()}, seed {DEFAULT_SEED}.",
             icon="⚠️",
         )
-        state = load_state(
-            min_ev=min_ev,
-            kelly_fraction=kelly_fraction,
-            bankroll_units=bankroll,
-            simulate=simulate,
-            seed=DEFAULT_SEED,
-            n_rounds=None,
-            season=DEFAULT_SEASON,
-            history_seasons=DEFAULT_HISTORY_SEASONS,
-            as_of=as_of,
-        )
+        try:
+            state = load_state(seed=DEFAULT_SEED, n_rounds=None, season=DEFAULT_SEASON, history_seasons=DEFAULT_HISTORY_SEASONS, **common)
+        except NoDataError as again:
+            render_setup_page(again, data_dir=data_dir, quotes_dir=quotes_dir)
+            return
+    if not state.is_demo:
+        state = calendar_state(state, state.built_at.isoformat(), calendar_now())
     section, girone = render_section_controls(controls, state)
     render_source_badge(badge, state, section)
 
-    st.title("⚽ Serie C Quant Lab")
+    st.title(PAGE_TITLE)
     scope = f"tutte le competizioni di {section}" if girone is None else girone.short
     st.caption(
         f"{perimeter_text(state, section)} · Dixon-Coles su {state.n_matches} partite (stima congiunta di tutto il perimetro) · "
@@ -1119,6 +1560,7 @@ def main() -> None:
         notes = list(state.notes)
         if serie_d_gironi():
             notes.append(f"Sezione Serie D: {state.serie_d_status}.")
+        notes += registry_sync_notes(data_dir) if not state.is_demo else []
         st.markdown("\n".join(f"- {note}" for note in notes))
         st.caption(f"Stato calcolato alle {state.built_at.astimezone().strftime('%d/%m/%Y %H:%M:%S')} (fonte: {state.source}).")
 
@@ -1139,5 +1581,26 @@ def main() -> None:
     with tab_legend:
         render_legend_tab(state, girone, min_ev, matchday, kelly_fraction, bankroll, section)
 
+
+def registry_sync_notes(data_dir: Path) -> list[str]:
+    """The *Dettagli pipeline* lines about the last FootyStats download: registry differences, competitions skipped.
+
+    From the refresh run in this session when there was one, else from the
+    stamp file the last refresh wrote (:func:`src.dashboard.data_refresh.last_refresh`).
+    """
+    result = st.session_state.get(LAST_REFRESH_STATE_KEY)
+    if isinstance(result, data_refresh.RefreshResult):
+        lines = [result.summary_text()]
+        lines += [f"Dizionario squadre: {line}" for line in result.registry_sync]
+        lines += result.warnings()
+        return lines
+    stamp = data_refresh.last_refresh(data_dir)
+    if stamp is None:
+        return []
+    lines = [data_refresh.refresh_label(data_dir) or "Dati FootyStats scaricati."]
+    lines += [f"Dizionario squadre: {line}" for line in stamp.get("registry_sync", []) or []]
+    for code, reason in (stamp.get("errors") or {}).items():
+        lines.append(f"Competizione {code} non scaricata all'ultimo aggiornamento: {reason}.")
+    return lines
 
 main()

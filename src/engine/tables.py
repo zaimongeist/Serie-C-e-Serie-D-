@@ -4,12 +4,23 @@ The dashboard used to show one fixture at a time, picked from a dropdown; this
 module builds the two ``pandas`` frames with Italian labels that replace that
 workflow and that ``main.py`` prints and exports as well:
 
-* :func:`matchday_table` -- **one row per fixture** of a matchday: the strength
+* :func:`matchday_table` -- **one row per match** of the selected rounds
+  (every match of each competition's official round, see
+  :mod:`src.engine.calendar`: the ones already played with their final score,
+  the ones in play or waiting for their result, the ones still to play with the
+  model's numbers, the postponed ones): the kick-off in ``Europe/Rome``
+  (``'sab 07/11 14:30'``), the ``Stato`` (``'giocata 2-1'`` / ``'da giocare'`` /
+  ``'in corso / risultato in attesa'`` / ``'rinviata'``), the strength
   parameters of the two teams, their recent form (points, goals, xG over the
-  last *n* played matches), the model's expected goals, the most likely score,
-  the market probabilities and fair odds, the best bookmaker price per
-  selection, the best EV among the quoted selections and the union of the value
-  engine's flags (``REGRESSION_TRAP`` / ``TRAP:<team>`` included);
+  last *n* played matches) and, **only for the matches still to play**, the
+  model's expected goals, the most likely score, the market probabilities and
+  fair odds, the best bookmaker price per selection, the best EV among the
+  quoted selections and the union of the value engine's flags
+  (``REGRESSION_TRAP`` / ``TRAP:<team>`` included); played, kicked-off and
+  postponed rows leave those columns blank;
+* :func:`recoveries_table` -- the postponed matches and the recoveries outside
+  the current rounds, with their original date and, for the scheduled ones, the
+  model's 1X2 / GG probabilities;
 * :func:`results_table` -- **one row per played match**: score, outcome, shots,
   shots on target, corners and xG of both teams and, when an engine is given,
   the fitted rates, the probability the model assigned to the outcome that
@@ -35,7 +46,7 @@ from __future__ import annotations
 
 import math
 import time
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from typing import Any, Final
@@ -46,6 +57,7 @@ from scipy.special import gammaln, xlogy
 
 from src.common.logging_config import get_logger
 from src.common.schemas import Girone, Market, MatchPrediction, season_of, validate_matches_df
+from src.engine.calendar import STATUS_PLAYED, RoundMatch, RoundView, format_day
 from src.engine.model import DixonColesEngine, FittedParams, tau
 from src.engine.picks import Matchday, in_gironi
 from src.engine.value import (
@@ -67,6 +79,7 @@ __all__ = [
     "MATCHDAY_COLUMNS",
     "MISSING_TEXT",
     "P_OUTCOME_DECIMALS",
+    "RECOVERIES_COLUMNS",
     "RESULTS_COLUMNS",
     "RESULTS_MODEL_COLUMNS",
     "RESULT_DRAW",
@@ -81,6 +94,7 @@ __all__ = [
     "matchday_table",
     "outcome_probabilities",
     "p_outcome_percent",
+    "recoveries_table",
     "results_table",
     "surprise_tag",
     "team_form",
@@ -110,6 +124,8 @@ EXPECTED_TAG: Final[str] = "atteso"
 MISSING_TEXT: Final[str] = "-"
 #: Separator of the flags in the ``Flag`` column (same as the value panel).
 FLAG_SEPARATOR: Final[str] = " | "
+#: ``Nuova data`` of a postponed match in :func:`recoveries_table` (FootyStats has not published the recovery yet).
+TO_BE_SCHEDULED_TEXT: Final[str] = "da definire"
 #: Points per result.
 _POINTS: Final[dict[str, int]] = {RESULT_WIN: 3, RESULT_DRAW: 1, RESULT_LOSS: 0}
 #: Canonical order of the known flags in the ``Flag`` column; unknown flags follow, sorted.
@@ -158,13 +174,19 @@ def matchday_columns(form_n: int = DEFAULT_FORM_N, xg_n: int = DEFAULT_XG_N) -> 
     The windows are spelled out in the labels (``'Pt Casa (5)'``, ``'xG F/S
     Casa (3)'``) so a table is self-describing wherever it ends up (screen,
     console, CSV). :data:`MATCHDAY_COLUMNS` are the labels for the defaults.
+    ``Calcio d'inizio`` is the kick-off in ``Europe/Rome`` (``'sab 07/11 14:30'``,
+    the day alone when the source gives no time) and ``Stato`` the status of the
+    match (``'giocata 2-1'``, ``'da giocare'``, ``'in corso / risultato in attesa'``,
+    ``'rinviata'``).
     """
     return (
         "Competizione",
         "Data",
+        "Calcio d'inizio",
         "Giornata",
         "Casa",
         "Ospiti",
+        "Stato",
         "α Casa",
         "β Casa",
         "α Ospiti",
@@ -226,10 +248,27 @@ _ODDS_COLUMNS: Final[tuple[tuple[Market, str, str], ...]] = (
     (Market.BTTS, "GG", "GG"),
 )
 
+#: Columns of :func:`recoveries_table`, in order.
+RECOVERIES_COLUMNS: Final[tuple[str, ...]] = (
+    "Competizione",
+    "Giornata",
+    "Partita",
+    "Data originale",
+    "Nuova data",
+    "Stato",
+    "P1 (%)",
+    "PX (%)",
+    "P2 (%)",
+    "GG (%)",
+    "match_id",
+)
+
 _MATCHDAY_STRING_COLUMNS: Final[tuple[str, ...]] = (
     "Competizione",
+    "Calcio d'inizio",
     "Casa",
     "Ospiti",
+    "Stato",
     "Forma Casa",
     "Forma Ospiti",
     "Ris. prob.",
@@ -610,6 +649,31 @@ def _param(mapping: Mapping[str, float], team: str) -> float:
     return float("nan") if value is None else round(float(value), 2)
 
 
+def _entries(
+    predictions: Sequence[MatchPrediction],
+    *,
+    rounds: Sequence[RoundView] | None,
+    matchday: Matchday | None,
+    keep: "Callable[[Girone], bool]",
+) -> list[tuple[RoundMatch, MatchPrediction | None]]:
+    """The rows of :func:`matchday_table`: ``(match, prediction of a match still to play or None)``.
+
+    With round views (``rounds``, else the matchday's :attr:`Matchday.round_views`)
+    every match of those rounds is a row; without them (a matchday built by hand,
+    or no matchday) the rows are the predictions, as before the round views
+    existed, restricted to ``matchday`` when given.
+    """
+    by_id = {p.fixture.match_id: p for p in predictions}
+    views = list(rounds) if rounds is not None else (list(matchday.round_views) if matchday is not None and matchday.round_views else None)
+    if views is not None:
+        return [(m, by_id.get(m.match_id) if m.to_play else None) for v in views if keep(v.competition) for m in v.matches]
+    return [
+        (RoundMatch.from_fixture(p.fixture), p)
+        for p in predictions
+        if (matchday is None or matchday.contains(p)) and keep(Girone.parse(p.fixture.girone))
+    ]
+
+
 def matchday_table(
     predictions: Iterable[MatchPrediction],
     *,
@@ -624,33 +688,51 @@ def matchday_table(
     girone: Girone | None = None,
     long: pd.DataFrame | None = None,
     gironi: Iterable[Girone | str] | None = None,
+    rounds: Iterable[RoundView] | None = None,
 ) -> pd.DataFrame:
-    """One row per fixture of the matchday: strengths, form, model, markets, best prices, EV and flags.
+    """One row per match of the selected rounds: kick-off, status, strengths, form and, for the matches to play, model, markets, prices, EV and flags.
 
-    Columns exactly :func:`matchday_columns` ``(form_n, xg_n)`` (:data:`MATCHDAY_COLUMNS`
-    with the defaults), sorted by date, competition order and home team:
+    Rows
+        With ``rounds`` (:class:`~src.engine.calendar.RoundView` objects), or
+        with a ``matchday`` that carries round views (every :class:`Matchday`
+        built by :func:`src.engine.picks.matchdays`), the table lists **every
+        match** of those rounds: played (``Stato`` ``'giocata 2-1'``, model
+        columns blank), still to play (``'da giocare'``, the prediction's numbers
+        when ``predictions`` has the fixture; blank for a fixture the fit could
+        not predict), kicked off without a result in the data (``'in corso /
+        risultato in attesa'``, blank: no pre-match numbers for a match under
+        way) and postponed (``'rinviata'``, blank). The round views say which
+        is which at the instant they were taken. Otherwise the rows
+        are the ``predictions`` (of ``matchday`` when given), as in earlier
+        releases. ``girone`` keeps one competition and ``gironi`` a set of them
+        (the dashboard section's, see :func:`~src.engine.picks.in_gironi`;
+        ``None`` = every competition).
 
-    * ``α`` / ``β`` of both teams from ``params`` (2 decimals, ``NaN`` for a team
-      the fit does not know);
-    * form over the last ``form_n`` played matches of ``matches`` dated before
-      ``as_of`` (every match when ``None``): ``Forma`` (``'V-P-N-V-V'``, most
-      recent first), ``Pt`` (points), ``GF/GS`` (``'9/4'``); xG for / against over
-      the last ``xg_n`` matches (``'4.1/2.6'``, ``'-'`` when an xG is missing);
-    * ``λ``, ``μ``, ``Tot. att.`` (2 decimals), ``Ris. prob.`` (``'1-0 (14%)'``),
-      the market probabilities in percent (1 decimal) and the fair odds (2
-      decimals) from the prediction;
-    * ``Book ...``: the best (highest) bookmaker price per selection among
-      ``opportunities`` (``NaN`` when no bookmaker quotes it), ``EV max (%)`` the
-      best EV among the fixture's quoted selections (``NaN`` without quotes),
-      ``Miglior EV`` that selection as ``'X @3.40'`` (``''`` without quotes),
-      ``Flag`` the union of the flags of every quoted selection plus
-      ``REGRESSION_TRAP`` / ``TRAP:<team>`` for a team in ``traps`` even when
-      nothing is quoted;
-    * ``match_id`` last, so a UI can map a selected row back to its fixture.
+    Columns
+        Exactly :func:`matchday_columns` ``(form_n, xg_n)`` (:data:`MATCHDAY_COLUMNS`
+        with the defaults), sorted by day, kick-off, competition order and home
+        team:
 
-    ``matchday`` keeps only its fixtures, ``girone`` only one competition and
-    ``gironi`` only a set of competitions (the dashboard section's, see
-    :func:`~src.engine.picks.in_gironi`; ``None`` = every competition).
+        * ``Calcio d'inizio`` -- ``'sab 07/11 14:30'`` in ``Europe/Rome`` (the day
+          alone without a time); ``Stato`` -- see above;
+        * ``α`` / ``β`` of both teams from ``params`` (2 decimals, ``NaN`` for a
+          team the fit does not know);
+        * form over the last ``form_n`` played matches of ``matches`` dated before
+          ``as_of`` (every match when ``None``): ``Forma`` (``'V-P-N-V-V'``, most
+          recent first), ``Pt`` (points), ``GF/GS`` (``'9/4'``); xG for / against
+          over the last ``xg_n`` matches (``'4.1/2.6'``, ``'-'`` when an xG is
+          missing);
+        * for the matches to play only: ``λ``, ``μ``, ``Tot. att.`` (2 decimals),
+          ``Ris. prob.`` (``'1-0 (14%)'``), the market probabilities in percent
+          (1 decimal) and the fair odds (2 decimals); ``Book ...`` the best
+          (highest) bookmaker price per selection among ``opportunities``
+          (``NaN`` when no bookmaker quotes it), ``EV max (%)`` the best EV among
+          the fixture's quoted selections, ``Miglior EV`` that selection as
+          ``'X @3.40'`` (``''`` without quotes), ``Flag`` the union of the flags
+          of every quoted selection plus ``REGRESSION_TRAP`` / ``TRAP:<team>`` for
+          a team in ``traps`` even when nothing is quoted;
+        * ``match_id`` last, so a UI can map a selected row back to its match.
+
     ``long`` is a :func:`team_matches` frame built in advance (``matches`` and
     ``as_of`` are then ignored for the form): callers that build several tables
     pass it so the per-team frame is computed once. The form is computed with
@@ -663,15 +745,13 @@ def matchday_table(
         raise ValueError(f"form_n and xg_n must be >= 1, got {form_n} and {xg_n}")
     g = None if girone is None else Girone.parse(girone)
     allowed = None if gironi is None else tuple(Girone.parse(x) for x in gironi)
-    preds = [
-        p
-        for p in predictions
-        if (matchday is None or matchday.contains(p))
-        and (g is None or Girone.parse(p.fixture.girone) == g)
-        and in_gironi(p.fixture.girone, allowed)
-    ]
+
+    def keep(competition: Girone) -> bool:
+        return (g is None or competition == g) and in_gironi(competition, allowed)
+
+    entries = _entries(list(predictions), rounds=None if rounds is None else list(rounds), matchday=matchday, keep=keep)
     columns = matchday_columns(form_n, xg_n)
-    if not preds:
+    if not entries:
         return _empty_matchday_table(columns)
     team_frame = team_matches(matches, as_of=as_of) if long is None else long
     form = _form_lookup(form_table(long=team_frame, n=form_n), form_n)
@@ -684,26 +764,21 @@ def matchday_table(
             trapped[trap.team] = trap
 
     rows: list[dict[str, Any]] = []
-    for p in preds:
-        fx = p.fixture
-        home, away = str(fx.home_team), str(fx.away_team)
+    moments: list[datetime] = []
+    for match, p in entries:
+        home, away = str(match.home_team), str(match.away_team)
         f_home = form.get(home) or TeamForm.empty(home, form_n)
         f_away = form.get(away) or TeamForm.empty(away, form_n)
         x_home = xg_form.get(home) or TeamForm.empty(home, xg_n)
         x_away = xg_form.get(away) or TeamForm.empty(away, xg_n)
-        hs, as_, p_top = p.most_likely_score()
-        quote = quotes.get(fx.match_id)
-        flags: set[str] = set(quote.flags) if quote is not None else set()
-        for team in (home, away):
-            if team in trapped:
-                flags.add(FLAG_REGRESSION_TRAP)
-                flags.add(f"{TRAP_FLAG_PREFIX}{team}")
         row: dict[str, Any] = {
-            "Competizione": Girone.parse(fx.girone).short,
-            "Data": pd.Timestamp(fx.date),
-            "Giornata": int(fx.round),
+            "Competizione": match.competition.short,
+            "Data": pd.Timestamp(match.date),
+            "Calcio d'inizio": match.kickoff_text,
+            "Giornata": int(match.round),
             "Casa": home,
             "Ospiti": away,
+            "Stato": match.status_text,
             "α Casa": _param(params.alpha, home),
             "β Casa": _param(params.beta, home),
             "α Ospiti": _param(params.alpha, away),
@@ -716,24 +791,21 @@ def matchday_table(
             f"GF/GS Ospiti ({form_n})": f_away.goals_text,
             f"xG F/S Casa ({xg_n})": x_home.xg_text,
             f"xG F/S Ospiti ({xg_n})": x_away.xg_text,
-            "λ": round(float(p.home_rate), 2),
-            "μ": round(float(p.away_rate), 2),
-            "Tot. att.": round(float(p.home_rate + p.away_rate), 2),
-            "Ris. prob.": f"{hs}-{as_} ({p_top:.0%})",
         }
-        for market, selection, label in _PROB_COLUMNS:
-            row[label] = round(float(p.probabilities[market][selection]) * 100.0, 1)
-        for market, selection, suffix in _ODDS_COLUMNS:
-            row[f"Fair {suffix}"] = round(float(p.fair_odds[market][selection]), 2)
-        for market, selection, suffix in _ODDS_COLUMNS:
-            price = quote.best_price.get((market, selection)) if quote is not None else None
-            row[f"Book {suffix}"] = float("nan") if price is None else round(price, 2)
-        best = quote.best if quote is not None else None
-        row["EV max (%)"] = float("nan") if best is None else round(best.ev * 100.0, 2)
-        row["Miglior EV"] = "" if best is None else f"{best.selection} @{best.book_odds:.2f}"
+        flags: set[str] = set()
+        if match.to_play:
+            for team in (home, away):
+                if team in trapped:
+                    flags.add(FLAG_REGRESSION_TRAP)
+                    flags.add(f"{TRAP_FLAG_PREFIX}{team}")
+        if p is not None:
+            row.update(_model_columns(p, quotes.get(match.match_id), flags))
+        else:
+            row.update(_blank_model_columns())
         row["Flag"] = _order_flags(flags, home, away)
-        row["match_id"] = str(fx.match_id)
+        row["match_id"] = str(match.match_id)
         rows.append(row)
+        moments.append(match.sort_key()[1])
 
     frame = pd.DataFrame(rows, columns=list(columns))
     frame = frame.assign(Data=pd.to_datetime(frame["Data"]).astype("datetime64[ns]"), Giornata=frame["Giornata"].astype("int64"))
@@ -744,12 +816,18 @@ def matchday_table(
     numeric = [c for c in columns if c not in _MATCHDAY_STRING_COLUMNS and c not in ("Data", "Giornata") and not c.startswith(("Pt ", "GF/GS", "xG F/S"))]
     for column in numeric:
         frame[column] = frame[column].astype("float64")
-    order = frame["Competizione"].map({g.short: i for i, g in enumerate(Girone)}).astype("int64")
-    frame = frame.assign(_order=order).sort_values(["Data", "_order", "Casa"], kind="stable").drop(columns="_order").reset_index(drop=True)
+    order = frame["Competizione"].map({x.short: i for i, x in enumerate(Girone)}).astype("int64")
+    frame = (
+        frame.assign(_moment=pd.to_datetime(pd.Series(moments, index=frame.index), utc=True), _order=order)
+        .sort_values(["Data", "_moment", "_order", "Casa"], kind="stable")
+        .drop(columns=["_moment", "_order"])
+        .reset_index(drop=True)
+    )
     log.debug(
         "matchday table built",
         extra={
-            "n_fixtures": len(frame),
+            "n_rows": len(frame),
+            "n_played": int(frame["Stato"].str.startswith(STATUS_PLAYED).fillna(False).sum()),
             "n_quoted": int(frame["EV max (%)"].notna().sum()),
             "n_trapped": int(frame["Flag"].str.contains(FLAG_REGRESSION_TRAP, regex=False).fillna(False).sum()),
             "matchday": None if matchday is None else matchday.key,
@@ -759,6 +837,43 @@ def matchday_table(
         },
     )
     return frame
+
+
+def _model_columns(p: MatchPrediction, quote: "_FixtureQuotes | None", flags: set[str]) -> dict[str, Any]:
+    """The model, market, price and EV cells of a match still to play (``flags`` is extended with the quoted ones)."""
+    hs, as_, p_top = p.most_likely_score()
+    out: dict[str, Any] = {
+        "λ": round(float(p.home_rate), 2),
+        "μ": round(float(p.away_rate), 2),
+        "Tot. att.": round(float(p.home_rate + p.away_rate), 2),
+        "Ris. prob.": f"{hs}-{as_} ({p_top:.0%})",
+    }
+    for market, selection, label in _PROB_COLUMNS:
+        out[label] = round(float(p.probabilities[market][selection]) * 100.0, 1)
+    for market, selection, suffix in _ODDS_COLUMNS:
+        out[f"Fair {suffix}"] = round(float(p.fair_odds[market][selection]), 2)
+    for market, selection, suffix in _ODDS_COLUMNS:
+        price = quote.best_price.get((market, selection)) if quote is not None else None
+        out[f"Book {suffix}"] = float("nan") if price is None else round(price, 2)
+    best = quote.best if quote is not None else None
+    out["EV max (%)"] = float("nan") if best is None else round(best.ev * 100.0, 2)
+    out["Miglior EV"] = "" if best is None else f"{best.selection} @{best.book_odds:.2f}"
+    if quote is not None:
+        flags.update(quote.flags)
+    return out
+
+
+def _blank_model_columns() -> dict[str, Any]:
+    """The model cells of a played, postponed or unpredicted match: ``NaN`` numbers, empty texts."""
+    out: dict[str, Any] = {"λ": float("nan"), "μ": float("nan"), "Tot. att.": float("nan"), "Ris. prob.": ""}
+    for _market, _selection, label in _PROB_COLUMNS:
+        out[label] = float("nan")
+    for _market, _selection, suffix in _ODDS_COLUMNS:
+        out[f"Fair {suffix}"] = float("nan")
+        out[f"Book {suffix}"] = float("nan")
+    out["EV max (%)"] = float("nan")
+    out["Miglior EV"] = ""
+    return out
 
 
 def _empty_matchday_table(columns: Sequence[str]) -> pd.DataFrame:
@@ -773,6 +888,48 @@ def _empty_matchday_table(columns: Sequence[str]) -> pd.DataFrame:
         elif column not in ("Data", "Giornata"):
             frame[column] = frame[column].astype("float64")
     return frame[list(columns)]
+
+
+# =============================================================================
+# Recoveries and postponements
+# =============================================================================
+def recoveries_table(recoveries: Iterable[RoundMatch], predictions: Iterable[MatchPrediction] = ()) -> pd.DataFrame:
+    """The *Recuperi e rinvii* list: one row per postponed match or recovery outside the current rounds.
+
+    Columns exactly :data:`RECOVERIES_COLUMNS`: ``Data originale`` is the day
+    the match was originally due (``'dom 01/11'``, see
+    :func:`src.engine.calendar.recoveries`), ``Nuova data`` the new kick-off of a
+    rescheduled match (``'mer 11/11 14:30'``) or :data:`TO_BE_SCHEDULED_TEXT`
+    for a postponed one, ``Stato`` the status, and the 1X2 / GG probabilities of
+    the model (percent, 1 decimal) for a scheduled match ``predictions`` holds
+    (``NaN`` otherwise). Chronological order, as given.
+    """
+    by_id = {p.fixture.match_id: p for p in predictions}
+    rows: list[dict[str, Any]] = []
+    for m in recoveries:
+        p = by_id.get(m.match_id) if m.to_play else None
+        rows.append(
+            {
+                "Competizione": m.competition.short,
+                "Giornata": int(m.round),
+                "Partita": m.label,
+                "Data originale": m.original_date_text or format_day(m.date),
+                "Nuova data": TO_BE_SCHEDULED_TEXT if m.postponed else m.kickoff_text,
+                "Stato": m.status_text,
+                "P1 (%)": float("nan") if p is None else round(float(p.probabilities[Market.MATCH_ODDS]["1"]) * 100.0, 1),
+                "PX (%)": float("nan") if p is None else round(float(p.probabilities[Market.MATCH_ODDS]["X"]) * 100.0, 1),
+                "P2 (%)": float("nan") if p is None else round(float(p.probabilities[Market.MATCH_ODDS]["2"]) * 100.0, 1),
+                "GG (%)": float("nan") if p is None else round(float(p.probabilities[Market.BTTS]["GG"]) * 100.0, 1),
+                "match_id": str(m.match_id),
+            }
+        )
+    frame = pd.DataFrame(rows, columns=list(RECOVERIES_COLUMNS))
+    for column in ("Competizione", "Partita", "Data originale", "Nuova data", "Stato", "match_id"):
+        frame[column] = frame[column].astype("string")
+    frame["Giornata"] = frame["Giornata"].astype("int64")
+    for column in ("P1 (%)", "PX (%)", "P2 (%)", "GG (%)"):
+        frame[column] = frame[column].astype("float64")
+    return frame.reset_index(drop=True)
 
 
 # =============================================================================

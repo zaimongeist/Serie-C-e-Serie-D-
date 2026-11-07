@@ -10,8 +10,9 @@ iterates the dynamic :class:`src.common.schemas.Girone` enum and never assumes
 A/B/C.
 
 A configured competition may be **absent** from the file or hold an **empty**
-object (the Serie D gironi ship empty: the FootyStats harvester fills them from
-``/league-teams`` on its first run). Both cases are the same registry state:
+object (a league just added to ``config/competitions.toml``: the FootyStats
+registry sync fills it from ``/league-teams`` on the next harvest). Both cases
+are the same registry state:
 :meth:`TeamRegistry.teams` answers ``()``, :attr:`TeamRegistry.gironi` lists only
 the competitions that have teams, :meth:`TeamRegistry.missing_competitions`
 names the empty ones and :attr:`TeamRegistry.perimeter_label` counts only the
@@ -20,10 +21,12 @@ teams present.
 Seasons and perimeter
 ---------------------
 The registry of :data:`DEFAULT_SEASON` (``config/teams_2026_27.json``: the
-official Lega Pro composition of the three Serie C gironi plus the Serie B
-organico) is the *perimeter*: its 80 teams are the only ones that are ranked,
-predicted and priced (:attr:`TeamRegistry.perimeter_label` spells it out:
-``'Serie C 2026/27 Gironi A/B/C + Serie B (80 squadre)'``). Older season files
+three Serie C gironi, Serie B and the nine Serie D gironi as FootyStats
+``/league-teams`` lists them, kept equal to FootyStats by the registry sync of
+every harvest, :func:`src.ingestion.footystats.sync_registry`) is the
+*perimeter*: its 242 teams are the only ones that are ranked, predicted and
+priced (:attr:`TeamRegistry.perimeter_label` spells it out: ``'Serie C 2026/27
+Gironi A/B/C + Serie B + Serie D Gironi A-I (242 squadre)'``). Older season files
 (``teams_2025_26.json``, ...) are kept as **historical alias sources**:
 :meth:`TeamRegistry.with_historical_aliases` merges their spellings into the
 current registry so that harvested history keeps consistent names, while
@@ -51,6 +54,7 @@ __all__ = [
     "DEFAULT_SEASON",
     "PerimeterLabel",
     "TeamRegistry",
+    "dumps_registry_payload",
     "list_seasons",
     "load_registry",
     "normalize_name",
@@ -82,6 +86,44 @@ def normalize_name(name: str) -> str:
 def season_file_stem(season: str) -> str:
     """``'2026/27'`` or ``'2026_27'`` -> ``'2026_27'`` (the suffix of the registry file name)."""
     return str(season).strip().replace("/", "_").replace("-", "_")
+
+
+def dumps_registry_payload(payload: Mapping[str, object]) -> str:
+    """Serialise a ``teams_<season>.json`` payload in the repository's compact layout.
+
+    Top-level keys keep their order and are written one per line; under
+    ``"gironi"`` every competition is an object with **one club per line**
+    (``"Canonical": ["alias", ...]``), an empty competition is written ``{}``.
+    The output ends with a newline and is valid JSON (``json.loads`` gives the
+    payload back), so the registry sync and the hand-maintained files share one
+    readable format and a sync that changes one club changes one line.
+    """
+    def dump(value: object) -> str:
+        return json.dumps(value, ensure_ascii=False)
+
+    lines = ["{"]
+    items = list(payload.items())
+    for index, (key, value) in enumerate(items):
+        comma = "," if index < len(items) - 1 else ""
+        if key != "gironi" or not isinstance(value, Mapping):
+            lines.append(f"  {dump(key)}: {dump(value)}{comma}")
+            continue
+        lines.append(f"  {dump(key)}: {{")
+        groups = list(value.items())
+        for g_index, (code, teams) in enumerate(groups):
+            g_comma = "," if g_index < len(groups) - 1 else ""
+            members = list(dict(teams or {}).items())
+            if not members:
+                lines.append(f"    {dump(code)}: {{}}{g_comma}")
+                continue
+            lines.append(f"    {dump(code)}: {{")
+            for t_index, (canonical, aliases) in enumerate(members):
+                t_comma = "," if t_index < len(members) - 1 else ""
+                lines.append(f"      {dump(canonical)}: {dump(list(aliases))}{t_comma}")
+            lines.append(f"    }}{g_comma}")
+        lines.append(f"  }}{comma}")
+    lines.append("}")
+    return "\n".join(lines) + "\n"
 
 
 class PerimeterLabel(str):
@@ -119,7 +161,7 @@ class TeamRegistry:
     ``teams_by_girone`` maps a :class:`Girone` (competition) to its canonical
     names; a registry may hold any subset of the configured competitions (the
     mini demo has three, the default perimeter four with teams plus the nine
-    Serie D gironi awaiting their auto-init). ``aliases`` maps a *normalised*
+    Serie D gironi of the shipped dictionary). ``aliases`` maps a *normalised*
     spelling to a canonical name. The canonical names of ``teams_by_girone`` are
     the **current** teams; ``historical_names`` lists further canonical names
     reachable through the alias table that are *not* current (teams of previous
@@ -143,15 +185,15 @@ class TeamRegistry:
     def missing_competitions(self) -> tuple[Girone, ...]:
         """Configured competitions with no team in this registry, in configuration order.
 
-        ``(Girone.DA, ..., Girone.DI)`` for the shipped 2026/27 dictionary until the
-        FootyStats harvester initialises the Serie D gironi; ``()`` when every
+        ``()`` for the shipped 2026/27 dictionary; a competition just added to the
+        configuration is listed until the FootyStats registry sync fills it; ``()`` when every
         competition of ``config/competitions.toml`` has teams.
         """
         present = set(self.gironi)
         return tuple(g for g in Girone if g not in present)
 
     def families(self) -> tuple[str, ...]:
-        """Families that have at least one team, in configuration order (``('Serie C', 'Serie B')`` before the Serie D auto-init)."""
+        """Families that have at least one team, in configuration order (``('Serie C', 'Serie B', 'Serie D')`` for the shipped dictionary)."""
         return tuple(dict.fromkeys(g.family for g in self.gironi))
 
     @property
@@ -173,8 +215,8 @@ class TeamRegistry:
     def perimeter_label(self) -> PerimeterLabel:
         """Italian description of the perimeter derived from the configuration, never hard-coded.
 
-        ``'Serie C 2026/27 Gironi A/B/C + Serie B (80 squadre)'`` for the default
-        registry (the empty Serie D gironi are not named and not counted),
+        ``'Serie C 2026/27 Gironi A/B/C + Serie B + Serie D Gironi A-I (242 squadre)'`` for the
+        default registry (an empty competition is not named and not counted),
         ``'Serie C 2026/27 Gironi A/B/C (14 squadre)'`` for the mini demo; only
         the competitions that have teams are named (see
         :func:`src.common.competitions.describe_competitions`). The value is a
@@ -243,7 +285,7 @@ class TeamRegistry:
 
         Keys are parsed with :meth:`Girone.parse`, so ``'SB'`` and ``'Serie B'``
         both work. A competition mapped to an **empty** object (the Serie D
-        gironi before their auto-init) is accepted and simply has no teams: it is
+        gironi of an older dictionary) is accepted and simply has no teams: it is
         left out of ``teams_by_girone`` and reported by
         :meth:`missing_competitions`. ``ValueError`` when a canonical name is
         listed under two competitions (a club has one canonical name and plays

@@ -1,50 +1,48 @@
 """Matchdays and "picks of the matchday": the most probable draws and both-teams-to-score matches.
 
 This module is pure (no ``streamlit``): it only depends on the shared contracts
-of :mod:`src.common.schemas` and on :class:`~src.engine.value.ValueOpportunity`,
+of :mod:`src.common.schemas`, on the official-round rule of
+:mod:`src.engine.calendar` and on :class:`~src.engine.value.ValueOpportunity`,
 so the console pipeline, the dashboard data layer and the tests share one
 implementation.
 
 Matchdays
 ---------
 With a real provider the fixture list holds **every** not-yet-played match of
-the season (hundreds of fixtures across the four competitions, each with its
-round number and date), so "the next round" is not one list but one round per
-competition, and those rounds are neither numbered alike (Serie B may be at
-round 13 while the Serie C gironi are at round 14) nor played every week
-(Serie B stops for the international breaks, Serie C plays through and adds
-midweek rounds). :func:`matchdays` therefore groups the fixtures **by
-calendar**, not by round index:
+the season (hundreds of fixtures across the competitions, each with its
+official round, FootyStats ``game_week``, and its kick-off). A "giornata" is
+built from the **official rounds**, never from dates alone:
 
-1. per competition, the fixtures are grouped by round number and every round
-   is **anchored** on the median date of its fixtures, the day most of the
-   round is played: a lone postponed or anticipated match cannot move it;
-2. a round with fewer fixtures than **half the competition's typical round
-   size** (the largest round in the list: 10 for a 20-team competition, so
-   fewer than 5) is a **recovery** group -- postponed matches still carrying
-   their original round number, whatever their date -- and never counts as a
-   regular round; inside a regular round the fixtures dated more than
-   ``max_days`` from the anchor are stragglers and are treated the same way;
-3. the regular rounds of every competition are placed in the **block** of the
-   football week that holds their anchor, the weekend block (Friday to Monday)
-   or the midweek block (Tuesday to Thursday), see :func:`week_block`; the
-   rounds of different competitions in the same block form one matchday, so
-   the Serie B round of Saturday 14 and the Serie C rounds of Sunday 15 are
-   one "giornata" while the Serie B round of Saturday 21 (after a break) goes
-   with the Serie C rounds of Sunday 22. A competition that does not play in a
-   block is simply absent from that matchday; when a competition has two
-   rounds in one block (a double-header) the second opens a further matchday
-   in the same block;
-4. recoveries and stragglers are attached to the **nearest** matchday by date
-   (the earlier one on a tie), extending its date span, so no fixture is lost.
+1. per competition, :func:`src.engine.calendar.upcoming_rounds` gives its
+   **current round** (the smallest round with a match still to play in which at
+   least half of the matches are not yet played, or which is being played in
+   the current block of the football week) and the regular rounds after it;
+2. the **first matchday** is the union of the current round of every
+   competition, whatever their numbers (Serie B may be at round 11 while the
+   Serie C gironi are at round 13) and whatever their dates: a round played
+   from Friday to Monday stays in it with its Friday matches already played;
+3. the **later matchdays** are the following rounds, grouped by the block of
+   the football week of their anchor day (:func:`week_block`: weekend
+   Friday-Monday or midweek Tuesday-Thursday), so the Serie B round of Saturday
+   21 goes with the Serie C rounds of Sunday 22; a competition that has two
+   rounds in one block (a double-header) opens a further matchday;
+4. **recoveries never move a matchday**: a postponed match, the isolated
+   recovery of a round already played (one match on a Wednesday, the other
+   eight played the weekend before) and a match rescheduled more than
+   ``max_days`` days from its round are not part of any matchday: they are
+   listed apart (:func:`src.engine.calendar.recoveries`, the dashboard's
+   *Recuperi e rinvii*) and never stretch a matchday's dates or label.
 
-A round being played right now (only its last fixtures still pending) stays a
-regular round while at least half of it is pending; its last few matches are
-attached, like recoveries, to the nearest matchday. The result is
-deterministic for a given fixture list: same input, same matchdays, same keys
-and labels. The label spells out the date span and the round of every
-competition involved, e.g. ``'Giornata del 7-9 nov 2026 · Girone A g.14,
-Girone B g.14, Girone C g.14, Serie B g.13'``.
+Each :class:`Matchday` carries the :class:`~src.engine.calendar.RoundView` of
+every round it holds (:attr:`Matchday.round_views`: every match of the round as
+it stands at the reference instant, played ones with their score, kicked-off
+ones as ``'in corso / risultato in attesa'``), its ``fixture_ids`` are the
+matches **still to play at that instant** (kick-off ahead of ``now``: the only
+ones the picks rank and the value panel prices, a match already under way is
+never offered as a pre-match bet) and its span is the span of its rounds.
+The result is deterministic for a given input; the label spells out the date
+span and the round of every competition involved, e.g. ``'Giornata del 6-9 nov
+2026 · Girone A g.13, Girone B g.13, Girone C g.13, Serie B g.11'``.
 
 Picks
 -----
@@ -52,22 +50,25 @@ Picks
 by the **model probability** of one selection -- :func:`draw_picks` for ``X`` of
 the 1X2 market, :func:`btts_picks` for ``GG`` -- and attaches the best bookmaker
 price of that selection, with its EV and flags, when the value engine evaluated
-it. The ranking is by probability only: "most probable" is not "worth the
-price", which is what the fair odds, the book odds and the EV columns are for.
-:func:`picks_frame` renders the picks as a ``pandas`` frame with Italian labels.
+it. Only the matches still to play of the matchday are ranked (not the ones
+that have kicked off at the matchday's reference instant). The ranking is by
+probability only: "most probable" is not "worth the price", which is what the
+fair odds, the book odds and the EV columns are for. :func:`picks_frame` renders
+the picks as a ``pandas`` frame with Italian labels.
 """
 from __future__ import annotations
 
 from collections import defaultdict
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import date, timedelta
+from datetime import date, datetime
 from typing import Final
 
 import pandas as pd
 
 from src.common.logging_config import get_logger
 from src.common.schemas import SELECTIONS, Fixture, Girone, Market, MatchPrediction
+from src.engine.calendar import DEFAULT_MAX_DAYS, CompetitionCalendar, RoundView, rome_midnight, week_block
 from src.engine.value import ValueOpportunity
 
 __all__ = [
@@ -198,17 +199,20 @@ def format_date_span(start: date, end: date) -> str:
 
 @dataclass(frozen=True)
 class Matchday:
-    """One "giornata" across the competitions: the rounds anchored in the same block of the football week.
+    """One "giornata" across the competitions: one official round per competition (see :func:`matchdays`).
 
-    See :func:`matchdays` for the rule (weekend block Friday-Monday, midweek
-    block Tuesday-Thursday). ``key`` is the ISO date of the earliest regular
-    fixture (``'2026-11-08'``; a ``#k`` suffix disambiguates the rare case of
-    two matchdays starting the same day), ``label`` the Italian description
-    shown in selectors and consoles, ``start``/``end`` the date span of every
-    fixture it holds (recoveries included), ``rounds`` the regular round number
-    of each competition involved (configuration order), ``fixture_ids`` the
-    ``match_id`` of every fixture (regular and recoveries) and ``n_fixtures``
-    their number. Equality compares every field; the hash is the key's.
+    ``key`` is the ISO date of the first day of the matchday (``'2026-11-06'``;
+    a ``#k`` suffix disambiguates the rare case of two matchdays starting the
+    same day), ``label`` the Italian description shown in selectors and
+    consoles, ``start``/``end`` the span of its rounds (played matches included,
+    postponed matches and far-away recoveries excluded), ``rounds`` the official
+    round of each competition involved (configuration order), ``fixture_ids``
+    the ``match_id`` of the matches **still to play** (not kicked off at the
+    reference instant the matchday was built at) and ``n_fixtures`` their
+    number. ``round_views`` holds the :class:`~src.engine.calendar.RoundView` of
+    each round (every match of it, played ones with their score; empty for a
+    matchday built by hand). Equality compares every field but ``round_views``;
+    the hash is the key's.
     """
 
     key: str
@@ -218,6 +222,7 @@ class Matchday:
     rounds: dict[Girone, int]
     fixture_ids: frozenset[str]
     n_fixtures: int = field(init=False)
+    round_views: tuple[RoundView, ...] = field(default=(), compare=False)
 
     def __post_init__(self) -> None:
         if not self.key:
@@ -227,12 +232,13 @@ class Matchday:
         object.__setattr__(self, "rounds", {Girone.parse(g): int(r) for g, r in self.rounds.items()})
         object.__setattr__(self, "fixture_ids", frozenset(str(i) for i in self.fixture_ids))
         object.__setattr__(self, "n_fixtures", len(self.fixture_ids))
+        object.__setattr__(self, "round_views", tuple(self.round_views))
 
     def __hash__(self) -> int:
         return hash(self.key)
 
     def contains(self, fixture: Fixture | MatchPrediction | str) -> bool:
-        """Whether a fixture, a prediction or a ``match_id`` belongs to this matchday."""
+        """Whether a fixture, a prediction or a ``match_id`` is one of the matches still to play of this matchday."""
         if isinstance(fixture, MatchPrediction):
             return fixture.fixture.match_id in self.fixture_ids
         if isinstance(fixture, Fixture):
@@ -241,8 +247,28 @@ class Matchday:
 
     @property
     def competitions(self) -> tuple[Girone, ...]:
-        """Competitions with a regular round in this matchday, configuration order."""
+        """Competitions with a round in this matchday, configuration order."""
         return tuple(self.rounds)
+
+    @property
+    def n_played(self) -> int:
+        """Matches of the matchday's rounds already played (``0`` without round views)."""
+        return sum(v.n_played for v in self.round_views)
+
+    @property
+    def n_in_play(self) -> int:
+        """Matches of the matchday's rounds that have kicked off without a result in the data (``0`` without round views)."""
+        return sum(v.n_in_play for v in self.round_views)
+
+    @property
+    def n_matches(self) -> int:
+        """Every match of the matchday's rounds (played, to play, postponed); ``n_fixtures`` without round views."""
+        return sum(v.n_matches for v in self.round_views) if self.round_views else self.n_fixtures
+
+    def view(self, girone: Girone | str) -> RoundView | None:
+        """The :class:`~src.engine.calendar.RoundView` of one competition's round (``None`` when absent)."""
+        wanted = Girone.parse(girone)
+        return next((v for v in self.round_views if v.competition == wanted), None)
 
     def rounds_text(self) -> str:
         """``'Girone A g.14, Girone B g.14, Girone C g.14, Serie B g.13'``."""
@@ -254,188 +280,101 @@ def _label(start: date, end: date, rounds: Mapping[Girone, int]) -> str:
     return f"Giornata {format_date_span(start, end)} · {rounds_text}"
 
 
-#: ``date.weekday()`` values (Monday = 0) of the weekend block of a football week: Friday, Saturday, Sunday, Monday.
-_WEEKEND_WEEKDAYS: Final[frozenset[int]] = frozenset({4, 5, 6, 0})
+def _regular_days(view: RoundView, max_days: int) -> list[date]:
+    """Days of a round that make its span: every match but the postponed ones and the far-away stragglers."""
+    far = {m.match_id for m in view.stragglers(max_days)}
+    days = [m.date for m in view.matches if not m.postponed and m.match_id not in far]
+    if not days and view.anchor is not None:
+        days = [view.anchor]
+    return days
 
 
-def week_block(day: date) -> tuple[date, date]:
-    """``(first day, last day)`` of the block of the football week that holds ``day``.
-
-    A football week has two blocks: the **weekend** block, Friday to Monday
-    (the regular rounds: Serie B from Friday, Serie C from Saturday, posticipi
-    on Monday), and the **midweek** block, Tuesday to Thursday (turni
-    infrasettimanali and holiday rounds). Rounds of different competitions
-    anchored in the same block form one matchday, whatever their round numbers.
-    """
-    weekday = day.weekday()
-    if weekday in _WEEKEND_WEEKDAYS:
-        start = day - timedelta(days=(weekday - 4) % 7)  # Friday 0, Saturday 1, Sunday 2, Monday 3 days back
-        return start, start + timedelta(days=3)
-    start = day - timedelta(days=weekday - 1)  # Tuesday 0, Wednesday 1, Thursday 2 days back
-    return start, start + timedelta(days=2)
-
-
-def _fixture_key(fx: Fixture) -> tuple[date, int, str, str]:
-    """Total order of fixtures: date, competition order, label, ``match_id``."""
-    return (fx.date, _girone_order(fx.girone), fx.label, fx.match_id)
-
-
-def _median_date(fixtures: Sequence[Fixture]) -> date:
-    """Lower median of the fixture dates: the day most of a round is played, insensitive to a lone straggler."""
-    dates = sorted(f.date for f in fixtures)
-    return dates[(len(dates) - 1) // 2]
-
-
-@dataclass(frozen=True)
-class _Round:
-    """One regular round of one competition: its anchor date and the fixtures that stay with it."""
-
-    girone: Girone
-    number: int
-    anchor: date
-    fixtures: tuple[Fixture, ...]
-
-
-def _split_rounds(girone: Girone, fixtures: Sequence[Fixture], max_days: int) -> tuple[list[_Round], list[Fixture]]:
-    """One competition's fixtures -> its regular rounds (anchor order) and its leftovers (recoveries, stragglers).
-
-    The typical round size is the largest round in the list; a round with
-    fewer fixtures than half of it is a recovery group (every fixture is a
-    leftover); inside a regular round the fixtures farther than ``max_days``
-    from the anchor (the median date) are stragglers. A regular round always
-    keeps at least the fixture played on the anchor date.
-    """
-    by_round: dict[int, list[Fixture]] = defaultdict(list)
-    for fx in fixtures:
-        by_round[int(fx.round)].append(fx)
-    typical = max(len(group) for group in by_round.values())
-    rounds: list[_Round] = []
-    leftovers: list[Fixture] = []
-    for number, group in sorted(by_round.items()):
-        if 2 * len(group) < typical:
-            leftovers.extend(group)  # postponed matches still numbered with their original round
-            continue
-        anchor = _median_date(group)
-        members = [f for f in group if abs((f.date - anchor).days) <= max_days]
-        leftovers.extend(f for f in group if abs((f.date - anchor).days) > max_days)
-        rounds.append(_Round(girone, number, anchor, tuple(sorted(members, key=_fixture_key))))
-    rounds.sort(key=lambda r: (r.anchor, r.number))
-    return rounds, leftovers
-
-
-@dataclass
-class _Draft:
-    """A matchday under construction: the regular rounds of one block plus the leftovers attached to it."""
-
-    block: date
-    rounds: dict[Girone, int] = field(default_factory=dict)
-    regular: list[Fixture] = field(default_factory=list)
-    attached: list[Fixture] = field(default_factory=list)
-
-    @property
-    def regular_start(self) -> date:
-        return min(f.date for f in self.regular)
-
-    @property
-    def regular_end(self) -> date:
-        return max(f.date for f in self.regular)
-
-    def distance(self, day: date) -> int:
-        """Days between ``day`` and the span of the regular fixtures (0 inside it)."""
-        if day < self.regular_start:
-            return (self.regular_start - day).days
-        if day > self.regular_end:
-            return (day - self.regular_end).days
-        return 0
-
-    def fixtures(self) -> list[Fixture]:
-        return self.regular + self.attached
+def _build_matchday(views: Sequence[RoundView], max_days: int, seen_keys: dict[str, int]) -> Matchday:
+    ordered = sorted(views, key=lambda v: _girone_order(v.competition))
+    days = [d for v in ordered for d in _regular_days(v, max_days)]
+    start, end = min(days), max(days)
+    rounds = {v.competition: v.round for v in ordered}
+    far = {m.match_id for v in ordered for m in v.stragglers(max_days)}
+    ids = frozenset(m.match_id for v in ordered for m in v.to_play if m.match_id not in far)
+    base = start.isoformat()
+    seen_keys[base] = seen_keys.get(base, 0) + 1
+    key = base if seen_keys[base] == 1 else f"{base}#{seen_keys[base]}"
+    return Matchday(key=key, label=_label(start, end, rounds), start=start, end=end, rounds=rounds, fixture_ids=ids, round_views=tuple(ordered))
 
 
 def matchdays(
     fixtures: Iterable[Fixture],
     *,
     as_of: date | None = None,
-    max_days: int = 7,
+    max_days: int = DEFAULT_MAX_DAYS,
     gironi: Iterable[Girone | str] | None = None,
+    played: pd.DataFrame | None = None,
+    now: datetime | None = None,
 ) -> list[Matchday]:
-    """Group the not-yet-played fixtures into :class:`Matchday` objects (see the module docstring for the rule).
+    """Group the calendar into :class:`Matchday` objects (see the module docstring for the rule).
 
-    ``as_of`` drops the fixtures dated before it (already played or stale);
-    ``None`` keeps every fixture given, which is the right call when the list is
-    already the upcoming schedule. ``max_days`` (>= 0) is how far from its
-    round's anchor date a fixture may be and still belong to the round; farther
-    away it is a straggler attached to the nearest matchday. ``gironi`` keeps
-    only the fixtures of those competitions (:func:`in_gironi`; ``None`` = every
-    competition): the matchdays of one section of the dashboard (Serie D alone)
-    are grouped from its own fixtures, so their keys, labels and rounds never
-    mention another section. The result is ordered by football-week block (the
-    next matchday first) and empty for no fixtures.
+    ``played`` is the canonical frame of the **current season**'s played
+    matches: with it every round view holds its played matches too and the
+    half-pending rule counts them (without it only the fixtures are seen and a
+    round's size is the largest round of the list). ``now`` is the reference
+    instant of the official-round rule (aware; ``None`` drops the time
+    condition, the right call when the list already is the upcoming schedule):
+    the round views are taken at it, so a fixture that has kicked off is in its
+    round as ``'in corso / risultato in attesa'`` and out of ``fixture_ids``;
+    ``as_of`` drops the fixtures dated before it and, without ``now``, sets the
+    reference instant to its midnight in ``Europe/Rome``. ``max_days`` (>= 0)
+    is how far from its round's anchor day a match still to play may be and
+    still belong to the matchday; farther away it is a straggler, listed with
+    the recoveries. ``gironi`` keeps only those competitions (:func:`in_gironi`;
+    ``None`` = every competition): the matchdays of one section of the
+    dashboard are built from its own competitions, so their keys, labels and
+    rounds never mention another section. The current matchday comes first;
+    the result is empty when no competition has a round to play.
     """
     if int(max_days) < 0:
         raise ValueError(f"max_days must be >= 0, got {max_days}")
+    max_days = int(max_days)
     wanted = None if gironi is None else {Girone.parse(g) for g in gironi}
     pending = [fx for fx in fixtures if (as_of is None or fx.date >= as_of) and (wanted is None or Girone.parse(fx.girone) in wanted)]
     if not pending:
         return []
+    reference = now if now is not None else (rome_midnight(as_of) if as_of is not None else None)
     by_competition: dict[Girone, list[Fixture]] = defaultdict(list)
     for fx in pending:
         by_competition[Girone.parse(fx.girone)].append(fx)
-    rounds: list[_Round] = []
-    leftovers: list[Fixture] = []
+    sequences: dict[Girone, list[RoundView]] = {}
     for g in sorted(by_competition, key=_girone_order):
-        comp_rounds, comp_leftovers = _split_rounds(g, by_competition[g], int(max_days))
-        rounds.extend(comp_rounds)
-        leftovers.extend(comp_leftovers)
+        ahead = CompetitionCalendar.build(g, played, by_competition[g]).upcoming(reference)
+        if ahead:
+            sequences[g] = ahead
+    if not sequences:
+        return []
 
-    # regular rounds -> one draft per block; a second round of the same competition in a block opens another draft
-    by_block: dict[date, list[_Round]] = defaultdict(list)
-    for r in rounds:
-        by_block[week_block(r.anchor)[0]].append(r)
-    drafts: list[_Draft] = []
-    for block in sorted(by_block):
-        block_drafts: list[_Draft] = []
-        for r in sorted(by_block[block], key=lambda r: (r.anchor, r.number, _girone_order(r.girone))):
-            target = next((d for d in block_drafts if r.girone not in d.rounds), None)
-            if target is None:
-                target = _Draft(block)
-                block_drafts.append(target)
-            target.rounds[r.girone] = r.number
-            target.regular.extend(r.fixtures)
-        drafts.extend(block_drafts)
-
-    # leftovers -> the nearest draft by date (the earlier one on a tie)
-    for fx in sorted(leftovers, key=_fixture_key):
-        nearest = min(range(len(drafts)), key=lambda i: (drafts[i].distance(fx.date), i))
-        drafts[nearest].attached.append(fx)
-
-    out: list[Matchday] = []
     seen_keys: dict[str, int] = {}
-    for draft in drafts:
-        held = draft.fixtures()
-        start, end = min(f.date for f in held), max(f.date for f in held)
-        base = draft.regular_start.isoformat()
-        seen_keys[base] = seen_keys.get(base, 0) + 1
-        key = base if seen_keys[base] == 1 else f"{base}#{seen_keys[base]}"
-        ordered_rounds = {g: draft.rounds[g] for g in sorted(draft.rounds, key=_girone_order)}
-        out.append(
-            Matchday(
-                key=key,
-                label=_label(start, end, ordered_rounds),
-                start=start,
-                end=end,
-                rounds=ordered_rounds,
-                fixture_ids=frozenset(f.match_id for f in held),
-            )
-        )
+    out = [_build_matchday([seq[0] for seq in sequences.values()], max_days, seen_keys)]
+    # the following rounds -> one group per block of the football week; a second round of the same competition in a
+    # block (a double-header) opens another group of that block
+    by_block: dict[date, list[RoundView]] = defaultdict(list)
+    for seq in sequences.values():
+        for view in seq[1:]:
+            by_block[week_block(view.anchor)[0]].append(view)
+    for block in sorted(by_block):
+        groups: list[list[RoundView]] = []
+        for view in sorted(by_block[block], key=lambda v: (v.anchor, v.round, _girone_order(v.competition))):
+            target = next((grp for grp in groups if all(v.competition != view.competition for v in grp)), None)
+            if target is None:
+                target = []
+                groups.append(target)
+            target.append(view)
+        out.extend(_build_matchday(grp, max_days, seen_keys) for grp in groups)
     log.debug(
         "matchdays grouped",
         extra={
             "n_fixtures": len(pending),
             "n_matchdays": len(out),
-            "n_leftovers": len(leftovers),
-            "first": out[0].key if out else None,
-            "competitions": [g.value for g in by_competition],
+            "first": out[0].key,
+            "current_rounds": {g.value: seq[0].round for g, seq in sequences.items()},
+            "now": None if reference is None else str(reference),
         },
     )
     return out
@@ -446,14 +385,16 @@ def next_matchday(
     *,
     as_of: date | None = None,
     gironi: Iterable[Girone | str] | None = None,
+    played: pd.DataFrame | None = None,
+    now: datetime | None = None,
 ) -> Matchday | None:
-    """The first matchday of :func:`matchdays` (the next block with a regular round), ``None`` without fixtures."""
-    groups = matchdays(fixtures, as_of=as_of, gironi=gironi)
+    """The first matchday of :func:`matchdays` (the current round of every competition), ``None`` without a round to play."""
+    groups = matchdays(fixtures, as_of=as_of, gironi=gironi, played=played, now=now)
     return groups[0] if groups else None
 
 
 def fixtures_of(matchday: Matchday, fixtures: Iterable[Fixture]) -> list[Fixture]:
-    """The fixtures of ``matchday``, sorted by date, competition order and label."""
+    """The fixtures still to play of ``matchday``, sorted by date, competition order and label."""
     return sorted(
         (fx for fx in fixtures if fx.match_id in matchday.fixture_ids),
         key=lambda fx: (fx.date, _girone_order(fx.girone), fx.label, fx.match_id),

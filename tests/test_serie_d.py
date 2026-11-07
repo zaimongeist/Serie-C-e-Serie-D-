@@ -1,5 +1,5 @@
-"""Serie D (nine gironi ``DA`` .. ``DI``, family ``'Serie D'``): configuration, registries that ship empty,
-simulator and engine behaviour, FootyStats auto-init of the team lists, automation and launchers.
+"""Serie D (nine gironi ``DA`` .. ``DI``, family ``'Serie D'``): configuration, the shipped 2026/27 lists, registries
+with empty competitions, simulator and engine behaviour, the FootyStats registry sync of the team lists and the launchers.
 
 The FootyStats side runs offline on ``httpx.MockTransport``: the router serves a league list with the Serie D
 league, a synthetic 18-team ``/league-teams`` listing and ``/league-matches`` rows with the thin statistics
@@ -25,7 +25,6 @@ import httpx
 import numpy as np
 import pandas as pd
 import pytest
-import yaml
 
 from src.common import competitions as competitions_module
 from src.common.competitions import (
@@ -41,7 +40,7 @@ from src.common.competitions import (
 )
 from src.common.paths import CONFIG_DIR, ROOT
 from src.common.schemas import Girone, validate_matches_df
-from src.common.teams import PerimeterLabel, TeamRegistry, load_registry, normalize_name
+from src.common.teams import PerimeterLabel, TeamRegistry, dumps_registry_payload, load_registry, normalize_name
 from src.engine.model import DixonColesConfig, DixonColesEngine, build_team_index
 from src.ingestion import footystats as fs
 from src.ingestion.harvester import Harvester, HttpConfig, _write_decision, load_endpoints
@@ -175,27 +174,29 @@ def test_describe_competitions_per_family() -> None:
 
 
 # ============================================================================ registry
-def test_registry_with_empty_serie_d_competitions() -> None:
+def test_shipped_registry_lists_the_nine_serie_d_gironi_of_footystats() -> None:
     registry = load_registry()
-    assert registry.n_teams == 80 and registry.gironi == (Girone.A, Girone.B, Girone.C, Girone.SB)
-    assert registry.missing_competitions() == tuple(Girone(code) for code in SERIE_D_CODES)
-    assert registry.families() == ("Serie C", "Serie B")
-    assert all(registry.teams(code) == () for code in SERIE_D_CODES) and registry.teams("Serie D Girone I") == ()
+    assert registry.n_teams == 242 and registry.gironi == tuple(Girone) and registry.missing_competitions() == ()
+    assert registry.families() == ("Serie C", "Serie B", "Serie D")
+    assert all(len(registry.teams(code)) == 18 for code in SERIE_D_CODES) and len(registry.teams("Serie D Girone I")) == 18
     with pytest.raises(ValueError, match="Unknown girone"):
         registry.teams("D")
     label = registry.perimeter_label
-    assert label == "Serie C 2026/27 Gironi A/B/C + Serie B (80 squadre)" and isinstance(label, PerimeterLabel) and isinstance(label, str)
-    assert label("Serie D") == registry.perimeter_label_for("Serie D") == "Serie D 2026/27 (0 squadre)"
+    assert label == "Serie C 2026/27 Gironi A/B/C + Serie B + Serie D Gironi A-I (242 squadre)" and isinstance(label, PerimeterLabel) and isinstance(label, str)
+    assert label("Serie D") == registry.perimeter_label_for("Serie D") == "Serie D 2026/27 Gironi A-I (162 squadre)"
     assert label(family="Serie C") == "Serie C 2026/27 Gironi A/B/C (60 squadre)" and label("Serie B") == "Serie B 2026/27 (20 squadre)"
-    assert label(None) == label and f"Perimetro: {label}" == "Perimetro: Serie C 2026/27 Gironi A/B/C + Serie B (80 squadre)"
+    assert label(None) == label and f"Perimetro: {label}" == "Perimetro: Serie C 2026/27 Gironi A/B/C + Serie B + Serie D Gironi A-I (242 squadre)"
     with pytest.raises(ValueError, match="Unknown family"):
         registry.perimeter_label_for("Serie A")
-    # the shipped file lists the nine codes with empty objects, and loading with history keeps them empty
+    # the shipped file lists every code; Serie D canonical names are the FootyStats cleanName (two documented exceptions)
     payload = json.loads((CONFIG_DIR / "teams_2026_27.json").read_text(encoding="utf-8"))
-    assert list(payload["gironi"]) == list(ALL_CODES) and all(payload["gironi"][code] == {} for code in SERIE_D_CODES)
-    assert "auto-init" in payload["note"] or "harvester" in payload["note"]
+    assert list(payload["gironi"]) == list(ALL_CODES) and all(len(payload["gironi"][code]) == 18 for code in SERIE_D_CODES)
+    assert "sync_registry" in payload["note"] and "AC Palermo Serie D" in payload["note"]
+    assert registry.girone_of("AC Palermo Serie D") is Girone.DI and registry.girone_of("Palermo") is Girone.SB
+    assert registry.girone_of("Trapani") is Girone.DI and registry.exact("Trapani 1905") == "Trapani"  # Serie C 2025/26: one name across divisions
+    assert registry.girone_of("Milan II") is Girone.DB and registry.girone_of("Ternana") is Girone.DE and registry.girone_of("Triestina") is Girone.DC
     merged = load_registry(with_history=True)
-    assert merged.n_teams == 80 and merged.missing_competitions() == registry.missing_competitions()
+    assert merged.n_teams == 242 and merged.missing_competitions() == ()
     # absent and empty mean the same thing
     absent = TeamRegistry.from_mapping("2026/27", {"A": {"x": []}, "SB": {"y": []}})
     empty = TeamRegistry.from_mapping("2026/27", {"A": {"x": []}, "SB": {"y": []}, "DA": {}, "DI": {}})
@@ -216,14 +217,15 @@ def test_registry_with_empty_serie_d_competitions() -> None:
 def test_simulate_league_and_history_skip_competitions_without_teams() -> None:
     assert DEFAULT_HOME_ADVANTAGE == {"A": 0.30, "B": 0.22, "C": 0.38, "SB": 0.25, **{code: 0.25 for code in SERIE_D_CODES}}
     assert default_home_advantage() == {g: DEFAULT_HOME_ADVANTAGE[g.value] for g in Girone} and default_home_advantage(["DA"]) == {Girone.DA: 0.25}
-    league = simulate_league(seed=7, as_of=date(2026, 11, 6))
+    serie_c_b = serie_c_b_registry()  # Serie D configured but without teams
+    league = simulate_league(seed=7, as_of=date(2026, 11, 6), registry=serie_c_b)
     assert sorted(set(league.matches["girone"])) == ["A", "B", "C", "SB"] and len(league.matches) == 440 and len(league.fixtures) == 40
     assert set(league.true_params.gamma) == set(Girone), "the true parameters cover every configured competition"
-    history = simulate_history(seed=7, seasons=("2025/26",))
+    history = simulate_history(seed=7, seasons=("2025/26",), registry=serie_c_b)
     assert sorted(set(history.matches["girone"])) == ["A", "B", "C", "SB"] and len(history.matches) == 1520
     assert history.season_registries["2025/26"].gironi == (Girone.A, Girone.B, Girone.C, Girone.SB)
     params = sample_true_params(load_registry(), np.random.default_rng(0))
-    assert len(params.alpha) == 80 and set(params.gamma) == set(Girone)
+    assert len(params.alpha) == 242 and set(params.gamma) == set(Girone)
     with pytest.raises(ValueError, match="no teams"):
         simulate_league(seed=1, registry=TeamRegistry.from_mapping("2026/27", {"DA": {}}))
 
@@ -260,9 +262,9 @@ def test_simulate_serie_d_registry_and_the_joint_fit_has_nine_gammas() -> None:
 
 
 def test_model_handles_a_competition_with_matches_but_no_registry_teams(caplog: pytest.LogCaptureFixture) -> None:
-    """The auto-init raced with the harvest: Serie D matches exist, the registry has no Serie D teams yet. The
+    """Serie D matches exist but the registry has no Serie D teams (an older dictionary, or the sync disabled). The
     index must not crash: those teams are historical of their own competition (own gamma, own group)."""
-    registry = load_registry()
+    registry = serie_c_b_registry()
     serie_d = simulate_serie_d_registry(seed=2)
     da_only = simulate_league(seed=9, registry=serie_d, n_rounds=8, with_odds=False).matches
     da_only = validate_matches_df(da_only.loc[da_only["girone"] == "DA"].reset_index(drop=True))
@@ -275,7 +277,7 @@ def test_model_handles_a_competition_with_matches_but_no_registry_teams(caplog: 
     params = DixonColesEngine(DixonColesConfig(xi=0.0)).fit(da_only, registry=registry)
     assert params.converged and set(params.gamma) == {Girone.DA} and len(params.historical_teams) == 18 and params.current_teams == ()
     # competitions with neither teams nor matches are simply absent: no gamma, no group
-    current = simulate_league(seed=7, n_rounds=6, with_odds=False).matches
+    current = simulate_league(seed=7, n_rounds=6, with_odds=False, registry=registry).matches
     both = validate_matches_df(pd.concat([current, da_only], ignore_index=True))
     with caplog.at_level(logging.WARNING, logger="src.engine.model"):
         joint = DixonColesEngine(DixonColesConfig(xi=0.0)).fit(both, registry=registry)
@@ -283,7 +285,7 @@ def test_model_handles_a_competition_with_matches_but_no_registry_teams(caplog: 
     assert Girone.DB not in joint.teams_by_girone and len(joint.historical_teams) == 18
 
 
-# ============================================================================ FootyStats auto-init
+# ============================================================================ FootyStats registry sync
 class CountingTransport(httpx.MockTransport):
     def __init__(self, handler: Callable[[httpx.Request], Any]) -> None:
         super().__init__(handler)
@@ -466,6 +468,35 @@ def config_copy(tmp_path: Path) -> Path:
     return config_dir
 
 
+@pytest.fixture
+def empty_da_copy(config_copy: Path) -> Path:
+    """The private copy with Serie D girone A emptied: the state of a competition just added to the configuration."""
+    path = config_copy / "teams_2026_27.json"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["gironi"]["DA"] = {}
+    path.write_text(dumps_registry_payload(payload), encoding="utf-8")
+    return config_copy
+
+
+def serie_c_b_registry() -> TeamRegistry:
+    """The shipped 2026/27 dictionary restricted to Serie C and Serie B (80 teams): a registry whose Serie D is empty."""
+    payload = json.loads((CONFIG_DIR / "teams_2026_27.json").read_text(encoding="utf-8"))
+    return TeamRegistry.from_mapping("2026/27", {code: payload["gironi"][code] for code in ("A", "B", "C", "SB")})
+
+
+def _repository_state() -> dict[str, str]:
+    paths = [*sorted(CONFIG_DIR.glob("*.json")), *sorted(p for p in (ROOT / "data").rglob("*") if p.is_file())]
+    return {str(path.relative_to(ROOT)): hashlib.sha256(path.read_bytes()).hexdigest() for path in paths}
+
+
+@pytest.fixture(autouse=True)
+def _repository_untouched() -> Any:
+    """The registry sync writes the dictionary it was read from: no test may let it write the repository's files."""
+    before = _repository_state()
+    yield
+    assert _repository_state() == before, "a test wrote config/*.json or data/ of the repository"
+
+
 def _digest(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
@@ -489,32 +520,39 @@ def make_provider(
 
 
 @pytest.mark.asyncio
-async def test_harvest_auto_initialises_an_empty_serie_d_girone(http_cfg: HttpConfig, config_copy: Path, tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
-    shipped_before = _digest(CONFIG_DIR / "teams_2026_27.json")
-    provider, transport = make_provider(http_cfg, config_copy, tmp_path / "map.json")
-    assert provider.registry.teams("DA") == () and provider.registry_path == config_copy / "teams_2026_27.json"
+async def test_harvest_sync_fills_an_empty_serie_d_girone(http_cfg: HttpConfig, empty_da_copy: Path, tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    provider, transport = make_provider(http_cfg, empty_da_copy, tmp_path / "map.json")
+    assert provider.registry.teams("DA") == () and provider.registry_path == empty_da_copy / "teams_2026_27.json"
     with caplog.at_level(logging.INFO):
         async with provider.client:
             result = await provider.harvest(["DA"], seasons=2)
     # league-teams was called for the current season once (the listing is reused by the harvest) and once for the past one
     teams_calls = [int(r.url.params["season_id"]) for r in transport.requests if r.url.path == "/league-teams"]
     assert teams_calls == [SEASON_IDS["DA"]["2026/27"], SEASON_IDS["DA"]["2025/26"]]
-    assert result.initialised_competitions == ("DA",) and result.registry_path == config_copy / "teams_2026_27.json"
-    assert "initialised=DA" in result.summary()
+    assert result.initialised_competitions == ("DA",) and result.registry_path == empty_da_copy / "teams_2026_27.json"
+    sync = result.registry_sync
+    assert sync is not None and sync.changed and sync.written and sync.competitions["DA"].added == tuple(f"Borgo {i:02d}" for i in range(1, 19))
+    assert sync.competitions["DA"].removed == () and sync.total == 242 and "registry_sync=changed:18" in result.summary()
     # the dictionary copy gained the 18 teams (canonical = cleanName, aliases = name / english name / alt_names) ...
-    saved = json.loads((config_copy / "teams_2026_27.json").read_text(encoding="utf-8"))
+    saved = json.loads((empty_da_copy / "teams_2026_27.json").read_text(encoding="utf-8"))
     group = saved["gironi"]["DA"]
     assert len(group) == 18 and group["Borgo 01"] == ["Unione Sportiva Borgo 01", "Borgo 01 Town", "Borgo01", SHARED_NICKNAME]
     assert group["Borgo 02"] == ["Unione Sportiva Borgo 02", "Borgo 02 Town", "Borgo02"], "a nickname shared by two clubs is written for the first only"
-    assert saved["gironi"]["DB"] == {} and len(saved["gironi"]["A"]) == 20 and saved["season"] == "2026/27"
-    reloaded = TeamRegistry.from_json(config_copy / "teams_2026_27.json")  # the file loads: no alias collision
-    assert reloaded.n_teams == 98 and reloaded.gironi == (Girone.A, Girone.B, Girone.C, Girone.SB, Girone.DA)
-    assert reloaded.exact(SHARED_NICKNAME) == "Borgo 01" and reloaded.exact("Borgo 05 Town") == "Borgo 05" and reloaded.perimeter_label("Serie D") == "Serie D 2026/27 (18 squadre)"
+    assert sync.skipped_aliases == {"Borgo 02": (SHARED_NICKNAME,)}
+    assert len(saved["gironi"]["DB"]) == 18 and len(saved["gironi"]["A"]) == 20 and saved["season"] == "2026/27"
+    reloaded = TeamRegistry.from_json(empty_da_copy / "teams_2026_27.json")  # the file loads: no alias collision
+    assert reloaded.n_teams == 242 and reloaded.gironi == tuple(Girone)
+    assert reloaded.exact(SHARED_NICKNAME) == "Borgo 01" and reloaded.exact("Borgo 05 Town") == "Borgo 05"
     # ... the provider reloaded it, so the Serie D teams are current, not unmapped ...
-    assert provider.registry.teams("DA") == tuple(f"Borgo {i:02d}" for i in range(1, 19)) and provider.registry.n_teams == 98
+    assert provider.registry.teams("DA") == tuple(f"Borgo {i:02d}" for i in range(1, 19)) and provider.registry.n_teams == 242
     assert result.unmapped_teams == {} and result.historical_teams == ()
     record = next(r for r in caplog.records if r.getMessage() == "registry initialised from FootyStats league-teams")
     assert record.competitions == ["DA"] and record.teams == {"DA": 18}
+    synced = next(r for r in caplog.records if r.getMessage() == "team dictionary synchronised with FootyStats")
+    assert synced.added == {"DA": [f"Borgo {i:02d}" for i in range(1, 19)]} and synced.changed and synced.total == 242
+    # ... the ids are persisted as the clubs' identity (method 'sync') ...
+    mapping = json.loads((tmp_path / "map.json").read_text(encoding="utf-8"))["teams"]
+    assert mapping["9001"]["canonical"] == "Borgo 01" and mapping["9001"]["method"] == fs.SYNC_METHOD and mapping["9001"]["competition"] == "DA"
     # ... the matches carry the thin Serie D statistics as NaN and the partial odds book is simply absent
     df = result.matches
     assert len(df) == 6 and set(df["girone"]) == {"DA"} and df["home_team"].isin(provider.registry.teams("DA")).all()
@@ -522,34 +560,54 @@ async def test_harvest_auto_initialises_an_empty_serie_d_girone(http_cfg: HttpCo
     assert df["home_goals"].tolist() == [2, 1, 0, 2, 1, 0] and result.n_matches_by_competition == {"DA": {"2026/27": 3, "2025/26": 3}}
     assert df["date"].dt.year.tolist() == [2025, 2025, 2025, 2026, 2026, 2026]  # the past season's matches sit in their own season
     assert len(result.fixtures) == 1 and result.fixtures[0].date == date(2027, 1, 15) and result.fixtures[0].girone is Girone.DA
+    assert result.fixtures[0].status == "scheduled" and result.fixtures[0].kickoff == datetime.fromtimestamp(FIXTURE_UNIX, tz=timezone.utc)
     assert result.odds == [] and result.failures == {} and result.skipped == {}
-    # the repository's own dictionary was never touched
-    assert _digest(CONFIG_DIR / "teams_2026_27.json") == shipped_before
-    # a second run finds the teams and initialises nothing
-    again, transport2 = make_provider(http_cfg, config_copy, tmp_path / "map.json")
+    # a second run finds the dictionary aligned: nothing written, one league-teams call
+    again, transport2 = make_provider(http_cfg, empty_da_copy, tmp_path / "map.json")
     async with again.client:
         second = await again.harvest(["DA"], seasons=1)
     assert second.initialised_competitions == () and second.registry_path is None and len(second.matches) == 3
+    assert second.registry_sync is not None and not second.registry_sync.changed and "registry_sync=unchanged" in second.summary()
     assert [r.url.path for r in transport2.requests] == ["/league-list", "/league-teams", "/league-matches"]
 
 
 @pytest.mark.asyncio
-async def test_harvest_without_auto_init_keeps_serie_d_teams_historical(http_cfg: HttpConfig, config_copy: Path, tmp_path: Path) -> None:
-    before = _digest(config_copy / "teams_2026_27.json")
-    provider, transport = make_provider(http_cfg, config_copy, tmp_path / "map.json")
+async def test_harvest_sync_replaces_the_clubs_footystats_no_longer_lists(http_cfg: HttpConfig, config_copy: Path, tmp_path: Path) -> None:
+    """The shipped DA (18 real clubs) against a listing of 18 other clubs: the dictionary becomes the listing."""
+    shipped_da = load_registry().teams("DA")
+    provider, _ = make_provider(http_cfg, config_copy, tmp_path / "map.json")
     async with provider.client:
-        result = await provider.harvest(["DA"], seasons=1, auto_init_registry=False)
-    assert result.initialised_competitions == () and _digest(config_copy / "teams_2026_27.json") == before
-    assert len(result.matches) == 3 and set(result.unmapped_teams) == {f"Borgo {i:02d}" for i in range(1, 19)}  # every listed team is unknown
-    assert sum(1 for r in transport.requests if r.url.path == "/league-teams") == 1
-    # a registry whose season is not a season label is never auto-initialised
+        result = await provider.harvest(["DA"], seasons=1)
+    da = result.registry_sync.competitions["DA"]
+    assert da.removed == shipped_da and da.added == tuple(f"Borgo {i:02d}" for i in range(1, 19)) and da.total == 18
+    assert "rimosse AS Biellese 1902" in da.describe() and "aggiunte Borgo 01" in da.describe()
+    assert provider.registry.teams("DA") == da.added and result.initialised_competitions == ()
+    assert len(TeamRegistry.from_json(config_copy / "teams_2026_27.json").teams("DB")) == 18, "competitions not synchronised are untouched"
+
+
+@pytest.mark.asyncio
+async def test_harvest_without_sync_keeps_serie_d_teams_historical(http_cfg: HttpConfig, empty_da_copy: Path, tmp_path: Path) -> None:
+    before = _digest(empty_da_copy / "teams_2026_27.json")
+    for index, flag in enumerate(({"auto_init_registry": False}, {"sync_registry": False})):
+        provider, transport = make_provider(http_cfg, empty_da_copy, tmp_path / f"map{index}.json")
+        async with provider.client:
+            result = await provider.harvest(["DA"], seasons=1, **flag)
+        assert result.initialised_competitions == () and result.registry_sync is None and _digest(empty_da_copy / "teams_2026_27.json") == before
+        assert len(result.matches) == 3 and set(result.unmapped_teams) == {f"Borgo {i:02d}" for i in range(1, 19)}  # every listed team is unknown
+        assert sum(1 for r in transport.requests if r.url.path == "/league-teams") == 1
+    # the former keyword wins over the new one when both are given
+    provider, _ = make_provider(http_cfg, empty_da_copy, tmp_path / "map.json")
+    async with provider.client:
+        both = await provider.harvest(["DA"], seasons=1, sync_registry=True, auto_init_registry=False)
+    assert both.registry_sync is None and _digest(empty_da_copy / "teams_2026_27.json") == before
+    # a registry whose season is not a season label is never synchronised
     synthetic = TeamRegistry.from_teams("sim", {"A": ("x", "y")})
     mapper = fs.FootyStatsTeamMapper(synthetic, TeamMatcher(synthetic), mapping_path=tmp_path / "map2.json")
     client = fs.FootyStatsClient(api_key=KEY, endpoints=load_endpoints().footystats, http=http_cfg, transport=CountingTransport(make_router()), sleeper=RecordingSleeper())
-    sim_provider = fs.FootyStatsProvider(client, mapper, now=lambda: NOW, config_dir=config_copy)
+    sim_provider = fs.FootyStatsProvider(client, mapper, now=lambda: NOW, config_dir=empty_da_copy)
     async with client:
         sim_result = await sim_provider.harvest(["DA"], seasons=1)
-    assert sim_result.initialised_competitions == () and not (config_copy / "teams_sim.json").exists()
+    assert sim_result.initialised_competitions == () and sim_result.registry_sync is None and not (empty_da_copy / "teams_sim.json").exists()
 
 
 @pytest.mark.asyncio
@@ -603,12 +661,13 @@ def test_write_registry_update_never_writes_a_dictionary_that_would_not_load(tmp
     assert TeamRegistry.from_json(tmp_path / "teams_2027_28.json").exact("The Blues") == "Everton"
 
 
-def test_cli_defaults_cover_the_thirteen_competitions_and_the_auto_init_flag() -> None:
+def test_cli_defaults_cover_the_thirteen_competitions_and_the_sync_flags() -> None:
     args = fs._build_parser().parse_args([])
-    assert args.competitions == list(ALL_CODES) and fs.DEFAULT_COMPETITIONS == ALL_CODES and not args.no_auto_init
+    assert args.competitions == list(ALL_CODES) and fs.DEFAULT_COMPETITIONS == ALL_CODES and not args.no_auto_init and not args.no_sync
     assert fs._build_parser().parse_args(["--no-auto-init", "--competitions", "DA", "DB"]).no_auto_init
+    assert fs._build_parser().parse_args(["--no-sync"]).no_sync and fs._build_parser().parse_args(["--sync-registry"]).sync_registry
     help_text = " ".join(fs._build_parser().format_help().split())
-    assert "DA = Serie D Girone A" in help_text and "DI = Serie D Girone I" in help_text and "--no-auto-init" in help_text
+    assert "DA = Serie D Girone A" in help_text and "DI = Serie D Girone I" in help_text and "--no-sync" in help_text and "--sync-registry" in help_text
     assert fs.configured_league_names()[-9:] == [f"Italy Serie D Group {letter}" for letter in "ABCDEFGHI"]
     assert fs.competition_label(["DA", "DB"]) == "Serie D" and fs.competition_label(["A", "SB", "DI"]) == "Serie C + Serie B + Serie D"
     assert all(name in fs.MissingApiKeyError("x").instructions for name in ("Italy Serie D Group A", "Italy Serie D Group I"))
@@ -628,9 +687,10 @@ def test_harvester_facade_supports_serie_d_through_footystats_only(tmp_path: Pat
 
 
 @pytest.mark.asyncio
-async def test_harvester_facade_adopts_the_registry_filled_by_the_auto_init(http_cfg: HttpConfig, config_copy: Path, tmp_path: Path) -> None:
+async def test_harvester_facade_adopts_the_registry_synchronised_by_footystats(http_cfg: HttpConfig, empty_da_copy: Path, tmp_path: Path) -> None:
     from dataclasses import replace  # noqa: PLC0415
 
+    config_copy = empty_da_copy
     cfg = load_endpoints()
     cfg = replace(cfg, http=http_cfg)
     registry = TeamRegistry.from_json(config_copy / "teams_2026_27.json")
@@ -648,38 +708,24 @@ async def test_harvester_facade_adopts_the_registry_filled_by_the_auto_init(http
     assert harvester.registry.teams("DA") == ()
     result = await harvester.harvest_all([Girone.DA], seasons=1)
     assert len(result.matches) == 3 and result.failures == {} and result.unmapped_teams == {} and result.provider == "footystats"
-    assert harvester.registry.teams("DA") == tuple(f"Borgo {i:02d}" for i in range(1, 19))  # adopted after the auto-init
-    assert harvester.matcher.is_current("Borgo 01") and TeamRegistry.from_json(config_copy / "teams_2026_27.json").n_teams == 98
+    assert harvester.registry.teams("DA") == tuple(f"Borgo {i:02d}" for i in range(1, 19))  # adopted after the sync
+    assert harvester.matcher.is_current("Borgo 01") and TeamRegistry.from_json(config_copy / "teams_2026_27.json").n_teams == 242
+    assert harvester.mapping_path == tmp_path / "map.json" and Harvester(endpoints=cfg, registry=registry, cache_dir=tmp_path / "x").mapping_path == ROOT / "data" / "footystats_teams.json"
 
 
-# ============================================================================ automation and launchers
-def test_workflow_runs_footystats_for_every_competition_and_commits_the_dictionaries() -> None:
-    path = ROOT / ".github" / "workflows" / "aggiorna-dati.yml"
-    workflow = yaml.safe_load(path.read_text(encoding="utf-8"))
-    triggers = workflow.get("on", workflow.get(True))  # PyYAML reads the bare key `on` as the boolean True
-    assert workflow["name"] and "schedule" in triggers and "workflow_dispatch" in triggers
-    competitions_input = triggers["workflow_dispatch"]["inputs"]["competitions"]
-    assert competitions_input["default"] == "" and "DA" in competitions_input["description"], "empty = every configured competition"
-    steps = {step["name"]: step for step in workflow["jobs"]["harvest"]["steps"]}
-    footy = steps["Raccolta dati (FootyStats)"]["run"]
-    assert "python -m src.ingestion.footystats" in footy and "--seasons" in footy
-    assert "--competitions A B C SB" not in footy, "the default (every configured competition, Serie D included) is used unless narrowed"
-    sofa = steps["Raccolta dati (SofaScore, nessun segreto FOOTYSTATS_API_KEY)"]["run"]
-    assert "--gironi A B C" in sofa and "DA" not in sofa
-    commit = steps["Commit dei CSV aggiornati"]["run"]
-    assert "config/teams_2026_27.json" in commit and "config/footystats_teams.json" in commit
-    summary = steps["Riepilogo (partite per competizione e stagione)"]["run"]
-    assert "registry initialised" in summary and "Serie D" in path.read_text(encoding="utf-8")
-
-
+# ============================================================================ launchers
 def test_launchers_harvest_every_competition_with_footystats() -> None:
     bat = (ROOT / "avvia.bat").read_text(encoding="utf-8")
     cmd = (ROOT / "avvia.command").read_text(encoding="utf-8")
     for text in (bat, cmd):
         footy_line = next(line for line in text.splitlines() if "src.ingestion.footystats" in line and "--seasons 3" in line)
-        assert "--competitions A B C SB" not in footy_line, "FootyStats runs for every configured competition (Serie D included)"
-        assert "Serie D" in text
-        assert re.search(r"src\.ingestion\.harvester --gironi A B C --seasons 3", text), "the SofaScore path stays A B C"
+        assert "--competitions" not in footy_line, "FootyStats runs for every configured competition (Serie D included)"
+        assert "--odds-out" not in footy_line and "--no-sync" not in footy_line, "default outputs under data/, registry sync included"
+        assert "Serie D" in text and "sincronizzazione" in text and "Chiave:" in text, "the key prompt stays"
+        assert "src.ingestion.harvester --gironi" not in text, "FootyStats is the only source of real data: no silent SofaScore fallback"
+        assert "pubblica_dati" not in text and "git add" not in text, "nothing is ever published to the repository"
+    assert cmd.index("src.ingestion.footystats --seasons 3") < cmd.index("streamlit run")
+    assert bat.index("src.ingestion.footystats --seasons 3") < bat.index("streamlit run")
 
 
 # ============================================================================ review findings: unchosen leagues, fuzzy names, --config-dir
@@ -751,15 +797,16 @@ async def test_refusal_of_an_unchosen_league_during_auto_init_and_harvest_is_a_s
             result = await provider.harvest(["A", "DA"], seasons=1)
     assert len(result.matches) == 3 and result.seasons == {"A": ["2026/27"]} and result.failures == {}
     assert result.not_chosen == {"DA": "Italy Serie D Group A"} and result.skipped == {"DA": fs.not_chosen_reason("Italy Serie D Group A")}
-    assert result.initialised_competitions == () and result.registry_path is None and provider.registry.teams("DA") == ()
-    assert _digest(config_copy / "teams_2026_27.json") == before
-    init_warning = next(r for r in caplog.records if r.getMessage() == "registry auto-init: league-teams unavailable, competition left without teams")
-    assert init_warning.competition == "DA" and init_warning.season_id == 17664 and "footystats.org" in init_warning.advice and KEY not in init_warning.error
+    assert result.initialised_competitions == () and result.registry_path is None and provider.registry.teams("DA") == load_registry().teams("DA")
+    assert _digest(config_copy / "teams_2026_27.json") == before, "a competition without a listing is never synchronised (never emptied)"
+    assert result.registry_sync is not None and "DA" in result.registry_sync.skipped and "non scelta" in result.registry_sync.skipped["DA"]
+    init_warning = next(r for r in caplog.records if r.getMessage() == "registry sync: league-teams unavailable, competition left unchanged")
+    assert init_warning.competition == "DA" and init_warning.season_id == 17664 and KEY not in init_warning.error
     refused = next(r for r in caplog.records if r.getMessage() == "competition skipped: FootyStats refused the league as not chosen by the account")
     assert refused.competition == "DA" and refused.league == "Italy Serie D Group A"
     assert not any(r.getMessage() == "footystats season failed" for r in caplog.records), "a refusal is a skip, not a failure"
     refusals = [r for r in transport.requests if int(r.url.params.get("season_id", "0")) == 17664]
-    assert [r.url.path for r in refusals] == ["/league-teams", "/league-teams"], "auto-init and harvest each asked once; no league-matches after the refusal"
+    assert [r.url.path for r in refusals] == ["/league-teams", "/league-teams"], "sync and harvest each asked once; no league-matches after the refusal"
     assert _write_decision(result, tmp_path / "absent.csv", allow_partial=False) == (True, None)
     assert fs.is_not_chosen_refusal(fs.FootyStatsError(f"API refused the request: {NOT_CHOSEN_MESSAGE}", url="u"))
     assert not fs.is_not_chosen_refusal(fs.FootyStatsError("API refused the request: Invalid API key", url="u"))
@@ -782,44 +829,52 @@ def test_cli_writes_serie_c_and_exits_0_when_the_serie_d_leagues_are_not_chosen(
     frame = pd.read_csv(tmp_path / "p" / "matches.csv")
     assert len(frame) == 3 and set(frame["girone"]) == {"A"} and (tmp_path / "p" / "fixtures.csv").exists()
     assert _digest(CONFIG_DIR / "teams_2026_27.json") == shipped_before
-    assert json.loads((config_copy / "teams_2026_27.json").read_text(encoding="utf-8"))["gironi"]["DA"] == {}
+    assert json.loads((config_copy / "teams_2026_27.json").read_text(encoding="utf-8"))["gironi"]["DA"] == json.loads((CONFIG_DIR / "teams_2026_27.json").read_text(encoding="utf-8"))["gironi"]["DA"]
 
 
-def test_cli_auto_init_writes_the_dictionary_of_config_dir_not_the_repository(
+def test_cli_sync_writes_the_dictionary_of_config_dir_not_the_repository(
     monkeypatch: pytest.MonkeyPatch, config_copy: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """Finding 3: with --config-dir the auto-init fills <config-dir>/teams_2026_27.json; the shipped file is untouched."""
+    """The registry sync fills <config-dir>/teams_2026_27.json and prints its report; the shipped file is untouched."""
     shipped_before = _digest(CONFIG_DIR / "teams_2026_27.json")
     _patch_cli_client(monkeypatch, tmp_path, make_router(chosen=("DA",)))
     code = fs.main(_cli_args(config_copy, tmp_path, "DA"))
     captured = capsys.readouterr()
     assert code == 0, captured.err
-    assert f"registry initialised: DA (18 teams) -> {config_copy / 'teams_2026_27.json'}" in captured.out
-    assert "perimeter: season 2026/27 (98 current teams)" in captured.out
+    assert f"Dizionario squadre 2026/27 sincronizzato con FootyStats ({config_copy / 'teams_2026_27.json'}): 36 variazioni" in captured.out
+    assert "Serie D Girone A (18 squadre): aggiunte Borgo 01" in captured.out and "rimosse AS Biellese 1902" in captured.out
+    assert "perimeter: season 2026/27 (242 current teams)" in captured.out and "registry initialised" not in captured.out
     saved = json.loads((config_copy / "teams_2026_27.json").read_text(encoding="utf-8"))
-    assert len(saved["gironi"]["DA"]) == 18 and saved["gironi"]["DB"] == {}
+    assert set(saved["gironi"]["DA"]) == {f"Borgo {i:02d}" for i in range(1, 19)} and len(saved["gironi"]["DB"]) == 18
     assert _digest(CONFIG_DIR / "teams_2026_27.json") == shipped_before, "the repository's dictionary must not change behind the user's back"
-    assert json.loads((CONFIG_DIR / "teams_2026_27.json").read_text(encoding="utf-8"))["gironi"]["DA"] == {}
     frame = pd.read_csv(tmp_path / "p" / "matches.csv")
     assert len(frame) == 3 and set(frame["girone"]) == {"DA"} and set(frame["home_team"]) <= set(saved["gironi"]["DA"])
+    # --sync-registry only aligns the dictionary (no CSV), --no-sync leaves it alone
+    (tmp_path / "p" / "matches.csv").unlink()
+    assert fs.main([*_cli_args(config_copy, tmp_path, "DA"), "--sync-registry"]) == 0
+    out = capsys.readouterr().out
+    assert "già allineato a FootyStats" in out and "Serie D Girone A (18 squadre): invariata" in out and not (tmp_path / "p" / "matches.csv").exists()
+    before = _digest(config_copy / "teams_2026_27.json")
+    assert fs.main([*_cli_args(config_copy, tmp_path, "DA"), "--no-sync"]) == 0
+    assert _digest(config_copy / "teams_2026_27.json") == before and "registry_sync=-" in capsys.readouterr().out
 
 
 def test_write_registry_update_never_adopts_a_fuzzy_match_as_canonical(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
-    """Finding 2: 'Trestina' (Serie D) resembles 'Triestina' (Serie C 2025/26, historical): the clean name is written and
-    the resemblance only reported; a club the dictionaries really know (exact / alias hit) keeps its dictionary name."""
-    registry = load_registry("2026_27", CONFIG_DIR)
-    matcher = TeamMatcher(Harvester.registry_with_history(registry, CONFIG_DIR))
+    """'Trestina' resembles 'Triestina' (a club of the 2025/26 dictionary): --init-registry writes the clean name and only
+    reports the resemblance; a club the dictionary really knows (exact / alias hit) keeps its dictionary name."""
+    registry = load_registry("2025_26", CONFIG_DIR)
+    matcher = TeamMatcher(registry)
     probe = matcher.match("Trestina", None)
-    assert probe.canonical == "Triestina" and probe.method == "fuzzy" and matcher.is_historical("Triestina"), "precondition: the fuzzy trap exists"
+    assert probe.canonical == "Triestina" and probe.method == "fuzzy", "precondition: the fuzzy trap exists"
     path = tmp_path / "teams_2026_27.json"
-    shutil.copy(CONFIG_DIR / "teams_2026_27.json", path)
+    path.write_text(json.dumps({"season": "2026/27", "gironi": {"DA": {}, "DE": {}}}), encoding="utf-8")
     trestina = fs.TeamInfo(id=7001, name="Sporting Club Trestina", clean_name="Trestina")
     triestina = fs.TeamInfo(id=7002, name="US Triestina", clean_name="Triestina")  # alias hit in teams_2025_26.json
     with caplog.at_level(logging.WARNING):
         diff = fs.write_registry_update(path, "2026/27", {"DE": [trestina], "DA": [triestina]}, matcher=matcher)
     saved = json.loads(path.read_text(encoding="utf-8"))
     assert saved["gironi"]["DE"] == {"Trestina": ["Sporting Club Trestina"]} and "Triestina" not in saved["gironi"]["DE"]
-    assert saved["gironi"]["DA"] == {"Triestina": []}, "cross-division continuity still works through the previous season's aliases ('US Triestina' normalises like the canonical: no new alias)"
+    assert saved["gironi"]["DA"] == {"Triestina": []}, "continuity works through the dictionary's aliases ('US Triestina' normalises like the canonical: no new alias)"
     assert diff.added_teams == {"DE": ["Trestina"], "DA": ["Triestina"]} and diff.suggestions == {"Trestina": "Triestina"}
     assert "Trestina ~ Triestina" in diff.describe() and "check by hand" in diff.describe()
     record = next(r for r in caplog.records if r.getMessage().startswith("FootyStats team written with its clean name"))
@@ -832,54 +887,25 @@ def test_write_registry_update_never_adopts_a_fuzzy_match_as_canonical(tmp_path:
     assert again.added_teams == {} and again.suggestions == {} and again.unchanged_teams == 1
 
 
-def test_publish_launchers_also_push_the_dictionaries_filled_by_the_auto_init() -> None:
-    """Finding 5: pubblica_dati.* must stage config/teams_2026_27.json and config/footystats_teams.json with the CSVs."""
-    for name, sep in (("pubblica_dati.command", "/"), ("pubblica_dati.bat", "\\")):
-        text = (ROOT / name).read_text(encoding="utf-8")
-        for file in ("teams_2026_27.json", "footystats_teams.json"):
-            assert f"config{sep}{file}" in text, f"{name} must git add config{sep}{file}"
-        assert re.search(r"(?m)^(if exist|\[ -f) .*footystats_teams\.json", text), f"{name}: the git add of the dictionaries is guarded by their existence"
-        assert "data" in text and "matches.csv" in text
-    readme = (ROOT / "README.md").read_text(encoding="utf-8")
-    assert "pubblica_dati" in readme and "config/footystats_teams.json" in readme
-
-
 def test_env_example_lists_every_configured_footystats_league() -> None:
     """Finding 7: the .env template names the nine Serie D leagues (every footystats_name of competitions.toml)."""
     text = (ROOT / ".env.example").read_text(encoding="utf-8")
     for comp in COMPETITIONS:
         assert comp.footystats_name in text, f".env.example must list {comp.footystats_name!r}"
     assert "FOOTYSTATS_API_KEY=" in text and "Choose leagues" in text
+    assert "Secrets" in text and 'FOOTYSTATS_API_KEY = "' in text, "Streamlit Cloud: the key goes in the app Secrets"
+    assert "PUBLIC" in text and "data/ is git-ignored" in text
 
 
 def test_docs_say_that_every_league_must_be_chosen_and_that_ids_stand_in_only_for_a_league_list_outage() -> None:
     """Finding 4: README, workflow comment, endpoints.toml and competitions.toml agree with the live API."""
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
-    workflow = (ROOT / ".github" / "workflows" / "aggiorna-dati.yml").read_text(encoding="utf-8")
     endpoints = (ROOT / "config" / "endpoints.toml").read_text(encoding="utf-8")
     competitions = (ROOT / "config" / "competitions.toml").read_text(encoding="utf-8")
     module_doc = fs.__doc__ or ""
-    for text, name in ((readme, "README"), (workflow, "workflow"), (endpoints, "endpoints.toml"), (competitions, "competitions.toml"), (module_doc, "module docstring")):
+    for text, name in ((readme, "README"), (endpoints, "endpoints.toml"), (competitions, "competitions.toml"), (module_doc, "module docstring")):
         assert not re.search(r"(?i)non scelta ripiega|lega non scelta ripiega|not chosen falls back|non è fra quelle scelte nell'account \(la lista live", text), name
         assert "not chosen by the user" in text or "League is not chosen" in text or "non scelta" in text, f"{name} must say what the API does with an unchosen league"
     assert "League is not chosen by the user" in readme and "saltata" in readme and "Choose leagues" in readme
     assert re.search(r"(?i)limitano il numero di leghe|limite .*leghe", readme), "the README mentions the per-plan cap on chosen leagues"
     assert "only when /league-list itself cannot be reached" in endpoints and "only when /league-list itself cannot be reached" in competitions
-    assert "saltata" in workflow and "ripiega" not in workflow
-
-
-def test_workflow_error_summary_checks_429_and_403_before_the_unchosen_league_clause_and_lists_skipped_gironi() -> None:
-    """Finding 6 (and 1): the error summary greps the real refusal text after the 429/403 checks, never claims that
-    season ids are missing, and the success summary lists the competitions skipped because their league is not chosen."""
-    path = ROOT / ".github" / "workflows" / "aggiorna-dati.yml"
-    workflow = yaml.safe_load(path.read_text(encoding="utf-8"))
-    steps = {step["name"]: step for step in workflow["jobs"]["harvest"]["steps"]}
-    error = steps["Riepilogo in caso di errore"]["run"]
-    assert "non ha season id configurati" not in error
-    clauses = [line for line in error.splitlines() if re.match(r"\s*(if|elif) grep", line)]
-    position = {key: next(i for i, line in enumerate(clauses) if key in line) for key in ("API key", "429", "403", "not chosen by the user")}
-    assert position["API key"] < position["429"] < position["not chosen by the user"] and position["403"] < position["not chosen by the user"]
-    assert "API refused the request" in error and "Choose leagues" in error
-    assert not any("chosen leagues" in line and "not chosen by the user" not in line for line in clauses), "the WARNING text alone is not an error"
-    summary = steps["Riepilogo (partite per competizione e stagione)"]["run"]
-    assert "^skipped " in summary and "non è scelta nell'account FootyStats" in summary and "registry initialised" in summary

@@ -3,14 +3,16 @@ from __future__ import annotations
 
 import re
 from collections.abc import Sequence
-from datetime import date
+from datetime import UTC, date, datetime
 from itertools import pairwise
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 import pytest
 
 from src.common.schemas import Fixture, Girone, Market, MatchPrediction, OddsQuote
+from src.common.teams import TeamRegistry, load_registry
 from src.dashboard.legend import (
     LEGEND,
     LEGEND_TITLE,
@@ -48,6 +50,12 @@ from src.simulation.generator import dixon_coles_matrix, market_probabilities, s
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
+def bc_registry() -> TeamRegistry:
+    """The Serie B and Serie C part of the shipped 2026/27 dictionary (80 teams): the simulated perimeter of these tests."""
+    full = load_registry()
+    return TeamRegistry.from_teams(full.season, {g.value: full.teams_by_girone[g] for g in full.gironi if g.family in ("Serie C", "Serie B")})
+
+
 # ----------------------------------------------------------------------------- helpers
 def fx(match_id: str, when: date, round_no: int, girone: str, home: str, away: str) -> Fixture:
     return Fixture(match_id, when, round_no, girone, home, away)
@@ -58,6 +66,7 @@ FRI6, SAT7, SUN8, MON9 = date(2026, 11, 6), date(2026, 11, 7), date(2026, 11, 8)
 TUE10, WED11, FRI13, SAT14, SUN15, MON16 = date(2026, 11, 10), date(2026, 11, 11), date(2026, 11, 13), date(2026, 11, 14), date(2026, 11, 15), date(2026, 11, 16)
 TUE17, WED18, SAT21, SUN22, SAT28, SUN29 = date(2026, 11, 17), date(2026, 11, 18), date(2026, 11, 21), date(2026, 11, 22), date(2026, 11, 28), date(2026, 11, 29)
 WED_DEC2, SAT_DEC5, WED_DEC23 = date(2026, 12, 2), date(2026, 12, 5), date(2026, 12, 23)
+SAT31, SUN1 = date(2026, 10, 31), date(2026, 11, 1)
 
 
 def round_fixtures(girone: str, round_no: int, dates: Sequence[date]) -> list[Fixture]:
@@ -130,6 +139,15 @@ def opportunity(pred: MatchPrediction, market: Market, selection: str, book_odds
 
 
 # ----------------------------------------------------------------------------- matchdays
+def played_rows(fixtures: Sequence[Fixture], scores: Sequence[tuple[int, int]] | None = None) -> pd.DataFrame:
+    """The fixtures as played matches (canonical columns used by the calendar), score 1-0 unless given."""
+    rows = []
+    for i, f in enumerate(fixtures):
+        hg, ag = (scores[i] if scores is not None else (1, 0))
+        rows.append({"match_id": f.match_id, "date": pd.Timestamp(f.date), "round": f.round, "girone": f.girone.value, "home_team": f.home_team, "away_team": f.away_team, "home_goals": hg, "away_goals": ag})
+    return pd.DataFrame(rows)
+
+
 def test_week_block_splits_the_week_into_weekend_and_midweek() -> None:
     for day in (FRI6, SAT7, SUN8, MON9):
         assert week_block(day) == (FRI6, MON9), day
@@ -138,53 +156,48 @@ def test_week_block_splits_the_week_into_weekend_and_midweek() -> None:
     assert week_block(FRI13) == (FRI13, MON16) and week_block(WED_DEC23) == (date(2026, 12, 22), date(2026, 12, 24))
 
 
-def test_matchdays_group_the_rounds_of_the_same_week_block() -> None:
+def test_first_matchday_is_the_current_round_of_every_competition() -> None:
     days = matchdays(synthetic_fixtures())
     assert [m.key for m in days] == ["2026-11-06", "2026-11-10", "2026-11-15", "2026-11-22"]
     first, midweek, third, fourth = days
-    # weekend block Fri 6 - Mon 9: A14, B14 (without its straggler), C14 and SB13 (Friday anticipo opens the span)
+    # the current round of each competition: A14, B14 (without its straggler), C14 and SB13 (Friday anticipo opens the span)
     assert first.label == "Giornata del 6-9 nov 2026 · Girone A g.14, Girone B g.14, Girone C g.14, Serie B g.13"
     assert first.rounds == {Girone.A: 14, Girone.B: 14, Girone.C: 14, Girone.SB: 13}
     assert first.n_fixtures == 39 and "B14_9" not in first.fixture_ids and (first.start, first.end) == (FRI6, MON9)
     assert first.competitions == (Girone.A, Girone.B, Girone.C, Girone.SB)
-    # midweek block Tue 10 - Thu 12: only Serie B plays, the Serie C gironi are simply absent
+    assert [v.label for v in first.round_views] == ["Girone A g.14", "Girone B g.14", "Girone C g.14", "Serie B g.13"]
+    assert first.view(Girone.B).n_matches == 10 and first.view("B").stragglers(7)[0].match_id == "B14_9" and first.view(Girone.DA) is None
+    # the following rounds by block of the football week: Serie B midweek alone, then A15 + B15, then A16
     assert midweek.label == "Giornata del 10-11 nov 2026 · Serie B g.14" and midweek.rounds == {Girone.SB: 14} and midweek.n_fixtures == 10
-    # weekend block Fri 13 - Mon 16: A15 and B15 (Girone C has no round left, Serie B neither)
     assert third.rounds == {Girone.A: 15, Girone.B: 15} and third.n_fixtures == 20 and third.label == "Giornata del 15 nov 2026 · Girone A g.15, Girone B g.15"
-    # weekend block Fri 20 - Mon 23: A16, plus the leftovers attached to the nearest matchday by date: the Girone B
-    # straggler of round 14 (Wed 2 Dec) and the round-12 recovery (Wed 23 Dec) extend its end
-    assert fourth.rounds == {Girone.A: 16} and fourth.fixture_ids == frozenset({f"A16_{i}" for i in range(10)} | {"A12x", "B14_9"})
-    assert (fourth.start, fourth.end) == (SUN22, WED_DEC23) and fourth.key == "2026-11-22"
-    assert fourth.label == "Giornata del 22 nov-23 dic 2026 · Girone A g.16"
-    # every fixture lands in exactly one matchday
+    # recoveries never move a matchday: the round-12 recovery (23 Dec) and the straggler (2 Dec) are in no matchday
+    assert fourth.rounds == {Girone.A: 16} and fourth.fixture_ids == frozenset(f"A16_{i}" for i in range(10))
+    assert (fourth.start, fourth.end) == (SUN22, SUN22) and fourth.label == "Giornata del 22 nov 2026 · Girone A g.16"
     all_ids = [i for m in days for i in m.fixture_ids]
-    assert sorted(all_ids) == sorted(f.match_id for f in synthetic_fixtures())
+    assert len(all_ids) == len(set(all_ids)) and set(f.match_id for f in synthetic_fixtures()) - set(all_ids) == {"A12x", "B14_9"}
     # deterministic: same input, same result (also from a differently ordered input)
     assert matchdays(list(reversed(synthetic_fixtures()))) == days
 
 
 def test_matchdays_as_of_and_max_days() -> None:
     fixtures = synthetic_fixtures()
-    days_rounds_first = {Girone.A: 14, Girone.B: 14, Girone.C: 14, Girone.SB: 13}
     later = matchdays(fixtures, as_of=TUE10)
-    assert [m.key for m in later] == ["2026-11-10", "2026-11-15", "2026-11-22"]
-    assert "A14_0" not in later[0].fixture_ids and "SB13_0" not in later[0].fixture_ids
-    # the Girone B straggler is now the only pending match of round 14: a recovery, attached to the nearest matchday
-    assert "B14_9" in later[2].fixture_ids and later[2].rounds == {Girone.A: 16}
+    # as of Tuesday the weekend rounds are gone: B14 keeps only its straggler (a recovery), so B15 is current
+    assert [m.key for m in later] == ["2026-11-10", "2026-11-22"]
+    assert later[0].rounds == {Girone.A: 15, Girone.B: 15, Girone.SB: 14} and later[0].n_fixtures == 30 and "B14_9" not in later[0].fixture_ids
+    assert later[0].label == "Giornata del 10-15 nov 2026 · Girone A g.15, Girone B g.15, Serie B g.14"
     assert matchdays(fixtures, as_of=date(2027, 1, 1)) == []
-    # a wide tolerance keeps the straggler inside its round (24 days from the round's anchor); the first matchday then
-    # spans to 2 Dec and becomes the nearest one for the 23 Dec recovery too
+    # a wide tolerance keeps the straggler inside its round (24 days from the anchor): the span then reaches 2 Dec
     wide = matchdays(fixtures, max_days=30)
-    assert "B14_9" in wide[0].fixture_ids and "A12x" in wide[0].fixture_ids and wide[0].end == WED_DEC23
-    assert wide[0].rounds == days_rounds_first and [m.n_fixtures for m in wide] == [41, 10, 20, 10]
+    assert "B14_9" in wide[0].fixture_ids and wide[0].end == WED_DEC2 and "A12x" not in wide[0].fixture_ids
+    assert [m.n_fixtures for m in wide] == [40, 10, 20, 10]
     with pytest.raises(ValueError, match="max_days"):
         matchdays(fixtures, max_days=-1)
     assert matchdays([]) == [] and next_matchday([]) is None
 
 
-def test_midweek_recovery_before_the_weekend_round_is_not_a_regular_round() -> None:
+def test_midweek_recovery_before_the_weekend_round_never_pulls_the_matchday_earlier() -> None:
     """A postponed match replayed midweek *before* the competition's next weekend round (the common Serie C case)."""
-    # as of Tue 10 Nov: Girone A has one round-10 recovery on Wed 11, then rounds 15 (Sun 15) and 16 (Sun 22)
     fixtures = [
         fx("A10rec", WED11, 10, "A", "Alpha", "Beta"),
         *round_fixtures("A", 15, [SUN15] * 10),
@@ -196,15 +209,19 @@ def test_midweek_recovery_before_the_weekend_round_is_not_a_regular_round() -> N
         *round_fixtures("SB", 14, [SAT14] * 10),
         *round_fixtures("SB", 15, [SAT21] * 10),
     ]
-    days = matchdays(fixtures)
-    assert [m.key for m in days] == ["2026-11-14", "2026-11-21"]
-    first, second = days
-    assert first.rounds == {Girone.A: 15, Girone.B: 15, Girone.C: 15, Girone.SB: 14}, "round 15 is Girone A's regular round, not the recovery"
-    assert "A10rec" in first.fixture_ids and {f"A15_{i}" for i in range(10)} <= first.fixture_ids and first.n_fixtures == 41
-    assert first.start == WED11 and first.label == "Giornata dell'11-15 nov 2026 · Girone A g.15, Girone B g.15, Girone C g.15, Serie B g.14"
-    assert second.rounds == {Girone.A: 16, Girone.B: 16, Girone.C: 16, Girone.SB: 15} and second.n_fixtures == 40
-    assert next_matchday(fixtures) == first and len(fixtures_of(first, fixtures)) == 41
-    # two recoveries of different old rounds on the same midweek: both attached, no extra matchday and no '#2' keys
+    # with the played matches of round 10 (eight on the weekend before) the result is the same
+    ten = round_fixtures("A", 10, [SAT31] * 4 + [SUN1] * 5)
+    for played in (None, played_rows(ten)):
+        days = matchdays(fixtures, played=played)
+        assert [m.key for m in days] == ["2026-11-14", "2026-11-21"]
+        first, second = days
+        assert first.rounds == {Girone.A: 15, Girone.B: 15, Girone.C: 15, Girone.SB: 14}, "round 15 is Girone A's current round, not the recovery"
+        assert "A10rec" not in first.fixture_ids and first.n_fixtures == 40 and first.start == SAT14
+        assert first.label == "Giornata del 14-15 nov 2026 · Girone A g.15, Girone B g.15, Girone C g.15, Serie B g.14"
+        assert second.rounds == {Girone.A: 16, Girone.B: 16, Girone.C: 16, Girone.SB: 15} and second.n_fixtures == 40
+        assert next_matchday(fixtures, played=played) == first and len(fixtures_of(first, fixtures)) == 40
+    assert first.view(Girone.A).n_played == 0
+    # two recoveries of different old rounds on the same midweek: both left out, no extra matchday and no '#2' keys
     two = [
         fx("C9rec", WED11, 9, "C", "C1", "C2"),
         fx("C11rec", WED11, 11, "C", "C3", "C4"),
@@ -214,20 +231,16 @@ def test_midweek_recovery_before_the_weekend_round_is_not_a_regular_round() -> N
         *round_fixtures("SB", 15, [SAT21] * 10),
     ]
     days = matchdays(two)
-    assert [m.key for m in days] == ["2026-11-14", "2026-11-21"] and {"C9rec", "C11rec"} <= days[0].fixture_ids
-    assert days[0].rounds == {Girone.C: 15, Girone.SB: 14} and days[0].n_fixtures == 22 and days[1].n_fixtures == 20
-    # a recovery played *after* the next round goes to the nearest matchday too (here the Sat 21 / Sun 22 one)
-    after = [fx("A10rec", WED18, 10, "A", "Alpha", "Beta"), *round_fixtures("A", 15, [SUN15] * 10), *round_fixtures("A", 16, [SUN22] * 10)]
-    days = matchdays(after)
-    assert [dict(m.rounds) for m in days] == [{Girone.A: 15}, {Girone.A: 16}] and "A10rec" in days[0].fixture_ids and days[0].end == WED18
-    # an anticipated match (one round-16 game on Fri 13, before round 15) does not turn round 15 into recoveries
+    assert [m.key for m in days] == ["2026-11-14", "2026-11-21"] and not {"C9rec", "C11rec"} & days[0].fixture_ids
+    assert days[0].rounds == {Girone.C: 15, Girone.SB: 14} and days[0].n_fixtures == 20 and days[1].n_fixtures == 20
+    # a match of the next round rescheduled 9 days before it is a straggler too: neither matchday moves
     anticipated = [*round_fixtures("A", 15, [SUN15] * 10), *round_fixtures("A", 16, [FRI13] + [SUN22] * 9)]
     days = matchdays(anticipated)
     assert [dict(m.rounds) for m in days] == [{Girone.A: 15}, {Girone.A: 16}]
-    assert "A16_0" in days[0].fixture_ids and days[0].start == FRI13 and days[0].n_fixtures == 11 and days[1].n_fixtures == 9
+    assert "A16_0" not in days[0].fixture_ids | days[1].fixture_ids and days[0].start == SUN15 and days[1].n_fixtures == 9
 
 
-def test_rounds_pair_by_calendar_block_not_by_index() -> None:
+def test_later_matchdays_pair_by_calendar_block_and_the_first_is_the_union() -> None:
     """Serie B skips 14 Nov (international break) while Serie C plays through: no drift of the pairing afterwards."""
     fixtures = [
         *round_fixtures("A", 14, [SUN8] * 10),
@@ -248,32 +261,57 @@ def test_rounds_pair_by_calendar_block_not_by_index() -> None:
         ("2026-12-05", {Girone.SB: 15}),
     ]
     assert days[1].label == "Giornata del 15 nov 2026 · Girone A g.15" and days[2].label == "Giornata del 21-22 nov 2026 · Girone A g.16, Serie B g.13"
-    assert all((m.end - m.start).days <= 1 for m in days), "a matchday is one weekend, never a 7-day span"
-    # a midweek Serie B round pairs with the midweek Serie C round (Tue 17 / Wed 18), not with the weekend one
-    midweek = [*round_fixtures("A", 15, [SUN15] * 10), *round_fixtures("A", 16, [WED18] * 10), *round_fixtures("SB", 13, [TUE17] * 10)]
-    days = matchdays(midweek)
-    assert [dict(m.rounds) for m in days] == [{Girone.A: 15}, {Girone.A: 16, Girone.SB: 13}]
-    assert days[1].label == "Giornata del 17-18 nov 2026 · Girone A g.16, Serie B g.13" and days[1].key == "2026-11-17"
+    # on Monday 9 the first matchday is the current round of both, whatever their dates: A15 on 15 Nov, SB13 on 21 Nov
+    monday = matchdays(fixtures, as_of=MON9)
+    assert monday[0].rounds == {Girone.A: 15, Girone.SB: 13} and (monday[0].start, monday[0].end) == (SUN15, SAT21)
+    assert [dict(m.rounds) for m in monday[1:]] == [{Girone.A: 16}, {Girone.A: 17, Girone.SB: 14}, {Girone.SB: 15}]
     # a competition with no fixtures at all is simply absent everywhere
     alone = matchdays([f for f in fixtures if f.girone is Girone.A])
     assert [dict(m.rounds) for m in alone] == [{Girone.A: 14}, {Girone.A: 15}, {Girone.A: 16}, {Girone.A: 17}]
 
 
-def test_a_round_in_progress_stays_regular_while_half_of_it_is_pending() -> None:
-    # Sunday morning: Saturday's 4 matches of Girone A round 15 are played, 6 remain (Sun 15 x5, Mon 16) -> still round 15
-    morning = [
-        *round_fixtures("A", 15, [SUN15] * 5 + [MON16]),
-        *round_fixtures("A", 16, [SUN22] * 10),
-        *round_fixtures("B", 15, [SUN15] * 10),
-        *round_fixtures("B", 16, [SUN22] * 10),
-    ]
-    days = matchdays(morning, as_of=SUN15)
-    assert [dict(m.rounds) for m in days] == [{Girone.A: 15, Girone.B: 15}, {Girone.A: 16, Girone.B: 16}] and days[0].n_fixtures == 16
-    # Sunday evening: 3 matches left (fewer than half the round) -> attached to the nearest matchday, the same weekend
-    evening = [*round_fixtures("A", 15, [SUN15] * 2 + [MON16]), *morning[6:]]
-    days = matchdays(evening, as_of=SUN15)
-    assert [dict(m.rounds) for m in days] == [{Girone.B: 15}, {Girone.A: 16, Girone.B: 16}]
-    assert {"A15_0", "A15_1", "A15_2"} <= days[0].fixture_ids and days[0].n_fixtures == 13 and days[0].end == MON16
+def test_a_round_in_progress_keeps_its_played_matches_and_stays_current() -> None:
+    """Friday/Saturday matches already played stay in the matchday with their score; the picks see only the ones to play."""
+    a15 = round_fixtures("A", 15, [SAT14] * 4 + [SUN15] * 5 + [MON16])
+    rest = [*round_fixtures("A", 16, [SUN22] * 10), *round_fixtures("B", 15, [SUN15] * 10), *round_fixtures("B", 16, [SUN22] * 10)]
+    played = played_rows(a15[:4], [(2, 1), (0, 0), (1, 3), (1, 1)])
+    sunday = datetime(2026, 11, 15, 9, 0, tzinfo=UTC)
+    days = matchdays([*a15[4:], *rest], played=played, now=sunday)
+    first = days[0]
+    assert dict(first.rounds) == {Girone.A: 15, Girone.B: 15} and first.n_fixtures == 16 and first.n_played == 4 and first.n_matches == 20
+    assert (first.start, first.end) == (SAT14, MON16) and first.key == "2026-11-14"
+    view = first.view(Girone.A)
+    assert [m.status_text for m in view.matches[:4]] == ["giocata 2-1", "giocata 0-0", "giocata 1-3", "giocata 1-1"]
+    assert not first.contains("A15_0") and first.contains("A15_4"), "the picks rank only the matches still to play"
+    # Sunday evening: seven of ten played, the Monday posticipo and two Sunday late games left -> still round 15 (in progress)
+    evening_played = played_rows(a15[:7])
+    evening = matchdays([*a15[7:], *rest], played=evening_played, now=datetime(2026, 11, 15, 12, 0, tzinfo=UTC))
+    assert evening[0].rounds[Girone.A] == 15 and evening[0].n_played == 7
+    # without the played matches the three leftovers are fewer than half a round and not provably in progress
+    assert matchdays([*a15[7:], *rest])[0].rounds[Girone.A] == 16
+
+
+def test_kicked_off_fixtures_leave_the_matchday_picks_but_stay_in_the_round() -> None:
+    """Regression: with the data of Saturday 10:00 and the page at 16:00 the four 14:30 matches stayed in the picks pool."""
+    def kick(fixtures: Sequence[Fixture], when: datetime) -> list[Fixture]:
+        return [Fixture(f.match_id, when.date(), f.round, f.girone, f.home_team, f.away_team, kickoff=when) for f in fixtures]
+
+    saturday = kick(round_fixtures("A", 13, [SAT7] * 4), datetime(2026, 11, 7, 13, 30, tzinfo=UTC))
+    sunday = kick(round_fixtures("B", 13, [SUN8] * 6), datetime(2026, 11, 8, 13, 30, tzinfo=UTC))
+    sunday = [Fixture(f.match_id.replace("B13", "A13x"), f.date, 13, "A", f.home_team, f.away_team, kickoff=f.kickoff) for f in sunday]
+    later = kick(round_fixtures("A", 14, [SUN15] * 10), datetime(2026, 11, 15, 13, 30, tzinfo=UTC))
+    fixtures = [*saturday, *sunday, *later]
+    afternoon = datetime(2026, 11, 7, 15, 0, tzinfo=UTC)  # 16:00 Rome: the Saturday matches kicked off 1h30 ago
+    first = matchdays(fixtures, now=afternoon)[0]
+    assert first.rounds == {Girone.A: 13} and first.n_in_play == 4 and first.n_fixtures == 6 and first.n_matches == 10
+    assert first.fixture_ids == {f.match_id for f in sunday} and not any(first.contains(f) for f in saturday)
+    view = first.view(Girone.A)
+    assert {m.match_id for m in view.in_play} == {f.match_id for f in saturday} and {m.status_text for m in view.in_play} == {"in corso / risultato in attesa"}
+    preds = [make_prediction(f, 1.2, 1.0) for f in fixtures]
+    picked = {p.match_id for p in draw_picks(preds, n=20, matchday=first)} | {p.match_id for p in btts_picks(preds, n=20, matchday=first)}
+    assert picked == {f.match_id for f in sunday}, "only matches still to play are ranked"
+    # the same data shown in the morning: every match of round 13 is still to play
+    assert matchdays(fixtures, now=datetime(2026, 11, 7, 9, 0, tzinfo=UTC))[0].n_fixtures == 10
 
 
 def test_next_matchday_and_fixtures_of() -> None:
@@ -291,8 +329,8 @@ def test_next_matchday_and_fixtures_of() -> None:
 
 def test_matchday_dataclass_and_date_spans() -> None:
     m = Matchday("2026-11-08", "x", date(2026, 11, 8), date(2026, 11, 9), {"A": 14}, frozenset({"a", "b"}))
-    assert m.rounds == {Girone.A: 14} and m.n_fixtures == 2 and hash(m) == hash("2026-11-08")
-    assert {m: 1}[m] == 1 and m.rounds_text() == "Girone A g.14"
+    assert m.rounds == {Girone.A: 14} and m.n_fixtures == 2 and hash(m) == hash("2026-11-08") and m.round_views == ()
+    assert {m: 1}[m] == 1 and m.rounds_text() == "Girone A g.14" and m.n_played == 0 and m.n_matches == 2 and m.view("A") is None
     with pytest.raises(ValueError):
         Matchday("k", "x", date(2026, 11, 9), date(2026, 11, 8), {}, frozenset())
     with pytest.raises(ValueError):
@@ -383,7 +421,7 @@ def test_rank_picks_attaches_the_best_book_price() -> None:
 @pytest.fixture(scope="module")
 def simulated_predictions() -> tuple[list[MatchPrediction], list[ValueOpportunity]]:
     """Predictions and value rows of the round after 2026-11-06 for the real 2026/27 perimeter (Serie B included)."""
-    league = simulate_league(seed=5, as_of=date(2026, 11, 6))
+    league = simulate_league(seed=5, registry=bc_registry(), as_of=date(2026, 11, 6))
     assert {f.girone for f in league.fixtures} == set(league.registry.gironi) == {Girone.A, Girone.B, Girone.C, Girone.SB} and len(league.fixtures) == 40
     engine = DixonColesEngine(DixonColesConfig.with_gaussian_prior(xi=0.0))
     engine.fit(league.matches, registry=league.registry)
@@ -457,6 +495,8 @@ def test_legend_covers_the_terms_a_bettor_needs() -> None:
         "VALUE", "REGRESSION_TRAP", "TRAP:<squadra>", "LONGSHOT", "SUSPICIOUS_EDGE", "Le 5 partite più probabili da X",
         "Le 12 partite più probabili da GG", "Dati simulati vs reali", "Storico di 3 stagioni", "Copertura minima",
         "Prime giornate", "Bankroll fisso", "Mai inseguire le perdite", "Campione minimo", "quote di chiusura",
+        "Giornata corrente", "Calcio d'inizio", "Stato · giocata", "Recuperi e rinvii", "Giornata n.",
+        "Aggiornamento dei dati FootyStats", "Chiave FootyStats e dati locali",
     ):
         assert any(needle in term for term in terms), needle
     # the rules and numbers quoted match the engine
@@ -539,10 +579,19 @@ def test_legend_claims_match_the_engine() -> None:
     rows = ValueEngine().evaluate([pred], [OddsQuote("M1", "Book", Market.MATCH_ODDS, {"1": 2.0, "X": 13.0, "2": 3.0})])
     row = next(r for r in rows if r.selection == "X")
     assert row.value and FLAG_VALUE in row.flags and FLAG_LONGSHOT in row.flags and row.stake_units == 0.0 and row.ev > 0.035
-    # the matchday entry describes the calendar-block pairing, not a k-th-round rule
+    # the matchday entry describes the current rounds and the calendar-block pairing, not a k-th-round rule
     giornata = terms["Giornata"]
     assert "venerdì-lunedì" in giornata and "martedì-giovedì" in giornata and "k-esima" not in giornata
-    assert "giornata più vicina" in giornata
+    assert "giornata corrente di ogni competizione" in giornata and "Recuperi e rinvii" in giornata and "giornata più vicina" not in giornata
+    # the current-round rule quotes the engine's thresholds: 3 hours of grace, half the round, the same block of the week
+    from src.engine.calendar import KICKOFF_GRACE
+
+    current = terms["Giornata corrente"]
+    assert KICKOFF_GRACE.total_seconds() == 3 * 3600 and "3 ore" in current and "metà" in current and "venerdì-lunedì" in current
+    assert "giocata 2-1" in terms["Stato · giocata / da giocare / in corso / rinviata"] and "sab 07/11 14:30" in terms["Calcio d'inizio"]
+    assert "6 ore" in terms["Aggiornamento dei dati FootyStats"] and "Aggiorna dati ora" in terms["Aggiornamento dei dati FootyStats"]
+    assert "SERIEC_DEMO=1" in terms["Dati simulati vs reali"] and "Non usare per scommettere" in terms["Dati simulati vs reali"]
+    assert "Secrets" in terms["Chiave FootyStats e dati locali"] and "data/processed" in terms["Chiave FootyStats e dati locali"]
     # the README carries the same text
     readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
     assert "più 0-0 e 1-1" in readme and "β verso la media del suo girone" in readme and "colonna bookmaker del CSV" in readme

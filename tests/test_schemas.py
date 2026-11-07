@@ -7,8 +7,10 @@ must say what it drops.
 """
 from __future__ import annotations
 
+import dataclasses
 import logging
-from datetime import date
+import pickle
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -16,8 +18,11 @@ import pytest
 
 import main as pipeline
 from src.common.schemas import (
+    FIXTURE_STATUSES,
+    LOCAL_TIMEZONE,
     MATCH_COLUMNS,
     MATCH_DTYPES,
+    Fixture,
     Girone,
     MatchRecord,
     ValidationReport,
@@ -257,3 +262,54 @@ def test_pipeline_match_counts_agree_on_a_hand_edited_csv(tmp_path: Path, mini: 
     assert len(out.matches) == 18 == out.params.n_matches
     assert "partite: 18" in console
     assert MISSING_MSG in err and all(v in err for v in victims) and "'home_goals': 1" in err and "'date': 1" in err
+
+
+# ============================================================================ Fixture: kick-off and status
+def test_fixture_six_field_constructor_still_works_with_defaults() -> None:
+    """The positional six-field call (simulator, older code) keeps working: no kick-off, status scheduled."""
+    fixture = Fixture("SIM-1", date(2026, 11, 8), 13, "A", "Lecco", "Trento")
+    assert fixture.kickoff is None and fixture.kickoff_local is None and fixture.status == "scheduled" and not fixture.is_postponed
+    assert fixture.girone is Girone.A and fixture.label == "Lecco - Trento"
+    assert FIXTURE_STATUSES == ("scheduled", "postponed")
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        fixture.status = "postponed"  # type: ignore[misc]
+    assert not hasattr(fixture, "__dict__"), "the dataclass stays slotted"
+
+
+def test_fixture_kickoff_is_utc_aware_and_shown_in_rome() -> None:
+    aware = datetime(2026, 11, 7, 14, 30, tzinfo=timezone.utc)
+    naive = Fixture("FS-1", date(2026, 11, 7), 13, "A", "Lecco", "Trento", kickoff=datetime(2026, 11, 7, 14, 30))
+    iso = Fixture("FS-1", date(2026, 11, 7), 13, "A", "Lecco", "Trento", kickoff="2026-11-07T14:30:00Z")
+    offset = Fixture("FS-1", date(2026, 11, 7), 13, "A", "Lecco", "Trento", kickoff=datetime(2026, 11, 7, 15, 30, tzinfo=timezone(timedelta(hours=1))))
+    stamp = Fixture("FS-1", date(2026, 11, 7), 13, "A", "Lecco", "Trento", kickoff=pd.Timestamp("2026-11-07 14:30", tz="UTC"))
+    assert naive.kickoff == iso.kickoff == offset.kickoff == stamp.kickoff == aware
+    assert naive.kickoff.tzinfo is timezone.utc and naive == iso
+    local = iso.kickoff_local
+    assert local is not None and local.tzinfo == LOCAL_TIMEZONE and (local.hour, local.minute) == (15, 30)  # CET, UTC+1
+    summer = Fixture("FS-2", date(2026, 9, 6), 2, "A", "Lecco", "Trento", kickoff="2026-09-06T12:30:00+00:00")
+    assert summer.kickoff_local is not None and summer.kickoff_local.hour == 14  # CEST, UTC+2
+    assert Fixture("FS-3", date(2026, 9, 6), 2, "A", "a", "b", kickoff="  ").kickoff is None
+    assert pickle.loads(pickle.dumps(iso)) == iso
+    with pytest.raises(TypeError):
+        Fixture("FS-4", date(2026, 9, 6), 2, "A", "a", "b", kickoff=12345)  # type: ignore[arg-type]
+
+
+def test_fixture_missing_kickoff_timestamps_are_none_not_nat() -> None:
+    """``pd.NaT`` subclasses ``datetime`` (not ``pd.Timestamp``): it must be stored as ``None``, never as ``NaT``."""
+    import numpy as np  # noqa: PLC0415
+    from src.engine.calendar import format_kickoff  # noqa: PLC0415
+
+    for missing in (pd.NaT, np.datetime64("NaT", "ns"), None, ""):
+        fixture = Fixture("FS-5", date(2026, 11, 7), 13, "A", "Lecco", "Trento", kickoff=missing)
+        assert fixture.kickoff is None and fixture.kickoff_local is None, repr(missing)
+        assert format_kickoff(fixture.kickoff, fixture.date) == "sab 07/11"  # day only, no NaT arithmetic
+    numpy_time = Fixture("FS-6", date(2026, 11, 7), 13, "A", "Lecco", "Trento", kickoff=np.datetime64("2026-11-07T14:30"))
+    assert numpy_time.kickoff == datetime(2026, 11, 7, 14, 30, tzinfo=timezone.utc)
+
+
+def test_fixture_status_postponed_and_validation() -> None:
+    postponed = Fixture("FS-9", date(2026, 9, 30), 1, "DA", "Chisola", "Borgosesia", kickoff="2026-09-30T13:00:00Z", status="postponed")
+    assert postponed.is_postponed and postponed.status == "postponed" and postponed.girone is Girone.DA
+    assert Fixture("FS-9", date(2026, 9, 30), 1, "DA", "a", "b", status=" Postponed ").status == "postponed"
+    with pytest.raises(ValueError, match="fixture status"):
+        Fixture("FS-9", date(2026, 9, 30), 1, "DA", "a", "b", status="cancelled")  # type: ignore[arg-type]

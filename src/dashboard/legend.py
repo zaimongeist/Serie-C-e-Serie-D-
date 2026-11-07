@@ -187,11 +187,57 @@ LEGEND: Final[tuple[LegendSection, ...]] = (
         (
             _e(
                 "Tabella giornata (tab Giornata)",
-                "una riga per ogni partita della giornata scelta (tutte le competizioni o quella della sidebar): forza delle "
-                "due squadre (α, β), forma recente, gol attesi del modello, risultato più probabile, probabilità e quote fair "
-                "dei mercati, miglior quota book per esito, EV migliore e flag. Tutto il turno si legge in un colpo d'occhio; "
-                "cliccando una riga (o scegliendo la gara nel menù «Partita») sotto compaiono la matrice dei punteggi e i "
-                "mercati di quella partita. «Scarica tabella giornata (CSV)» ha le stesse colonne più match_id.",
+                "una riga per **ogni partita** della giornata ufficiale di ogni competizione (tutte le competizioni della "
+                "sezione o quella della sidebar): le partite già giocate con il risultato finale, quelle da giocare con orario e "
+                "previsione del modello (forza α/β, forma recente, gol attesi, risultato più probabile, probabilità e quote fair "
+                "dei mercati, miglior quota book per esito, EV migliore e flag), quelle già iniziate senza risultato nei dati e "
+                "quelle rinviate. Tutto il turno si legge in un "
+                "colpo d'occhio, anche quando una parte è già stata giocata il venerdì; cliccando una partita da giocare (o "
+                "scegliendola nel menù «Partita») sotto compaiono la matrice dei punteggi e i mercati di quella partita. "
+                "«Scarica tabella giornata (CSV)» ha le stesse colonne più match_id.",
+            ),
+            _e(
+                "Giornata corrente",
+                "la giornata ufficiale (game_week di FootyStats) che si sta giocando o che sta per iniziare, competizione per "
+                "competizione: la più bassa che ha ancora almeno una partita in programma (calcio d'inizio non più vecchio di 3 "
+                "ore: una partita iniziata da meno di 3 ore tiene la giornata corrente) e in cui almeno metà delle partite con "
+                "una data non è ancora giocata (le rinviate senza nuova data non contano), oppure che è in corso: qualche "
+                "partita giocata o iniziata e una partita rimasta nello stesso blocco della settimana (venerdì-lunedì o "
+                "martedì-giovedì) della maggior parte del turno. Così un turno con due partite giocate il venerdì e otto nel "
+                "fine settimana resta la giornata corrente, con tutte e dieci le partite; un turno di cui resta solo un recupero "
+                "infrasettimanale no (anche se altre partite sono rinviate): la giornata corrente è la successiva e il recupero "
+                "va in «Recuperi e rinvii».",
+            ),
+            _e(
+                "Calcio d'inizio",
+                "giorno e ora della partita in ora italiana, «sab 07/11 14:30» (FootyStats dà l'orario in UTC: il passaggio fra "
+                "ora legale e solare è già considerato). Le partite giocate e i file senza orario mostrano solo il giorno, "
+                "«ven 06/11».",
+            ),
+            _e(
+                "Stato · giocata / da giocare / in corso / rinviata",
+                "«giocata 2-1» = partita già disputata, con il risultato finale e le colonne del modello vuote (non si prevede "
+                "il passato); «da giocare» = calcio d'inizio ancora da venire, con la previsione: sono le sole partite delle "
+                "selezioni e del pannello valore; «in corso / risultato in attesa» = il calcio d'inizio è passato ma il "
+                "risultato non è ancora nei dati (partita in corso, FootyStats non l'ha ancora pubblicato o i dati locali sono "
+                "di prima della fine): resta nel suo turno, senza previsione e senza quote, perché una giocata pre-partita su "
+                "una partita iniziata non ha senso; «rinviata» = nessun risultato 48 ore dopo il calcio d'inizio e recupero non "
+                "ancora fissato: niente previsione finché non ha una nuova data.",
+            ),
+            _e(
+                "Giornata n. (una competizione)",
+                "con una sola competizione scelta nella sidebar compare il menù «Giornata n.»: mostra qualsiasi giornata "
+                "ufficiale di quella competizione, passata o futura, con tutte le sue partite; «(corrente)» indica la giornata "
+                "corrente.",
+            ),
+            _e(
+                "Recuperi e rinvii",
+                "l'elenco, sotto la tabella, delle partite rinviate e dei recuperi ancora da giocare fissati fuori dalla giornata "
+                "corrente della loro competizione (per esempio un recupero del mercoledì di un turno già giocato), con la nuova "
+                "data e, per una partita spostata davvero, la data originale (il giorno in cui si giocava il resto del turno). "
+                "Non spostano mai la giornata e non entrano nelle selezioni di giornata; per quelle in programma sono indicate le "
+                "probabilità 1X2 e GG del modello. Una partita già iniziata senza risultato non è un recupero: resta nel suo "
+                "turno come «in corso / risultato in attesa».",
             ),
             _e(
                 "Forma (Casa / Ospiti)",
@@ -387,14 +433,15 @@ LEGEND: Final[tuple[LegendSection, ...]] = (
         (
             _e(
                 "Giornata",
-                "i turni delle competizioni della sezione scelta (Serie B e i tre gironi di Serie C, oppure i nove gironi di "
-                "Serie D) giocati nello stesso blocco della settimana calcistica: fine settimana "
-                "(venerdì-lunedì) oppure turno infrasettimanale (martedì-giovedì). Ogni turno è ancorato alla data in cui "
-                "si gioca la maggior parte delle sue partite, i numeri di giornata possono differire (Serie B alla 13ª, "
-                "gironi di Serie C alla 14ª) e una competizione che in quel blocco non gioca (Serie B in sosta per le "
-                "nazionali) semplicemente manca dall'etichetta. I recuperi di turni passati (poche partite con un numero di "
-                "giornata vecchio) sono aggregati alla giornata più vicina per data. Le giornate di Serie D sono raggruppate "
-                "a parte, dal suo calendario: non spostano quelle di Serie B e Serie C.",
+                "la giornata corrente di ogni competizione della sezione scelta (Serie B e i tre gironi di Serie C, oppure i "
+                "nove gironi di Serie D), messe insieme qualunque sia il loro numero (Serie B all'11ª, gironi di Serie C alla 13ª) "
+                "e con le partite già giocate incluse; le giornate successive raggruppano i turni seguenti giocati nello stesso "
+                "blocco della settimana calcistica: fine settimana (venerdì-lunedì) oppure turno infrasettimanale "
+                "(martedì-giovedì). Una competizione che in quel blocco non gioca (Serie B in sosta per le nazionali) manca "
+                "dall'etichetta. Le liste X e GG considerano solo le partite ancora da giocare (calcio d'inizio non ancora "
+                "passato: una partita iniziata esce dalle liste e dal pannello valore); rinvii e recuperi fuori turno "
+                "non spostano la giornata (sono in «Recuperi e rinvii»). Le giornate di Serie D sono raggruppate a parte, dal suo "
+                "calendario: non spostano quelle di Serie B e Serie C.",
             ),
             _e(
                 "Le 5 partite più probabili da X",
@@ -430,10 +477,31 @@ LEGEND: Final[tuple[LegendSection, ...]] = (
         (
             _e(
                 "Dati simulati vs reali",
-                "il badge nella sidebar dice quale sta usando la dashboard. «Dati simulati» = lega sintetica generata dal "
-                "programma per provare l'interfaccia (squadre vere, risultati inventati, quote del bookmaker fittizio "
-                "SimBook): **non usarli per scommettere**. «Dati reali» = partite, calendario e quote raccolti da "
-                "FootyStats in data/processed e data/odds.",
+                "la dashboard mostra solo dati reali FootyStats, scaricati con la tua chiave: il badge della sidebar dice "
+                "«Dati reali FootyStats». Senza dati non mostra numeri ma una pagina iniziale che spiega cosa manca e come "
+                "configurare la chiave. La lega simulata (squadre vere, calendari, risultati e quote del bookmaker fittizio "
+                "SimBook inventati) esiste solo come demo esplicita, avviata con SERIEC_DEMO=1: allora ogni pagina ha in cima "
+                "l'avviso rosso «DATI SIMULATI: squadre, calendari e risultati inventati. Non usare per scommettere.» e il badge "
+                "dice «Demo»; ogni CSV scaricato dalla demo si chiama DEMO_... e ha come prima colonna AVVISO = «DATI SIMULATI - "
+                "NON USARE PER SCOMMETTERE». **Non usare mai la demo per scommettere.**",
+            ),
+            _e(
+                "Aggiornamento dei dati FootyStats",
+                "all'avvio, se la chiave è configurata e i dati locali mancano o hanno più di 6 ore, la dashboard li scarica di "
+                "nuovo da FootyStats (partite delle ultime 3 stagioni, calendario con orari e rinvii, quote) e allinea il "
+                "dizionario squadre; la sidebar dice «Dati FootyStats aggiornati alle HH:MM del gg/mm» e il pulsante «Aggiorna "
+                "dati ora» li riscarica subito. Una competizione che non si può scaricare (lega non scelta sull'account, errore "
+                "di rete, anche solo per la stagione in corso) è segnalata con un avviso e tiene i dati precedenti; le altre si "
+                "aggiornano. Finché i dati restano più vecchi di 6 ore (chiave mancante, aggiornamento non riuscito) un avviso "
+                "giallo in cima alla pagina ne dice l'età e il motivo, e un altro avviso resta per ogni competizione ferma ai "
+                "dati di un download precedente. Le differenze del dizionario squadre sono in «Dettagli pipeline».",
+            ),
+            _e(
+                "Chiave FootyStats e dati locali",
+                "la chiave non va mai pubblicata: in locale sta nel file .env (FOOTYSTATS_API_KEY=...), su Streamlit Cloud in "
+                "App settings → Secrets (FOOTYSTATS_API_KEY = \"...\"). I dati scaricati restano solo in data/processed e "
+                "data/odds sul tuo computer o sul server dell'app: non sono nel repository pubblico, perché i dati FootyStats "
+                "sono in licenza al tuo account.",
             ),
             _e(
                 "Storico di 3 stagioni",
@@ -443,8 +511,9 @@ LEGEND: Final[tuple[LegendSection, ...]] = (
             ),
             _e(
                 "Squadre storiche e perimetro",
-                "il perimetro è il dizionario squadre della stagione (config/teams_<stagione>.json): le 80 squadre di "
-                "Serie C A/B/C e Serie B, più le 162 di Serie D quando la sezione è inizializzata. Una partita in programma "
+                "il perimetro è il dizionario squadre della stagione (config/teams_<stagione>.json), allineato alle liste "
+                "squadre di FootyStats a ogni aggiornamento: le 80 squadre di Serie C A/B/C e Serie B più le 162 dei nove "
+                "gironi di Serie D. Una partita in programma "
                 "con una squadra fuori perimetro o datata in un'altra stagione viene saltata e segnalata in «Dettagli pipeline».",
             ),
             _e(
@@ -453,9 +522,10 @@ LEGEND: Final[tuple[LegendSection, ...]] = (
                 "34 giornate ciascuno, codici DA-DI. La stima Dixon-Coles è unica per tutto il perimetro (le squadre promosse e "
                 "retrocesse collegano le divisioni; fattore campo e Σα = 0 per competizione tengono i gironi confrontabili), ma "
                 "classifica, giornate, risultati, valore, selezioni ed export mostrano solo la sezione scelta e le liste X / GG "
-                "sono calcolate dentro la sezione. Le liste squadre dei gironi non sono nel codice: la prima raccolta FootyStats "
-                "con la chiave le inizializza dall'API (python -m src.ingestion.footystats --competitions DA DB DC DD DE DF DG "
-                "DH DI --seasons 3, oppure avvia.bat), e fino ad allora la sezione mostra solo questo avviso. Le statistiche di "
+                "sono calcolate dentro la sezione. Le liste squadre dei gironi vengono da FootyStats e si riallineano a ogni "
+                "aggiornamento dei dati; finché non ci sono partite di Serie D nei dati la sezione mostra solo un avviso con il "
+                "comando di raccolta (python -m src.ingestion.footystats --competitions DA DB DC DD DE DF DG DH DI --seasons 3). "
+                "Le statistiche di "
                 "Serie D su FootyStats sono più povere: xG e tiri spesso mancano (colonne «-», λ e μ restano stimati dai gol), "
                 "senza xG il filtro REGRESSION_TRAP non può scattare, e le quote coprono meno partite (pannello valore in parte "
                 "vuoto): leggi gli EV di Serie D con prudenza ancora maggiore.",

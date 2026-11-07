@@ -1,7 +1,19 @@
-# Verifica dei calendari FootyStats (squadre, giornate, date, partite rinviate, differenze
-# con il dizionario squadre). Usa il secret FOOTYSTATS_API_KEY e NON scrive dati nel repository:
-# il riepilogo compare nella pagina del run e i file restano come artifact per 1 giorno.
-# Parte da solo quando cambia lo script di verifica sul branch di lavoro, oppure a mano.
+# Verifica dei calendari FootyStats con la chiave dell'utente (secret FOOTYSTATS_API_KEY).
+#
+# Il repository è PUBBLICO e i dati FootyStats sono concessi in licenza al titolare della chiave:
+# questo workflow NON scrive nulla nel repository, NON carica artifact e NON stampa quote né
+# statistiche. Nel log (e nel riepilogo del run) compaiono solo fatti di calendario: squadre,
+# giornate, orari, stato delle partite e risultati finali.
+#
+# Passo 1 - istantanea: calendario della stagione corrente di ogni competizione, anomalie,
+#           partite rinviate, giornata corrente e prova a secco della sincronizzazione del dizionario.
+# Passo 2 - percorso del prodotto: la stessa raccolta che fanno avvia.* e la dashboard
+#           (python -m src.ingestion.footystats, tutte le competizioni, 3 stagioni) in una cartella
+#           temporanea ci/ FUORI da data/, con la sincronizzazione del dizionario nella copia di lavoro
+#           (mai committata); poi la giornata corrente di ogni competizione come la mostra il prodotto.
+#
+# Parte da solo quando cambiano lo script di verifica, l'ingestion FootyStats, l'helper del
+# calendario o la configurazione sul branch di lavoro, oppure a mano (Run workflow).
 name: Verifica calendari FootyStats
 
 on:
@@ -10,6 +22,8 @@ on:
     paths:
       - .github/workflows/verifica-calendari.yml
       - src/ingestion/calendar_snapshot.py
+      - src/ingestion/footystats.py
+      - src/engine/calendar.py
       - config/competitions.toml
       - config/teams_2026_27.json
   workflow_dispatch:
@@ -25,6 +39,8 @@ jobs:
   verifica:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    env:
+      FOOTYSTATS_API_KEY: ${{ secrets.FOOTYSTATS_API_KEY }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -38,27 +54,49 @@ jobs:
       - name: Dipendenze
         run: python -m pip install --disable-pip-version-check -r requirements.txt
 
-      - name: Verifica calendari
-        env:
-          FOOTYSTATS_API_KEY: ${{ secrets.FOOTYSTATS_API_KEY }}
+      - name: Controllo del secret
         run: |
           if [ -z "${FOOTYSTATS_API_KEY}" ]; then
             echo "## Secret FOOTYSTATS_API_KEY mancante" >> "$GITHUB_STEP_SUMMARY"
             echo "Crealo in Settings -> Secrets and variables -> Actions." >> "$GITHUB_STEP_SUMMARY"
             exit 1
           fi
+          echo "Secret FOOTYSTATS_API_KEY presente (il valore non viene mai stampato)."
+
+      - name: Istantanea dei calendari
+        run: |
+          mkdir -p ci
           set +e
-          python -m src.ingestion.calendar_snapshot --out snapshot/calendario.json --summary snapshot/riepilogo.md --log-level WARNING
+          python -m src.ingestion.calendar_snapshot --summary ci/riepilogo.md --log-level WARNING
           status=$?
           set -e
-          if [ -f snapshot/riepilogo.md ]; then cat snapshot/riepilogo.md >> "$GITHUB_STEP_SUMMARY"; fi
+          if [ -f ci/riepilogo.md ]; then cat ci/riepilogo.md >> "$GITHUB_STEP_SUMMARY"; fi
           exit $status
 
-      - name: Conserva il risultato (1 giorno)
+      - name: Percorso del prodotto (raccolta FootyStats + sincronizzazione del dizionario)
         if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: verifica-calendari
-          path: snapshot/
-          retention-days: 1
-          if-no-files-found: ignore
+        run: |
+          mkdir -p ci
+          set +e
+          python -m src.ingestion.footystats --seasons 3 --no-odds \
+            --out ci/matches.csv --fixtures-out ci/fixtures.csv --odds-out ci/odds.csv \
+            --cache-dir ci/raw --mapping ci/footystats_teams.json > ci/raccolta.txt 2> ci/raccolta-errori.txt
+          status=$?
+          set -e
+          {
+            echo "## Raccolta FootyStats come la fa il prodotto (exit code ${status})"
+            echo '```'
+            grep -v '^matches -> \|^fixtures -> ' ci/raccolta.txt || true
+            grep -E '^(skipped|failure|leagues not chosen|harvest incomplete|dizionario squadre|footystats failed)' ci/raccolta-errori.txt || true
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+          python -m src.ingestion.calendar_snapshot --product-view --matches ci/matches.csv --fixtures ci/fixtures.csv \
+            --summary ci/giornate.md --log-level WARNING || status=1
+          if [ -f ci/giornate.md ]; then cat ci/giornate.md >> "$GITHUB_STEP_SUMMARY"; fi
+          echo "Dizionario sincronizzato nella copia di lavoro (non committato):"
+          git diff --stat -- config/ || true
+          exit $status
+
+      - name: Pulizia (nessun dato FootyStats resta sul runner)
+        if: always()
+        run: rm -rf ci

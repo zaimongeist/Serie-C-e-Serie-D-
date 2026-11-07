@@ -9,9 +9,27 @@ import pytest
 
 import main as pipeline
 from src.common.schemas import MATCH_COLUMNS, Market, OddsQuote
+from src.common.teams import TeamRegistry
+from src.common.teams import load_registry as load_shipped_registry
 from src.engine.tables import MATCHDAY_COLUMNS, RESULTS_MODEL_COLUMNS
 from src.engine.value import ValueOpportunity
-from src.simulation.generator import simulate_league
+from src.simulation.generator import DEMO_WARNING, simulate_league
+
+
+def bc_registry(season: str = "2026_27") -> TeamRegistry:
+    """The Serie B and Serie C part of the shipped dictionary of ``season`` (80 teams), Serie D left empty."""
+    full = load_shipped_registry(season)
+    return TeamRegistry.from_teams(full.season, {g.value: full.teams_by_girone[g] for g in full.gironi if g.family in ("Serie C", "Serie B")})
+
+
+BC = bc_registry()
+
+
+@pytest.fixture(autouse=True)
+def serie_b_c_perimeter(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The console runs on the Serie B / Serie C perimeter: the shipped dictionary also holds the 162 Serie D clubs, whose
+    simulated joint fit takes minutes; the Serie D section is exercised with ``--serie-d-demo`` (synthetic gironi)."""
+    monkeypatch.setattr(pipeline, "load_registry", lambda season="2026_27", *a, **k: bc_registry(season))
 
 
 def test_mini_mode_runs_end_to_end(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
@@ -38,20 +56,23 @@ def test_mini_mode_runs_end_to_end(tmp_path: Path, capsys: pytest.CaptureFixture
         assert section in captured, section
     assert captured.index("6) ALERT REGRESSION_TRAP") < captured.index("8) SELEZIONI DI GIORNATA") < captured.index("7) EXPORT")
     assert pipeline.LEGEND_POINTER == "Legenda: tab Legenda della dashboard oppure README" and pipeline.LEGEND_POINTER in captured
-    # export is a well-formed CSV with one row per evaluated selection
-    assert export.exists()
-    with export.open(newline="", encoding="utf-8") as fh:
+    # export is a well-formed CSV with one row per evaluated selection; simulated data -> DEMO_ file with the AVVISO column
+    demo_export = tmp_path / "DEMO_value.csv"
+    assert not export.exists() and demo_export.exists() and out.export_path == demo_export == pipeline.demo_export_path(export)
+    with demo_export.open(newline="", encoding="utf-8") as fh:
         rows = list(csv.DictReader(fh))
     assert len(rows) == n_selections
     assert {"match_id", "market", "selection", "book_odds", "fair_odds", "ev", "stake_units"} <= set(rows[0])
+    assert list(rows[0])[0] == "AVVISO" and {r["AVVISO"] for r in rows} == {"DATI SIMULATI - NON USARE PER SCOMMETTERE"}
     # the matchday picks: 5 draws and up to 12 GG of the next matchday (the mini demo has 7 fixtures), written next to the report
     assert len(out.matchdays) == 1 and out.next_matchday is not None and out.next_matchday.n_fixtures == len(out.predictions) == 7
     assert len(out.draw_picks) == 5 and len(out.btts_picks) == 7
     assert all(p.selection == "X" for p in out.draw_picks) and all(p.selection == "GG" for p in out.btts_picks)
     assert out.next_matchday.label in captured and "le 5 partite più probabili da X" in captured and "le 7 partite più probabili da GG" in captured
-    assert out.picks_export_path == tmp_path / "value_selezioni.csv" == pipeline.picks_export_path(export) and out.picks_export_path.exists()
+    assert out.picks_export_path == tmp_path / "DEMO_value_selezioni.csv" == pipeline.picks_export_path(demo_export) and out.picks_export_path.exists()
     picks = pd.read_csv(out.picks_export_path)
-    assert list(picks.columns)[:3] == ["Lista", "Giornata", "#"] and picks["Lista"].tolist() == ["X"] * 5 + ["GG"] * 7
+    assert list(picks.columns)[:4] == ["AVVISO", "Lista", "Giornata", "#"] and picks["Lista"].tolist() == ["X"] * 5 + ["GG"] * 7
+    assert picks["AVVISO"].eq("DATI SIMULATI - NON USARE PER SCOMMETTERE").all()
     assert picks["Giornata"].eq(out.next_matchday.label).all() and {"Partita", "P. Modello (%)", "Quota Fair", "Quota Book", "EV (%)", "Flag", "Nota"} <= set(picks.columns)
     assert f"selezioni di giornata scritte in: {out.picks_export_path}" in captured
     # section 4 prints the next matchday as one compact table (no more one line per fixture) ...
@@ -67,12 +88,14 @@ def test_mini_mode_runs_end_to_end(tmp_path: Path, capsys: pytest.CaptureFixture
     assert list(out.results_frame.columns) == list(RESULTS_MODEL_COLUMNS) and len(out.results_frame) == len(out.current_matches) == 20
     assert out.results_frame["P esito (%)"].between(0.0, 100.0).all()
     # ... and --export writes the full table and the played results next to the report
-    assert out.matchday_export_path == tmp_path / "value_giornata.csv" == pipeline.matchday_export_path(export) and out.matchday_export_path.exists()
-    assert out.results_export_path == tmp_path / "value_risultati.csv" == pipeline.results_export_path(export) and out.results_export_path.exists()
+    assert out.matchday_export_path == tmp_path / "DEMO_value_giornata.csv" == pipeline.matchday_export_path(demo_export) and out.matchday_export_path.exists()
+    assert out.results_export_path == tmp_path / "DEMO_value_risultati.csv" == pipeline.results_export_path(demo_export) and out.results_export_path.exists()
     giornata = pd.read_csv(out.matchday_export_path)
-    assert list(giornata.columns) == list(MATCHDAY_COLUMNS) and len(giornata) == 7 and giornata["Forma Casa"].notna().all()
+    assert list(giornata.columns) == ["AVVISO", *MATCHDAY_COLUMNS] and len(giornata) == 7 and giornata["Forma Casa"].notna().all()
     risultati = pd.read_csv(out.results_export_path)
-    assert list(risultati.columns) == list(RESULTS_MODEL_COLUMNS) and len(risultati) == 20 and set(risultati["Esito"]) <= {"1", "X", "2"}
+    assert list(risultati.columns) == ["AVVISO", *RESULTS_MODEL_COLUMNS] and len(risultati) == 20 and set(risultati["Esito"]) <= {"1", "X", "2"}
+    assert giornata["AVVISO"].eq("DATI SIMULATI - NON USARE PER SCOMMETTERE").all() and risultati["AVVISO"].eq("DATI SIMULATI - NON USARE PER SCOMMETTERE").all()
+    assert {p.name for p in tmp_path.iterdir()} == {"DEMO_value.csv", "DEMO_value_selezioni.csv", "DEMO_value_giornata.csv", "DEMO_value_risultati.csv"}
     assert f"tabella giornata scritta in: {out.matchday_export_path}" in captured and f"risultati giocati scritti in: {out.results_export_path}" in captured
 
 
@@ -143,7 +166,7 @@ def test_real_data_path_loads_processed_csv_and_odds(tmp_path: Path) -> None:
     """``--processed/--fixtures/--odds`` must consume the harvester's CSV layout."""
     from src.ingestion.harvester import save_fixtures, save_processed
 
-    league = simulate_league(seed=9, n_rounds=12)
+    league = simulate_league(registry=BC, seed=9, n_rounds=12)
     processed = tmp_path / "matches.csv"
     fixtures = tmp_path / "fixtures.csv"
     odds_dir = tmp_path / "odds"
@@ -204,12 +227,12 @@ def test_auto_prior_is_based_on_matches_per_team_not_total_matches(tmp_path: Pat
     """120 matches over 60 teams are 2 per team: the old ``len(matches) < 100`` rule switched the
     prior off and the pure MLE pinned rho/gamma on their bounds (home multiplier x3). The rule now
     looks at the matches per team of the least-covered girone."""
-    league = simulate_league(seed=7, n_rounds=4)
+    league = simulate_league(registry=BC, seed=7, n_rounds=4)
     assert len(league.matches) == 160  # 4 rounds x (30 Serie C + 10 Serie B) matches
     assert pipeline.matches_per_team(league.matches) == pytest.approx(4.0)
     assert pipeline.prior_recommended(league.matches)
     # a full half season (15 per team) is where the MLE takes over; a single thin girone keeps the prior on
-    half = simulate_league(seed=7, n_rounds=15).matches
+    half = simulate_league(registry=BC, seed=7, n_rounds=15).matches
     assert pipeline.matches_per_team(half) == pytest.approx(15.0) and not pipeline.prior_recommended(half)
     thin = half[(half["girone"] != "C") | (half["round"] <= 2)]
     assert pipeline.matches_per_team(thin) == pytest.approx(2.0) and pipeline.prior_recommended(thin)
@@ -237,7 +260,7 @@ def test_auto_prior_is_based_on_matches_per_team_not_total_matches(tmp_path: Pat
 
 def test_parameters_on_optimiser_bounds_are_reported(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     """With ``--prior off`` on 2 matches per team the MLE is degenerate: the console must say so."""
-    league = simulate_league(seed=7, n_rounds=4)
+    league = simulate_league(registry=BC, seed=7, n_rounds=4)
     processed, fixtures, _ = _save_league(tmp_path, league)
     out = pipeline.main(["--processed", str(processed), "--fixtures", str(fixtures), "--prior", "off", "--no-export", "--log-level", "ERROR"])
     captured = capsys.readouterr().out
@@ -261,7 +284,7 @@ def test_fixture_with_unknown_team_is_skipped_not_fatal(tmp_path: Path, capsys: 
     (``main()`` re-installs the log handler on ``sys.stderr``, so warnings are read from ``capsys``.)"""
     from src.common.schemas import Fixture, Girone
 
-    league = simulate_league(seed=9, n_rounds=12)
+    league = simulate_league(registry=BC, seed=9, n_rounds=12)
     first = league.fixtures[0]
     league.fixtures.append(Fixture("HAND-1", first.date, first.round, Girone.A, "Nowhere FC", first.away_team))  # not in any registry
     girone_c_free = league.matches[league.matches["girone"] != "C"].reset_index(drop=True)
@@ -287,7 +310,7 @@ def test_fixture_with_unknown_team_is_skipped_not_fatal(tmp_path: Path, capsys: 
 
 def test_missing_explicit_fixtures_or_odds_path_warns(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     """A typo in --fixtures/--odds used to be indistinguishable from an empty season (exit 0, silence)."""
-    league = simulate_league(seed=9, n_rounds=12)
+    league = simulate_league(registry=BC, seed=9, n_rounds=12)
     processed, _, _ = _save_league(tmp_path, league)
     missing_fx, missing_odds = tmp_path / "nope" / "fixtures.csv", tmp_path / "nope" / "odds"
     out = pipeline.main(["--processed", str(processed), "--fixtures", str(missing_fx), "--odds", str(missing_odds), "--no-export", "--log-level", "WARNING"])
@@ -335,7 +358,7 @@ def test_load_odds_dir_tolerates_empty_file_and_reports_blank_and_duplicate_rows
 
 def test_console_value_table_names_the_bookmaker(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     """With several books quoting the same selection the rows were indistinguishable."""
-    league = simulate_league(seed=9, n_rounds=12)
+    league = simulate_league(registry=BC, seed=9, n_rounds=12)
     processed, fixtures, odds_dir = _save_league(tmp_path, league, odds=True)
     second = pd.read_csv(odds_dir / "simbook.csv")
     second["bookmaker"] = "OtherBook"
@@ -387,10 +410,11 @@ def test_section_d_with_the_demo_registry_prints_the_serie_d_section(tmp_path: P
     assert len(out.results_frame) == 324 and out.results_frame["Competizione"].str.startswith("D-").all()
     assert len(out.draw_picks) == 5 and len(out.btts_picks) == 12 and all(p.girone.family == "Serie D" for p in out.draw_picks + out.btts_picks)
     assert len(out.predictions) == 121 and len(out.sections[SECTION_D].predictions) == 81 and len(out.sections[SECTION_D].opportunities) == 891
-    assert out.export_path == export and export.exists() and len(pd.read_csv(export)) == len(out.opportunities), "the value report covers the whole perimeter"
-    assert out.matchday_export_path == tmp_path / "value_giornata.csv" and out.picks_export_path == tmp_path / "value_selezioni.csv" and out.results_export_path == tmp_path / "value_risultati.csv"
+    demo_export = tmp_path / "DEMO_value.csv"
+    assert out.export_path == demo_export and demo_export.exists() and len(pd.read_csv(demo_export)) == len(out.opportunities), "the value report covers the whole perimeter"
+    assert out.matchday_export_path == tmp_path / "DEMO_value_giornata.csv" and out.picks_export_path == tmp_path / "DEMO_value_selezioni.csv" and out.results_export_path == tmp_path / "DEMO_value_risultati.csv"
     assert len(pd.read_csv(out.matchday_export_path)) == 81 and len(pd.read_csv(out.results_export_path)) == 324
-    assert not (tmp_path / "value_d_giornata.csv").exists(), "one section: no suffix"
+    assert not (tmp_path / "DEMO_value_d_giornata.csv").exists() and not export.exists(), "one section: no suffix; simulated: DEMO_ only"
     # the recovery report covers every competition of the perimeter, Serie D included
     assert out.recovery is not None and len(out.recovery) == 13 and set(out.recovery["girone"]) == {g.value for g in Girone}
 
@@ -409,15 +433,17 @@ def test_section_all_with_the_demo_registry_runs_both_sections_with_suffixed_exp
     assert len(bc.matchday_frame) == 40 and len(d.matchday_frame) == 81 and len(bc.results_frame) == 160 and len(d.results_frame) == 324
     assert len(bc.draw_picks) == len(d.draw_picks) == 5 and all(p.girone.family != "Serie D" for p in bc.draw_picks) and all(p.girone.family == "Serie D" for p in d.btts_picks)
     # suffixed CSVs per section, the whole-perimeter value report at --export, no unsuffixed section files
-    assert bc.matchday_export_path == tmp_path / "value_bc_giornata.csv" and d.matchday_export_path == tmp_path / "value_d_giornata.csv"
-    assert bc.picks_export_path == tmp_path / "value_bc_selezioni.csv" and d.results_export_path == tmp_path / "value_d_risultati.csv"
-    assert {p.name for p in tmp_path.iterdir()} == {"value.csv", "value_bc_giornata.csv", "value_bc_selezioni.csv", "value_bc_risultati.csv", "value_d_giornata.csv", "value_d_selezioni.csv", "value_d_risultati.csv"}
+    assert bc.matchday_export_path == tmp_path / "DEMO_value_bc_giornata.csv" and d.matchday_export_path == tmp_path / "DEMO_value_d_giornata.csv"
+    assert bc.picks_export_path == tmp_path / "DEMO_value_bc_selezioni.csv" and d.results_export_path == tmp_path / "DEMO_value_d_risultati.csv"
+    assert {p.name for p in tmp_path.iterdir()} == {
+        f"DEMO_value{suffix}.csv" for suffix in ("", "_bc_giornata", "_bc_selezioni", "_bc_risultati", "_d_giornata", "_d_selezioni", "_d_risultati")
+    }
     assert len(pd.read_csv(d.matchday_export_path)) == 81 and pd.read_csv(d.picks_export_path)["Lista"].tolist() == ["X"] * 5 + ["GG"] * 12
     assert f"tabella giornata scritta in: {d.matchday_export_path}" in console and console.count("report CSV scritto in:") == 1
     # with several sections the top-level fields describe the whole perimeter and nothing unsuffixed is written
     assert len(out.matchday_frame) == 121 and len(out.results_frame) == 484 and out.next_matchday is not None and out.next_matchday.n_fixtures == 121
     assert len(out.draw_picks) == 5 and out.matchday_export_path is None and out.picks_export_path is None and out.results_export_path is None
-    assert out.export_path == export and export.exists()
+    assert out.export_path == tmp_path / "DEMO_value.csv" and out.export_path.exists() and not export.exists()
     assert pipeline.section_export_stem(export, SECTION_D, multi=True) == tmp_path / "value_d.csv" and pipeline.section_export_stem(export, SECTION_D, multi=False) == export
     assert pipeline.section_export_stem(export, None, multi=True) == export
 
@@ -469,7 +495,7 @@ def test_serie_d_demo_requires_the_simulated_full_mode(tmp_path: Path, capsys: p
     processed = tmp_path / "matches.csv"
     from src.ingestion.harvester import save_processed
 
-    save_processed(simulate_league(seed=9, n_rounds=4).matches, processed)
+    save_processed(simulate_league(registry=BC, seed=9, n_rounds=4).matches, processed)
     with pytest.raises(SystemExit) as exc:
         pipeline.main(["--processed", str(processed), "--no-export", "--mode", "full", "--serie-d-demo"])
     assert exc.value.code == 2 and "--serie-d-demo" in capsys.readouterr().err
@@ -483,3 +509,126 @@ def test_serie_d_demo_requires_the_simulated_full_mode(tmp_path: Path, capsys: p
     assert pipeline.perimeter_banner(merged, pd.DataFrame(columns=["girone"]).astype({"girone": "string"}), pd.DataFrame(columns=["girone"]).astype({"girone": "string"}), SECTION_D).startswith(
         "Perimetro: Serie D 2026/27 Gironi A-I (162 squadre) · stagione corrente: 0 partite"
     )
+
+
+# ============================================================================ demo warning and --footystats
+def test_simulated_modes_print_the_demo_warning_first_and_last(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    pipeline.main(["--mode", "mini", "--no-export", "--log-level", "ERROR"])
+    lines = [line for line in capsys.readouterr().out.splitlines() if line.strip()]
+    assert lines[0] == DEMO_WARNING == lines[-1] == "DATI SIMULATI: squadre, calendari e risultati inventati. Non usare per scommettere."
+    # real data: no demo warning at all
+    from src.ingestion.harvester import save_fixtures, save_processed
+
+    league = simulate_league(registry=BC, seed=9, n_rounds=12)
+    save_processed(league.matches, tmp_path / "matches.csv")
+    save_fixtures(league.fixtures, tmp_path / "fixtures.csv")
+    out = pipeline.main(
+        ["--processed", str(tmp_path / "matches.csv"), "--fixtures", str(tmp_path / "fixtures.csv"), "--no-export", "--log-level", "ERROR", "--as-of", "2026-11-07"]
+    )
+    console = capsys.readouterr().out
+    assert DEMO_WARNING not in console and "dati reali" in console
+    # the real-data matchday is the current round as of --as-of (13th round, dated 15/11/2026): fixed date, no dependence on the clock
+    assert out.next_matchday is not None and set(out.next_matchday.rounds.values()) == {13}
+    assert "Calcio d'inizio" in console and "da giocare" in console
+
+
+def test_real_data_console_does_not_depend_on_the_clock_and_marks_nothing_as_demo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    """Regression: the demo-warning test ran the real-data console on ``datetime.now`` and would fail from 17/11/2026.
+
+    With ``--as-of`` the current round is the same whatever the clock says; the real-data exports carry no ``DEMO_``
+    prefix and no ``AVVISO`` column; once the fixtures have kicked off (``--as-of`` the day after) they leave the
+    matchday and their quotes leave the value section.
+    """
+    from datetime import UTC, datetime
+
+    from src.ingestion.harvester import save_fixtures, save_processed
+
+    league = simulate_league(registry=BC, seed=9, n_rounds=12)
+    processed, fixtures, odds_dir = tmp_path / "matches.csv", tmp_path / "fixtures.csv", tmp_path / "odds"
+    save_processed(league.matches, processed)
+    save_fixtures(league.fixtures, fixtures)
+    odds_dir.mkdir()
+    pd.DataFrame(
+        [{"match_id": q.match_id, "bookmaker": q.bookmaker, "market": q.market.value, "selection": sel, "odds": o} for q in league.odds for sel, o in q.odds.items()]
+    ).to_csv(odds_dir / "simbook.csv", index=False)
+
+    class FarFuture(datetime):
+        @classmethod
+        def now(cls, tz=None):  # noqa: ANN001, ANN206 - the clock of the console, two years ahead
+            return datetime(2028, 11, 20, 12, 0, tzinfo=UTC if tz is None else tz)
+
+    monkeypatch.setattr(pipeline, "datetime", FarFuture)
+    export = tmp_path / "reports" / "value.csv"
+    base = ["--processed", str(processed), "--fixtures", str(fixtures), "--odds", str(odds_dir), "--log-level", "ERROR"]
+    out = pipeline.main([*base, "--as-of", "2026-11-07", "--export", str(export)])
+    console = capsys.readouterr().out
+    assert out.next_matchday is not None and set(out.next_matchday.rounds.values()) == {13} and out.next_matchday.n_fixtures == len(league.fixtures)
+    assert DEMO_WARNING not in console and "già iniziate" not in console
+    names = {p.name for p in export.parent.iterdir()}
+    assert names == {"value.csv", "value_selezioni.csv", "value_giornata.csv", "value_risultati.csv"} and not any(n.startswith("DEMO_") for n in names)
+    for name in names:
+        assert "AVVISO" not in pd.read_csv(export.parent / name).columns, name
+    # the day after the round (fixtures dated 15/11 without a time): nothing left to bet on, the quotes are excluded
+    after = pipeline.main([*base, "--as-of", "2026-11-16", "--no-export"])
+    console = capsys.readouterr().out
+    assert after.next_matchday is None and len(after.opportunities) == len(out.opportunities)
+    assert "quote valutate: 0 " in console and f"{len(out.opportunities)} quote di partite già iniziate (o rinviate) escluse" in console
+
+
+def test_footystats_flag_downloads_first_then_runs_on_the_real_data(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    from datetime import UTC, datetime
+
+    import src.dashboard.data_refresh as data_refresh
+    from src.ingestion.harvester import save_fixtures, save_processed
+
+    processed, odds_dir = tmp_path / "processed", tmp_path / "odds"
+    monkeypatch.setattr(pipeline, "PROCESSED_DIR", processed)
+    monkeypatch.setattr(pipeline, "ODDS_DIR", odds_dir)
+    league = simulate_league(registry=BC, seed=21, n_rounds=12)
+    calls: list[Path] = []
+
+    def fake_refresh(processed_dir, odds_dir_, *, progress=None, **_):  # noqa: ANN001, ANN003, ANN202
+        calls.append(Path(processed_dir))
+        progress(0.5, "Scarico da FootyStats… 12 richieste")
+        save_processed(league.matches, Path(processed_dir) / "matches.csv")
+        save_fixtures(league.fixtures, Path(processed_dir) / "fixtures.csv")
+        stamp = datetime(2026, 11, 7, 13, 5, tzinfo=UTC)
+        result = data_refresh.RefreshResult(stamp, stamp, ("A", "B", "C", "SB", "DA"), Path(processed_dir), Path(odds_dir_))
+        result.per_competition = {c: {"partite": 120, "in_calendario": 10, "quote": 0} for c in ("A", "B", "C", "SB")}
+        result.errors, result.not_chosen = {"DA": "not chosen"}, {"DA": "Italy Serie D Group A"}
+        result.registry_sync = ("Girone B: aggiunta Nuova Monterosi",)
+        result.n_matches, result.n_fixtures, result.written = len(league.matches), len(league.fixtures), True
+        return result
+
+    monkeypatch.setattr(data_refresh, "refresh", fake_refresh)
+    out = pipeline.main(["--footystats", "--no-export", "--log-level", "ERROR"])
+    console = capsys.readouterr().out
+    assert calls == [processed] and len(out.matches) == len(league.matches) and len(out.predictions) == len(league.fixtures)
+    assert DEMO_WARNING not in console and "dati reali FootyStats" in console
+    assert "[ 50%] Scarico da FootyStats… 12 richieste" in console and "Dati FootyStats aggiornati alle 14:05 del 07/11" in console
+    assert "ATTENZIONE: Serie D Girone A: saltata, la lega «Italy Serie D Group A»" in console and "Dizionario squadre: Girone B: aggiunta Nuova Monterosi" in console
+    # --footystats and --processed together are refused
+    with pytest.raises(SystemExit) as exc:
+        pipeline.main(["--footystats", "--processed", str(processed / "matches.csv"), "--no-export"])
+    assert exc.value.code == 2 and "--footystats" in capsys.readouterr().err
+
+    # nothing downloaded and no earlier data: exit 2 with the instructions, never a simulated league
+    empty = tmp_path / "empty"
+    monkeypatch.setattr(pipeline, "PROCESSED_DIR", empty)
+
+    def failing_refresh(processed_dir, odds_dir_, **_):  # noqa: ANN001, ANN003, ANN202
+        stamp = datetime(2026, 11, 7, 13, 5, tzinfo=UTC)
+        result = data_refresh.RefreshResult(stamp, stamp, ("A",), Path(processed_dir), Path(odds_dir_))
+        result.error = "chiave FootyStats non configurata (FOOTYSTATS_API_KEY in .env, nell'ambiente o nei secrets di Streamlit)"
+        return result
+
+    monkeypatch.setattr(data_refresh, "refresh", failing_refresh)
+    with pytest.raises(SystemExit) as exc:
+        pipeline.main(["--footystats", "--no-export", "--log-level", "ERROR"])
+    captured = capsys.readouterr()
+    assert exc.value.code == 2 and "Nessun dato reale disponibile" in captured.err and "FOOTYSTATS_API_KEY" in captured.err
+    assert DEMO_WARNING not in captured.out and "Aggiornamento FootyStats non riuscito" in captured.out
+    # a failed download with earlier data: the earlier data is used and the console says so
+    monkeypatch.setattr(pipeline, "PROCESSED_DIR", processed)
+    out = pipeline.main(["--footystats", "--no-export", "--log-level", "ERROR"])
+    assert len(out.matches) == len(league.matches) and "Uso i dati FootyStats già scaricati" in capsys.readouterr().out

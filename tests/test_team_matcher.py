@@ -4,12 +4,14 @@ The matching-logic tests run on the 2025/26 dictionary (``LEGACY_SEASON``): its
 spellings (``Vicenza``, ``Virtus Verona``, ...) are the ones the assertions were
 written for, and pinning the season keeps them independent of
 :data:`src.common.teams.DEFAULT_SEASON`. The historical-team tests use the
-current 2026/27 perimeter (80 teams: the three Serie C gironi plus Serie B)
-extended with the 2025/26 aliases. Both season files hold Serie B, so clubs such
-as Virtus Entella, Vicenza or Arezzo are *current* teams: the "unknown club"
-examples use ``UNKNOWN_CLUB`` (Serie D, in neither file) and the "left the
-perimeter" examples use clubs that are only in the 2025/26 file (Ternana,
-Frosinone, ...).
+current 2026/27 perimeter (242 teams: the three Serie C gironi, Serie B and the
+nine Serie D gironi, as FootyStats lists them) extended with the 2025/26 aliases.
+Both season files hold Serie B, so clubs such as Virtus Entella, Vicenza or
+Arezzo are *current* teams, and so are the clubs relegated from Serie C to
+Serie D (Ternana, Pro Patria, Triestina, ...). The "unknown club" examples of the
+2025/26 matching tests use ``UNKNOWN_CLUB`` (a Serie D club absent from that
+file) and the "left the perimeter" examples use clubs that are only in the
+2025/26 file (Rimini, Frosinone, Monza, Venezia, Guidonia Montecelio).
 """
 from __future__ import annotations
 
@@ -23,9 +25,9 @@ from src.ingestion.team_matcher import MatchResult, TeamMatcher
 
 LEGACY_SEASON = "2025_26"
 CURRENT_SEASON = "2026_27"
-#: Teams of the 2026/27 perimeter: three Serie C gironi + Serie B, 20 each.
-PERIMETER_SIZE = 80
-#: A real club (Serie D) that is in neither registry; close enough to "Virtus Verona" to be its
+#: Teams of the 2026/27 perimeter: three Serie C gironi + Serie B (20 each) + nine Serie D gironi (18 each).
+PERIMETER_SIZE = 242
+#: A real club (Serie D) that is not in the 2025/26 registry; close enough to "Virtus Verona" to be its
 #: top fuzzy candidate (score 74) without reaching the default threshold (86).
 UNKNOWN_CLUB = "Virtus Bergamo"
 
@@ -282,7 +284,8 @@ def test_default_season_is_the_current_perimeter() -> None:
     assert DEFAULT_SEASON == CURRENT_SEASON
     plain = TeamMatcher(load_registry())
     assert len(plain.current_names) == PERIMETER_SIZE and plain.historical_names == frozenset()
-    assert plain.match("Ternana").canonical is None  # left Serie C after 2025/26: unknown without history
+    assert plain.match("Rimini").canonical is None  # left the perimeter after 2025/26: unknown without history
+    assert plain.match("Ternana").canonical == "Ternana"  # relegated to Serie D 2026/27: still a current team
     assert plain.match("Frosinone").canonical is None  # Serie B 2025/26, promoted: unknown without history
     assert plain.match("Juventus U23").canonical == "Juventus Next Gen"  # alias kept in the 2026/27 file
     # Serie B is part of the perimeter: its clubs are current teams, not unknown ones (regression:
@@ -293,11 +296,12 @@ def test_default_season_is_the_current_perimeter() -> None:
 
 def test_historical_names_are_derived_from_the_registry(history_matcher: TeamMatcher) -> None:
     assert len(history_matcher.current_names) == PERIMETER_SIZE
-    assert {"Ternana", "Frosinone", "Monza", "Pro Patria", "Triestina", "Rimini", "Virtus Verona", "Venezia"} <= history_matcher.historical_names
-    # promoted (Vicenza, Benevento, Arezzo) or relegated (Pescara) between Serie B and Serie C: still current
-    assert {"Vicenza", "Benevento", "Arezzo", "Pescara"} <= history_matcher.current_names
+    assert {"Frosinone", "Monza", "Rimini", "Venezia", "Guidonia Montecelio"} <= history_matcher.historical_names
+    # promoted (Vicenza, Benevento, Arezzo) or relegated (Pescara; Ternana, Pro Patria, Triestina, Virtus Verona to
+    # Serie D) between divisions: still current, under one canonical name
+    assert {"Vicenza", "Benevento", "Arezzo", "Pescara", "Ternana", "Pro Patria", "Triestina", "Virtus Verona"} <= history_matcher.current_names
     assert history_matcher.historical_names.isdisjoint(history_matcher.current_names)
-    assert history_matcher.is_historical("Ternana") and not history_matcher.is_current("Ternana")
+    assert history_matcher.is_historical("Rimini") and not history_matcher.is_current("Rimini")
     assert history_matcher.is_current("Perugia") and not history_matcher.is_historical("Perugia")
     assert not history_matcher.is_current("SPAL") and not history_matcher.is_historical("SPAL")
     # A registry without the ``historical_names`` attribute still works: targets of the
@@ -325,7 +329,7 @@ def test_unrestricted_lookup_resolves_historical_teams(history_matcher: TeamMatc
 
 
 def test_restricted_lookup_only_returns_current_teams(history_matcher: TeamMatcher) -> None:
-    # Ternana played in girone B until 2025/26 but is not in the 2026/27 perimeter.
+    # Ternana played in girone B until 2025/26 and plays Serie D (DE) in 2026/27: never a girone B team now.
     assert history_matcher.match("Ternana Calcio", Girone.B).canonical is None
     assert history_matcher.match("Ternana", "B").canonical is None
     assert history_matcher.match("Vicenza", Girone.A).canonical is None
