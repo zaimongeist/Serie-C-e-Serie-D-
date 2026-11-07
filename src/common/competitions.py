@@ -1,15 +1,21 @@
 """Competitions of the perimeter, read from ``config/competitions.toml``.
 
 A *competition* is one league table the model fits separately: a Serie C
-girone, Serie B, later other leagues. Each has a short upper-case ``code``
-(``'A'``, ``'B'``, ``'C'``, ``'SB'``) that is the value of the dynamic
-:class:`src.common.schemas.Girone` enum, the key of the season registries
-(``config/teams_<season>.json``) and the ``girone`` column of the canonical
-match frame. The configuration file is an array of ``[[competition]]`` tables in
-display order; :data:`COMPETITIONS` holds them as frozen :class:`Competition`
-records. When the file is missing (or unreadable) the built-in
-:data:`DEFAULT_COMPETITIONS` are used so importing the package never fails; the
-problem is logged.
+girone, Serie B, a Serie D girone, later other leagues. Each has a short
+upper-case ``code`` (``'A'``, ``'B'``, ``'C'``, ``'SB'``, ``'DA'`` .. ``'DI'``)
+that is the value of the dynamic :class:`src.common.schemas.Girone` enum, the key
+of the season registries (``config/teams_<season>.json``) and the ``girone``
+column of the canonical match frame. The configuration file is an array of
+``[[competition]]`` tables in display order; :data:`COMPETITIONS` holds them as
+frozen :class:`Competition` records. When the file is missing (or unreadable)
+the built-in :data:`DEFAULT_COMPETITIONS` are used so importing the package never
+fails; the problem is logged.
+
+Competitions are grouped in *families* (``'Serie C'``, ``'Serie B'``,
+``'Serie D'``): the user-facing surfaces (dashboard sections, exports, picks)
+are split by family while the engine fits the whole perimeter jointly, so the
+module offers :func:`families`, :func:`family_label`,
+:func:`competitions_of_family` and a family-aware :func:`describe_competitions`.
 
 This module deliberately imports nothing from :mod:`src.common.schemas` (which
 builds the enum from it) so the dependency graph stays acyclic.
@@ -18,7 +24,7 @@ from __future__ import annotations
 
 import re
 import tomllib
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any, Final, Iterable, Mapping, Sequence
 
@@ -32,7 +38,10 @@ __all__ = [
     "Competition",
     "competition",
     "competitions_by_family",
+    "competitions_of_family",
     "describe_competitions",
+    "families",
+    "family_label",
     "find_competition",
     "load_competitions",
     "normalize_competition_name",
@@ -46,9 +55,14 @@ COMPETITIONS_PATH: Final[Path] = CONFIG_DIR / "competitions.toml"
 
 _CODE_RE: Final[re.Pattern[str]] = re.compile(r"^[A-Z][A-Z0-9]{0,7}$")
 _SPACES_RE: Final[re.Pattern[str]] = re.compile(r"\s+")
+_SEASON_LABEL_RE: Final[re.Pattern[str]] = re.compile(r"^(\d{4})[/_\-](\d{2}|\d{4})$")
 #: Words that spellings of a competition may carry without changing its identity
 #: (``'Girone A'``, ``'Group A'``, ``'Italy Serie C Group A'`` all mean code ``A``).
 _FILLER_WORDS: Final[tuple[str, ...]] = ("GIRONE", "GIRONI", "GROUP", "GRUPPO")
+#: Providers that resolve a competition at runtime by name and therefore serve every configured one.
+_NAME_RESOLVING_PROVIDERS: Final[frozenset[str]] = frozenset({"footystats", "fotmob"})
+#: Minimum number of consecutive single-letter gironi described as a range (``'A-I'`` instead of ``'A/B/C'``).
+_RANGE_MIN_MEMBERS: Final[int] = 4
 
 
 def normalize_competition_name(value: object) -> str:
@@ -57,18 +71,37 @@ def normalize_competition_name(value: object) -> str:
     return _SPACES_RE.sub(" ", text)
 
 
+def _normalize_season_label(label: object) -> str:
+    """``'2026_27'`` / ``'2026-27'`` / ``'2026/2027'`` -> ``'2026/27'``; ``ValueError`` for anything else."""
+    text = str(label).strip()
+    found = _SEASON_LABEL_RE.match(text)
+    if found is None:
+        raise ValueError(f"season label must look like '2026/27', got {label!r}")
+    start = int(found.group(1))
+    second = found.group(2)
+    end = int(second) if len(second) == 4 else (start // 100) * 100 + int(second)
+    if len(second) == 2 and end < start:  # '1999/00'
+        end += 100
+    if end != start + 1:
+        raise ValueError(f"season label must span two consecutive years, got {label!r}")
+    return f"{start}/{end % 100:02d}"
+
+
 @dataclass(frozen=True, slots=True)
 class Competition:
     """One league table of the perimeter (a row of ``config/competitions.toml``).
 
     ``code`` is the stable identifier used everywhere in the code base; ``label``
-    is the full public name (``'Serie C Girone A'``), ``short`` the compact one
-    for tables and selectors (``'Girone A'``, ``'Serie B'``); ``footystats_name``
-    is the ``name`` field of the FootyStats ``/league-list`` entry;
-    ``sofascore_tournament_id`` the legacy SofaScore unique-tournament id (``0``
-    when unknown); ``tier`` the level in the national pyramid and ``family`` the
-    league the competition belongs to (the three Serie C gironi share
-    ``'Serie C'``).
+    is the full public name (``'Serie C Girone A'``, ``'Serie D Girone A'``),
+    ``short`` the compact one for tables and selectors (``'Girone A'``,
+    ``'Serie B'``, ``'D-A'``); ``footystats_name`` is the ``name`` field of the
+    FootyStats ``/league-list`` entry; ``sofascore_tournament_id`` the legacy
+    SofaScore unique-tournament id (``0`` when unknown: the competition is then
+    not served by that provider); ``tier`` the level in the national pyramid and
+    ``family`` the league the competition belongs to (the three Serie C gironi
+    share ``'Serie C'``, the nine Serie D gironi ``'Serie D'``). ``season_ids``
+    maps a season label (``'2026/27'``) to the FootyStats ``season_id`` and is the
+    fallback used when ``/league-list`` cannot answer for the competition.
     """
 
     code: str
@@ -79,6 +112,7 @@ class Competition:
     sofascore_tournament_id: int
     tier: int
     family: str
+    season_ids: dict[str, int] = field(default_factory=dict, hash=False)
 
     def __post_init__(self) -> None:
         code = str(self.code).strip().upper()
@@ -98,6 +132,20 @@ class Competition:
             raise ValueError(f"competition {code}: sofascore_tournament_id must be >= 0, got {self.sofascore_tournament_id}")
         if self.tier < 1:
             raise ValueError(f"competition {code}: tier must be >= 1, got {self.tier}")
+        if not isinstance(self.season_ids, Mapping):
+            raise ValueError(f"competition {code}: season_ids must be a mapping of season label -> FootyStats season id")
+        ids: dict[str, int] = {}
+        for raw_label, raw_id in self.season_ids.items():
+            try:
+                label = _normalize_season_label(raw_label)
+            except ValueError as exc:
+                raise ValueError(f"competition {code}: season_ids: {exc}") from exc
+            if isinstance(raw_id, bool) or not isinstance(raw_id, int) or raw_id < 1:
+                raise ValueError(f"competition {code}: season_ids[{label!r}] must be a positive integer, got {raw_id!r}")
+            if label in ids:
+                raise ValueError(f"competition {code}: season_ids lists season {label!r} twice")
+            ids[label] = raw_id
+        object.__setattr__(self, "season_ids", ids)
 
     @property
     def spellings(self) -> frozenset[str]:
@@ -108,29 +156,78 @@ class Competition:
         """
         return frozenset(normalize_competition_name(v) for v in (self.code, self.label, self.short, self.footystats_name))
 
+    @property
+    def girone_letter(self) -> str:
+        """The girone designation inside the family: ``'A'`` for ``'Serie C Girone A'`` *and* ``'Serie D Girone A'``, ``''`` for ``'Serie B'``.
+
+        Derived from the label with the family name and the filler words removed, so
+        descriptions can say ``Gironi A-I`` for Serie D instead of ``DA/DB/...``.
+        """
+        words = _without_phrase(_code_words(normalize_competition_name(self.label)), _code_words(normalize_competition_name(self.family)))
+        return " ".join(words)
+
+    def supports_provider(self, name: str) -> bool:
+        """Whether data provider ``name`` can serve this competition.
+
+        ``'sofascore'`` needs a known tournament id (``False`` when it is ``0``);
+        ``'footystats'`` and ``'fotmob'`` resolve competitions by name at runtime
+        and serve every configured one. ``ValueError`` for an empty name; an
+        unknown provider name is assumed to resolve by name as well.
+        """
+        provider = str(name).strip().lower()
+        if not provider:
+            raise ValueError("provider name must not be empty")
+        if provider == "sofascore":
+            return self.sofascore_tournament_id > 0
+        if provider in _NAME_RESOLVING_PROVIDERS:
+            return bool(self.footystats_name)
+        return True
+
     def to_dict(self) -> dict[str, Any]:
-        """Plain mapping with the field names of the TOML table."""
-        return {f.name: getattr(self, f.name) for f in fields(self)}
+        """Plain mapping with the field names of the TOML table (``season_ids`` as a copy)."""
+        out = {f.name: getattr(self, f.name) for f in fields(self)}
+        out["season_ids"] = dict(self.season_ids)
+        return out
 
 
-#: Built-in definitions, used when ``config/competitions.toml`` is missing.
+def _serie_d(letter: str, season_ids: Mapping[str, int]) -> Competition:
+    return Competition(
+        f"D{letter}", f"Serie D Girone {letter}", f"D-{letter}", "Italy", f"Italy Serie D Group {letter}", 0, 4, "Serie D", dict(season_ids)
+    )
+
+
+#: Built-in definitions, used when ``config/competitions.toml`` is missing (identical to the shipped file;
+#: FootyStats season ids verified live on 2026-11-06).
 DEFAULT_COMPETITIONS: Final[tuple[Competition, ...]] = (
-    Competition("A", "Serie C Girone A", "Girone A", "Italy", "Italy Serie C Group A", 141, 3, "Serie C"),
-    Competition("B", "Serie C Girone B", "Girone B", "Italy", "Italy Serie C Group B", 142, 3, "Serie C"),
-    Competition("C", "Serie C Girone C", "Girone C", "Italy", "Italy Serie C Group C", 143, 3, "Serie C"),
-    Competition("SB", "Serie B", "Serie B", "Italy", "Italy Serie B", 53, 2, "Serie B"),
+    Competition("A", "Serie C Girone A", "Girone A", "Italy", "Italy Serie C Group A", 141, 3, "Serie C", {"2024/25": 12659, "2025/26": 15535, "2026/27": 17487}),
+    Competition("B", "Serie C Girone B", "Girone B", "Italy", "Italy Serie C Group B", 142, 3, "Serie C", {"2024/25": 12647, "2025/26": 15532, "2026/27": 17492}),
+    Competition("C", "Serie C Girone C", "Girone C", "Italy", "Italy Serie C Group C", 143, 3, "Serie C", {"2024/25": 12670, "2025/26": 15519, "2026/27": 17473}),
+    Competition("SB", "Serie B", "Serie B", "Italy", "Italy Serie B", 53, 2, "Serie B", {"2024/25": 12621, "2025/26": 15632, "2026/27": 17404}),
+    _serie_d("A", {"2024/25": 13475, "2025/26": 15710, "2026/27": 17664}),
+    _serie_d("B", {"2024/25": 13232, "2025/26": 15706, "2026/27": 17667}),
+    _serie_d("C", {"2024/25": 13479, "2025/26": 15718, "2026/27": 17666}),
+    _serie_d("D", {"2024/25": 13481, "2025/26": 15714, "2026/27": 17676}),
+    _serie_d("E", {"2024/25": 13473, "2025/26": 15685, "2026/27": 17669}),
+    _serie_d("F", {"2024/25": 13470, "2025/26": 15707, "2026/27": 17671}),
+    _serie_d("G", {"2024/25": 13469, "2025/26": 15712, "2026/27": 17672}),
+    _serie_d("H", {"2024/25": 13477, "2025/26": 15693, "2026/27": 17674}),
+    _serie_d("I", {"2024/25": 13472, "2025/26": 15705, "2026/27": 17675}),
 )
 
-_REQUIRED_KEYS: Final[tuple[str, ...]] = tuple(f.name for f in fields(Competition))
+#: Keys every ``[[competition]]`` table must carry; ``season_ids`` is the only optional one.
+_OPTIONAL_KEYS: Final[frozenset[str]] = frozenset({"season_ids"})
+_REQUIRED_KEYS: Final[tuple[str, ...]] = tuple(f.name for f in fields(Competition) if f.name not in _OPTIONAL_KEYS)
+_ALL_KEYS: Final[frozenset[str]] = frozenset(f.name for f in fields(Competition))
 
 
 def parse_competitions(payload: Mapping[str, Any], *, source: str = "<mapping>") -> tuple[Competition, ...]:
     """Turn the decoded TOML document into competitions, in file order.
 
     ``payload`` must hold a non-empty ``competition`` array of tables with every
-    :class:`Competition` field; unknown keys are rejected (typos must not pass
-    silently), codes must be unique and so must the spellings each code answers
-    to. ``ValueError`` names ``source`` in its message.
+    :class:`Competition` field except the optional ``season_ids`` sub-table;
+    unknown keys are rejected (typos must not pass silently), codes must be
+    unique and so must the spellings each code answers to. ``ValueError`` names
+    ``source`` in its message.
     """
     tables = payload.get("competition")
     if not isinstance(tables, list) or not tables:
@@ -142,11 +239,11 @@ def parse_competitions(payload: Mapping[str, Any], *, source: str = "<mapping>")
         if not isinstance(table, Mapping):
             raise ValueError(f"{source}: [[competition]] #{position} is not a table")
         missing = [k for k in _REQUIRED_KEYS if k not in table]
-        unknown = sorted(set(table) - set(_REQUIRED_KEYS))
+        unknown = sorted(set(table) - _ALL_KEYS)
         if missing or unknown:
             raise ValueError(f"{source}: [[competition]] #{position} has missing keys {missing} / unknown keys {unknown}")
         try:
-            comp = Competition(**{k: table[k] for k in _REQUIRED_KEYS})
+            comp = Competition(**{k: table[k] for k in _ALL_KEYS if k in table})
         except (TypeError, ValueError) as exc:
             raise ValueError(f"{source}: [[competition]] #{position}: {exc}") from exc
         if comp.code in seen_codes:
@@ -240,13 +337,15 @@ def find_competition(value: object, competitions: Iterable[Competition] = COMPET
     """Resolve any accepted spelling of a competition (``ValueError`` when none matches).
 
     Accepted, case-insensitively and with ``_``/``-`` as spaces: the code
-    (``'A'``, ``'SB'``), the label, the short label and the FootyStats name
-    (``'Girone A'``, ``'Serie B'``, ``'serie_b'``, ``'Italy Serie B'``), the
-    family alone when it has a single competition, and a code wrapped in filler
-    words (``GIRONE``/``GROUP``/``GRUPPO``) and/or in the name of **its own**
-    family (``'Serie C Girone A'``, ``'Group A'``, ``'GIRONE_A'``, ``'GIRONEA'``,
-    ``'serie c girone a'``). ``'B'`` always means the competition whose code is
-    ``'B'`` (Serie C Girone B), never Serie B.
+    (``'A'``, ``'SB'``, ``'DA'``), the label, the short label and the FootyStats
+    name (``'Girone A'``, ``'Serie B'``, ``'serie_b'``, ``'Italy Serie B'``,
+    ``'Serie D Girone A'``, ``'D-A'``, ``'Italy Serie D Group A'``), the family
+    alone when it has a single competition, and a code wrapped in filler words
+    (``GIRONE``/``GROUP``/``GRUPPO``) and/or in the name of **its own** family
+    (``'Serie C Girone A'``, ``'Group A'``, ``'GIRONE_A'``, ``'GIRONEA'``,
+    ``'serie c girone a'``). ``'A'``, ``'B'`` and ``'C'`` always mean the Serie C
+    gironi (the competitions with those codes), never Serie B or a Serie D girone;
+    ``'D'`` alone is ambiguous (nine Serie D gironi) and raises.
 
     Contradictory spellings are rejected rather than guessed: ``'Serie B Girone
     A'`` (the family of another competition), ``'Serie C SB'``, ``'Italy A'`` (a
@@ -276,29 +375,76 @@ def find_competition(value: object, competitions: Iterable[Competition] = COMPET
 
 
 def competitions_by_family(competitions: Iterable[Competition] = COMPETITIONS) -> dict[str, tuple[Competition, ...]]:
-    """Competitions grouped by ``family`` in first-appearance order (``{'Serie C': (A, B, C), 'Serie B': (SB,)}``)."""
+    """Competitions grouped by ``family`` in first-appearance order (``{'Serie C': (A, B, C), 'Serie B': (SB,), 'Serie D': (DA, ..., DI)}``)."""
     groups: dict[str, list[Competition]] = {}
     for comp in competitions:
         groups.setdefault(comp.family, []).append(comp)
     return {family: tuple(members) for family, members in groups.items()}
 
 
-def describe_competitions(competitions: Iterable[Competition] = COMPETITIONS, *, season: str | None = None) -> str:
-    """Italian one-liner naming the competitions: ``'Serie C Gironi A/B/C + Serie B'``.
+def families(competitions: Iterable[Competition] = COMPETITIONS) -> tuple[str, ...]:
+    """The family names in configuration order: ``('Serie C', 'Serie B', 'Serie D')`` with the shipped file."""
+    return tuple(competitions_by_family(competitions))
+
+
+def family_label(family: object, competitions: Iterable[Competition] = COMPETITIONS) -> str:
+    """Canonical spelling of a family given any case/underscore variant (``'serie_d'`` -> ``'Serie D'``).
+
+    ``ValueError`` when no configured competition belongs to that family.
+    """
+    wanted = normalize_competition_name(family)
+    for name in families(competitions):
+        if normalize_competition_name(name) == wanted:
+            return name
+    raise ValueError(f"Unknown family: {family!r} (known: {list(families(competitions))})")
+
+
+def competitions_of_family(family: object, competitions: Iterable[Competition] = COMPETITIONS) -> tuple[Competition, ...]:
+    """The competitions of one family in configuration order (``ValueError`` for an unknown family)."""
+    comps = tuple(competitions)
+    name = family_label(family, comps)
+    return competitions_by_family(comps)[name]
+
+
+def _gironi_text(members: Sequence[Competition]) -> str:
+    """``'A/B/C'`` for a few gironi, ``'A-I'`` for a run of at least four consecutive letters, codes when letters are missing."""
+    letters = [c.girone_letter for c in members]
+    if any(not letter for letter in letters):
+        return "/".join(c.code for c in members)
+    consecutive = all(len(letter) == 1 and letter.isalpha() for letter in letters) and all(
+        ord(b) == ord(a) + 1 for a, b in zip(letters, letters[1:])
+    )
+    if consecutive and len(letters) >= _RANGE_MIN_MEMBERS:
+        return f"{letters[0]}-{letters[-1]}"
+    return "/".join(letters)
+
+
+def describe_competitions(
+    competitions: Iterable[Competition] = COMPETITIONS, *, season: str | None = None, family: str | None = None
+) -> str:
+    """Italian one-liner naming the competitions: ``'Serie C Gironi A/B/C + Serie B + Serie D Gironi A-I'``.
 
     Families are joined with ``' + '``; a family with several competitions lists
-    their codes after ``Gironi``, a single-competition family is named alone.
+    their girone letters after ``Gironi`` (``A/B/C``, or a range ``A-I`` for at
+    least four consecutive letters), a single-competition family is named alone.
     With ``season`` the label is inserted after the first family
     (``'Serie C 2026/27 Gironi A/B/C + Serie B'``), which is how banners read.
-    An empty iterable yields ``''`` (or the bare season).
+    ``family`` restricts the description to that family
+    (``describe_competitions(family='Serie D', season='2026/27')`` ->
+    ``'Serie D 2026/27 Gironi A-I'``; ``ValueError`` for an unknown family when
+    the iterable holds competitions). An empty selection yields ``''`` (or the
+    bare season).
     """
+    comps = tuple(competitions)
+    if family is not None and comps:
+        comps = competitions_of_family(family, comps)
     parts: list[str] = []
-    for position, (family, members) in enumerate(competitions_by_family(competitions).items()):
-        text = family
+    for position, (name, members) in enumerate(competitions_by_family(comps).items()):
+        text = name
         if season is not None and position == 0:
             text += f" {season}"
         if len(members) > 1:
-            text += " Gironi " + "/".join(c.code for c in members)
+            text += " Gironi " + _gironi_text(members)
         parts.append(text)
     if not parts:
         return str(season) if season is not None else ""

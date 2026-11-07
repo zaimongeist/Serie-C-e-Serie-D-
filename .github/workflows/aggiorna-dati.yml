@@ -1,15 +1,19 @@
-# Raccolta dati post-giornata: scarica le ultime 3 stagioni di Serie C (Gironi A/B/C) e Serie B,
-# aggiorna data/processed/*.csv (+ le quote pre-match in data/odds/footystats.csv) e committa solo
-# se qualcosa è cambiato.
+# Raccolta dati post-giornata: scarica le ultime 3 stagioni di Serie C (Gironi A/B/C), Serie B e
+# Serie D (Gironi A-I), aggiorna data/processed/*.csv (+ le quote pre-match in data/odds/footystats.csv)
+# e committa solo se qualcosa è cambiato.
 #
 # Sorgente dati:
 #   - FootyStats (API ufficiale, raggiungibile anche dai datacenter): serve la chiave API del tuo
 #     account footystats.org, salvata come SEGRETO di repository FOOTYSTATS_API_KEY
 #     (Settings → Secrets and variables → Actions → New repository secret). Sul sito aggiungi al tuo
-#     account le leghe: Italy Serie C Group A / B / C e Italy Serie B ("Choose leagues").
-#     La chiave non compare mai nei log, nella cache né nei file committati.
-#   - senza segreto si usa SofaScore. ATTENZIONE: SofaScore risponde spesso HTTP 403 agli IP dei
-#     datacenter; in quel caso il job fallisce e il riepilogo lo spiega.
+#     account le leghe: Italy Serie C Group A / B / C, Italy Serie B e Italy Serie D Group A .. I
+#     ("Choose leagues"); una lega non scelta ripiega sui season id configurati in
+#     config/competitions.toml. La chiave non compare mai nei log, nella cache né nei file committati.
+#     Per default il job raccoglie TUTTE le 13 competizioni configurate (input `competitions` vuoto).
+#     Serie D: la prima esecuzione inizializza le liste squadre dei 9 gironi in
+#     config/teams_2026_27.json dall'endpoint league-teams (auto-init) e il commit le include.
+#   - senza segreto si usa SofaScore (solo Serie C A/B/C). ATTENZIONE: SofaScore risponde spesso
+#     HTTP 403 agli IP dei datacenter; in quel caso il job fallisce e il riepilogo lo spiega.
 #
 # Dove gira:
 #   - per default sui runner GitHub (ubuntu-latest), sufficiente con FootyStats.
@@ -17,7 +21,7 @@
 #     (Settings → Actions → Runners → New self-hosted runner) e imposta la variabile di repository
 #     HARVEST_RUNNER = self-hosted (Settings → Secrets and variables → Actions → Variables).
 #     Il job partirà sul PC quando è acceso e il runner è in esecuzione.
-name: Aggiorna dati Serie C e Serie B
+name: Aggiorna dati Serie C, Serie B e Serie D
 
 on:
   schedule:
@@ -30,8 +34,8 @@ on:
         default: "3"
         required: false
       competitions:
-        description: "Competizioni FootyStats (codici separati da spazio: A B C SB)"
-        default: "A B C SB"
+        description: "Competizioni FootyStats (codici separati da spazio, es. A B C SB DA DB DC DD DE DF DG DH DI); vuoto = tutte le 13 configurate"
+        default: ""
         required: false
       with_stats:
         description: "SofaScore: scaricare anche tiri/angoli/xG (true/false)"
@@ -82,10 +86,14 @@ jobs:
         run: |
           set -o pipefail
           SEASONS="${{ github.event.inputs.seasons || '3' }}"
-          COMPETITIONS="${{ github.event.inputs.competitions || 'A B C SB' }}"
-          echo "Sorgente: FootyStats (competizioni: $COMPETITIONS, stagioni: $SEASONS)" | tee harvest.log
+          COMPETITIONS="${{ github.event.inputs.competitions }}"
+          # Nessun --competitions = tutte le competizioni di config/competitions.toml (Serie C A/B/C, Serie B, Serie D A-I);
+          # i gironi di Serie D ancora senza squadre in config/teams_2026_27.json vengono inizializzati da league-teams.
+          COMPETITIONS_FLAG=""
+          if [ -n "$COMPETITIONS" ]; then COMPETITIONS_FLAG="--competitions $COMPETITIONS"; fi
+          echo "Sorgente: FootyStats (competizioni: ${COMPETITIONS:-tutte le configurate}, stagioni: $SEASONS)" | tee harvest.log
           # shellcheck disable=SC2086
-          python -m src.ingestion.footystats --competitions $COMPETITIONS --seasons "$SEASONS" \
+          python -m src.ingestion.footystats $COMPETITIONS_FLAG --seasons "$SEASONS" \
             --odds-out data/odds/footystats.csv 2>&1 | tee -a harvest.log
 
       - name: Raccolta dati (SofaScore, nessun segreto FOOTYSTATS_API_KEY)
@@ -95,7 +103,7 @@ jobs:
           SEASONS="${{ github.event.inputs.seasons || '3' }}"
           STATS_FLAG=""
           if [ "${{ github.event.inputs.with_stats || 'true' }}" = "false" ]; then STATS_FLAG="--no-stats"; fi
-          echo "Sorgente: SofaScore (nessun segreto FOOTYSTATS_API_KEY configurato)" | tee harvest.log
+          echo "Sorgente: SofaScore (nessun segreto FOOTYSTATS_API_KEY configurato; solo Serie C A/B/C)" | tee harvest.log
           python -m src.ingestion.harvester --gironi A B C --seasons "$SEASONS" $STATS_FLAG 2>&1 | tee -a harvest.log
 
       - name: Riepilogo (partite per competizione e stagione)
@@ -103,14 +111,20 @@ jobs:
         run: |
           python - <<'PY'
           import os
+          import re
           from pathlib import Path
           import pandas as pd
           from src.common.schemas import season_of
 
           lines = ["## Dati raccolti", ""]
-          source = Path("harvest.log").read_text(encoding="utf-8").splitlines()[0] if Path("harvest.log").exists() else ""
+          log_text = Path("harvest.log").read_text(encoding="utf-8") if Path("harvest.log").exists() else ""
+          source = log_text.splitlines()[0] if log_text else ""
           if source:
               lines += [source, ""]
+          # auto-init della Serie D: la CLI stampa "registry initialised: DA (18 teams), ... -> config/teams_2026_27.json"
+          initialised = re.search(r"^registry initialised: (.+)$", log_text, flags=re.MULTILINE)
+          if initialised:
+              lines += [f"Gironi inizializzati in config/teams_2026_27.json (Serie D, liste squadre da FootyStats): {initialised.group(1)}", ""]
           matches = Path("data/processed/matches.csv")
           if matches.exists():
               df = pd.read_csv(matches, parse_dates=["date"])
@@ -143,7 +157,7 @@ jobs:
             if grep -qiE "API key (not configured|missing)|footystats: FootyStats API key" harvest.log; then
               echo "Manca la chiave FootyStats: aggiungi il segreto di repository **FOOTYSTATS_API_KEY** (Settings → Secrets and variables → Actions)."
             elif grep -qE "chosen leagues" harvest.log; then
-              echo "Una competizione non è fra le leghe del tuo account FootyStats: su footystats.org aggiungi *Italy Serie C Group A/B/C* e *Italy Serie B* (Choose leagues)."
+              echo "Una competizione non è fra le leghe del tuo account FootyStats e non ha season id configurati: su footystats.org aggiungi *Italy Serie C Group A/B/C*, *Italy Serie B* e *Italy Serie D Group A..I* (Choose leagues)."
             elif grep -qE "status=403|HTTP 403|Forbidden" harvest.log; then
               echo "SofaScore ha risposto **403 Forbidden**: l'IP del runner è bloccato."
               echo "Soluzione: configura il segreto FOOTYSTATS_API_KEY (API ufficiale), oppure esegui il job da un self-hosted runner sul tuo PC (variabile HARVEST_RUNNER=self-hosted) o lancia \`avvia.command\` / \`avvia.bat\` in locale."
@@ -162,7 +176,9 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add data/processed/matches.csv data/processed/fixtures.csv
           [ -f data/odds/footystats.csv ] && git add data/odds/footystats.csv
+          # Dizionari squadre: l'auto-init della Serie D e la mappa id FootyStats -> nome canonico li modificano.
           [ -f config/footystats_teams.json ] && git add config/footystats_teams.json
+          [ -f config/teams_2026_27.json ] && git add config/teams_2026_27.json
           if git diff --cached --quiet; then
             echo "Nessuna variazione nei dati: niente da committare." | tee -a "$GITHUB_STEP_SUMMARY"
             exit 0
@@ -171,6 +187,10 @@ jobs:
           import pandas as pd; print(len(pd.read_csv("data/processed/matches.csv")))
           PY
           )
-          git commit -m "Aggiorna dati Serie C / Serie B ($(date -u +%Y-%m-%d), $N partite)"
+          REGISTRY_NOTE=""
+          if ! git diff --cached --quiet -- config/teams_2026_27.json; then
+            REGISTRY_NOTE=" + dizionario squadre"
+          fi
+          git commit -m "Aggiorna dati Serie C / Serie B / Serie D ($(date -u +%Y-%m-%d), $N partite$REGISTRY_NOTE)"
           git push
-          echo "Dati aggiornati: $N partite in data/processed/matches.csv" >> "$GITHUB_STEP_SUMMARY"
+          echo "Dati aggiornati: $N partite in data/processed/matches.csv$REGISTRY_NOTE" >> "$GITHUB_STEP_SUMMARY"

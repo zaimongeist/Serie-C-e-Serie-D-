@@ -30,6 +30,21 @@ decay down-weights them). Teams that appear only in history are fitted as
 current one. Fixtures dated in another season than the registry's (a stale
 ``fixtures.csv`` of last season) are never predicted: they are listed as skipped.
 
+Sections (``--section bc|d|all``, default ``all``)
+--------------------------------------------------
+The fit (steps 1-2) is one for the whole perimeter; steps 3-8 are printed once
+per *section* -- *Serie B e Serie C* and *Serie D*, the same split as the
+dashboard sidebar -- each with its own banner, ranking per competition, matchday
+table, value panel, trap alerts and picks (5 X / 12 GG ranked within the
+section). Only the sections that have teams run: the Serie D gironi ship empty
+(the FootyStats harvester initialises them from the API), so until then the
+console prints the Serie D status and the command that initialises it. With
+more than one section the per-section CSVs carry the section slug
+(``<stem>_bc_giornata.csv``, ``<stem>_d_giornata.csv``, ...); the value report
+at ``--export`` always covers the whole perimeter. In the simulated full mode
+``--serie-d-demo`` adds a synthetic Serie D registry (nine gironi of 18 clubs)
+so the section can be shown offline.
+
 Calendar of the simulated modes: ``--mode full`` plays the rounds dated before
 ``--as-of`` (today by default) and predicts the first round on/after it, like
 the dashboard; ``--rounds N`` fixes the played rounds instead (e.g. 30 for the
@@ -45,6 +60,7 @@ Examples::
     python main.py --processed data/processed/matches.csv --fixtures data/processed/fixtures.csv --odds data/odds
     python main.py --season 2026_27 --kelly 0.25 --min-ev 0.05 --export reports/value.csv
     python main.py --n-draws 8 --n-btts 15        # longer matchday pick lists (section 8)
+    python main.py --mode full --rounds 6 --history 0 --serie-d-demo --section d   # the Serie D section on synthetic data
 """
 from __future__ import annotations
 
@@ -52,15 +68,17 @@ import argparse
 from dataclasses import dataclass, field, replace
 from datetime import date
 from pathlib import Path
-from typing import Final, Sequence
+from typing import Callable, Final, Sequence
 
 import numpy as np
 import pandas as pd
 
 from src.common.logging_config import configure_logging, get_logger
 from src.common.paths import ROOT
+from src.common.competitions import describe_competitions
 from src.common.schemas import (
     Fixture,
+    Girone,
     MatchPrediction,
     OddsQuote,
     empty_matches_frame,
@@ -78,6 +96,7 @@ from src.simulation.generator import (
     inject_regression_trap,
     simulate_history,
     simulate_mini_dataset,
+    simulate_serie_d_registry,
 )
 
 log = get_logger("main")
@@ -217,18 +236,31 @@ def load_real_data(
 # rule instead of pinning it to zero coverage (``CoverageReport.ignored`` names it).
 from src.dashboard.state import (  # noqa: E402
     PRIOR_MIN_MATCHES_PER_TEAM,
+    SECTION_BC,
+    SECTION_D,
     CoverageReport,
+    configured_gironi,
     coverage_report,
     export_csv_bytes,
     history_label,
+    in_section,
     matches_per_team,
     other_season_reason,
     perimeter_matches,
     picks_csv_bytes,
     prior_recommended,
+    section_matches,
+    section_slug,
+    sections_for,
+    serie_d_gironi,
+    serie_d_harvest_command,
+    serie_d_status_text,
     simulate_current_season,
     split_by_season,
 )
+
+#: ``--section`` values -> the sections of :mod:`src.dashboard.state` they ask for (``all`` = every section with teams).
+SECTION_CHOICES: Final[dict[str, tuple[str, ...]]] = {"bc": (SECTION_BC,), "d": (SECTION_D,), "all": (SECTION_BC, SECTION_D)}
 
 #: Console pointer to the glossary, printed with the matchday picks.
 LEGEND_POINTER: Final[str] = "Legenda: tab Legenda della dashboard oppure README"
@@ -258,6 +290,20 @@ MATCHDAY_CONSOLE_LEGEND: Final[str] = (
     "Book X miglior quota book della X · EV max miglior valore atteso % fra le selezioni quotate · Flag unione dei flag "
     "della partita (tabella completa con forma, α/β, tutte le quote e match_id nel CSV <export>_giornata.csv)"
 )
+
+
+def section_export_stem(export: Path, section: str | None, *, multi: bool) -> Path:
+    """The base path of a section's CSVs: ``export`` itself for one section, ``<stem>_<slug>.csv`` when several sections run.
+
+    ``reports/value_report.csv`` -> ``reports/value_report_d.csv`` for Serie D
+    with ``multi=True``, so :func:`picks_export_path` & co. then yield
+    ``value_report_d_selezioni.csv``, ``value_report_d_giornata.csv``,
+    ``value_report_d_risultati.csv``.
+    """
+    export = Path(export)
+    if section is None or not multi:
+        return export
+    return export.with_name(f"{export.stem}_{section_slug(section)}{export.suffix}")
 
 
 def picks_export_path(export: Path) -> Path:
@@ -358,13 +404,27 @@ def season_summary(matches: pd.DataFrame, registry: TeamRegistry | None = None) 
     return pd.DataFrame(rows, columns=columns)
 
 
-def perimeter_banner(registry: TeamRegistry, current: pd.DataFrame, history: pd.DataFrame) -> str:
+def perimeter_banner(registry: TeamRegistry, current: pd.DataFrame, history: pd.DataFrame, section: str | None = None) -> str:
     """``'Perimetro: Serie C 2026/27 Gironi A/B/C + Serie B (80 squadre) · stagione corrente: 440 partite · storico: 3040 partite 2024/25-2025/26'``.
 
     The competitions come from the registry (:attr:`TeamRegistry.perimeter_label`,
-    built on ``config/competitions.toml``), never from a hard-coded string.
+    built on ``config/competitions.toml``), never from a hard-coded string. With
+    ``section`` only that section's competitions with teams are named
+    (``'Perimetro: Serie D 2026/27 Gironi A-I (162 squadre) · ...'``) and the
+    match counts are restricted to them.
     """
-    text = f"Perimetro: {registry.perimeter_label} · stagione corrente: {len(current)} partite"
+    if section is None:
+        label = registry.perimeter_label
+    else:
+        gironi = [g for g in registry.gironi if in_section(g, section)]
+        n_teams = sum(len(registry.teams_by_girone.get(g, ())) for g in gironi)
+        label = (
+            f"{describe_competitions((g.competition for g in gironi), season=registry.season_label)} ({n_teams} squadre)"
+            if gironi
+            else f"{section} {registry.season_label} (nessuna squadra)"
+        )
+        current, history = section_matches(current, section), section_matches(history, section)
+    text = f"Perimetro: {label} · stagione corrente: {len(current)} partite"
     if len(history):
         text += f" · storico: {len(history)} partite {history_label(history)}"
     else:
@@ -372,7 +432,64 @@ def perimeter_banner(registry: TeamRegistry, current: pd.DataFrame, history: pd.
     return text
 
 
+def registry_serie_d_status(registry: TeamRegistry, current: pd.DataFrame) -> str:
+    """The Serie D status (:func:`src.dashboard.state.serie_d_status_text`) from a registry and the current-season matches."""
+    n_teams = sum(len(registry.teams_by_girone.get(g, ())) for g in serie_d_gironi())
+    return serie_d_status_text(n_teams, len(section_matches(current, SECTION_D)), season_label=registry.season_label)
+
+
+def serie_d_demo_registry(base: TeamRegistry, *, seed: int = 7, n_teams: int = 18) -> TeamRegistry:
+    """``base`` (the real perimeter) plus the synthetic Serie D gironi of :func:`simulate_serie_d_registry` (``--serie-d-demo``).
+
+    The merged registry keeps the base season and every base team under its
+    competition and adds ``n_teams`` synthetic clubs to each configured Serie D
+    girone (``'Squadra DA 01'`` ...), so the simulated league and the console
+    demo can show the Serie D section offline. Aliases are not needed by the
+    simulator and are left out.
+    """
+    extra = simulate_serie_d_registry(seed=seed, n_teams=n_teams, season=base.season)
+    teams_by_code: dict[str, tuple[str, ...]] = {g.value: tuple(base.teams_by_girone[g]) for g in base.gironi}
+    for g in extra.gironi:
+        teams_by_code[g.value] = tuple(extra.teams_by_girone[g])
+    merged = TeamRegistry.from_teams(base.season, teams_by_code)
+    log.info("synthetic Serie D registry merged", extra={"serie_d_gironi": [g.value for g in extra.gironi], "n_teams": merged.n_teams})
+    return merged
+
+
 # ------------------------------------------------------------------------ pipeline
+@dataclass
+class SectionOutput:
+    """What :func:`run_pipeline` computed for one section (``section`` is ``None`` for the whole perimeter).
+
+    ``gironi`` are the configured competitions of the section; ``predictions``,
+    ``opportunities`` and ``traps`` the perimeter-wide ones restricted to them;
+    ``matchdays`` the section's own "giornate" (grouped from its fixtures only),
+    ``matchday_frame`` the table of its next matchday, ``results_frame`` its
+    played matches of the current season, ``draw_picks``/``btts_picks`` the top-N
+    lists ranked within the section, and the ``*_export_path`` the CSVs written
+    with ``--export`` (``None`` otherwise).
+    """
+
+    section: str | None
+    gironi: tuple[Girone, ...]
+    predictions: list[MatchPrediction] = field(default_factory=list)
+    opportunities: list[ValueOpportunity] = field(default_factory=list)
+    traps: list[RegressionTrap] = field(default_factory=list)
+    matchdays: list[Matchday] = field(default_factory=list)
+    matchday_frame: pd.DataFrame = field(default_factory=pd.DataFrame)
+    results_frame: pd.DataFrame = field(default_factory=pd.DataFrame)
+    draw_picks: list[Pick] = field(default_factory=list)
+    btts_picks: list[Pick] = field(default_factory=list)
+    picks_export_path: Path | None = None
+    matchday_export_path: Path | None = None
+    results_export_path: Path | None = None
+
+    @property
+    def next_matchday(self) -> Matchday | None:
+        """The first upcoming matchday of the section, ``None`` without predicted fixtures."""
+        return self.matchdays[0] if self.matchdays else None
+
+
 @dataclass
 class PipelineOutput:
     """Everything :func:`run_pipeline` computed.
@@ -389,6 +506,14 @@ class PipelineOutput:
     and ``results_frame`` the played matches of the current season with the
     model's reading (:func:`src.engine.tables.results_table`); with ``--export``
     they are written to ``matchday_export_path`` / ``results_export_path``.
+
+    ``sections`` holds the per-section results (:class:`SectionOutput`, keyed by
+    section name) when :func:`run_pipeline` ran sections. The top-level
+    ``matchdays`` / frames / picks / export paths mirror the **single** section
+    when exactly one ran (so ``--section d`` yields Serie D's tables) and the
+    **whole perimeter** when several ran (whose CSVs then carry a section
+    suffix each, see :func:`section_export_stem`, and the top-level paths are
+    ``None``); ``export_path`` is always the whole-perimeter value report.
     """
 
     matches: pd.DataFrame
@@ -416,6 +541,7 @@ class PipelineOutput:
     results_frame: pd.DataFrame = field(default_factory=pd.DataFrame)
     matchday_export_path: Path | None = None
     results_export_path: Path | None = None
+    sections: dict[str, SectionOutput] = field(default_factory=dict)
 
     @property
     def next_matchday(self) -> Matchday | None:
@@ -436,6 +562,7 @@ def run_pipeline(
     season: str | None = None,
     n_draws: int = DEFAULT_N_DRAWS,
     n_btts: int = DEFAULT_N_BTTS,
+    sections: Sequence[str] | None = None,
 ) -> PipelineOutput:
     """Fit -> predict -> value, printing each step when ``verbose``.
 
@@ -451,6 +578,16 @@ def run_pipeline(
     line per fixture; with ``export`` the full table and the played results of
     the current season go to :func:`matchday_export_path` /
     :func:`results_export_path`.
+
+    ``sections`` (:data:`~src.dashboard.state.SECTION_BC`,
+    :data:`~src.dashboard.state.SECTION_D`) prints steps 3-8 once per section,
+    each under its own banner and restricted to the section's competitions
+    (picks ranked within the section, matchdays grouped from its fixtures);
+    with several sections the CSVs carry the section slug
+    (:func:`section_export_stem`). ``None`` (the default) is one pass over the
+    whole perimeter, the pre-Serie-D behaviour; an empty sequence prints only
+    steps 1-2 (and writes the value report). The value engine runs once for the
+    whole perimeter whatever the sections.
     """
     matches = validate_matches_df(matches)
     say = print if verbose else (lambda *a, **k: None)
@@ -525,23 +662,13 @@ def run_pipeline(
         log.warning("parameters at optimiser bounds", extra={"parameters": at_bounds, "n_matches": params.n_matches})
         notes.append(warning)
 
-    # 3. ranking ---------------------------------------------------------------
-    if verbose:
-        _banner(f"3) RANKING FORZA PER COMPETIZIONE {label} (alpha = attacco, beta = solidità difensiva, gamma = fattore campo; solo squadre del perimetro)")
-    for g in current_by_girone:
-        rk = engine.ranking(g)
-        say(f"\n--- {g.short} ({len(rk)} squadre) ---")
-        say(rk[["team", "alpha", "beta", "gamma", "attack_index", "defence_index"]].to_string(index=False))
-    if params.historical_teams:
-        say(f"\n{len(params.historical_teams)} squadre storiche escluse dal ranking (stimate solo come avversarie): {', '.join(params.historical_teams)}")
-
-    # 4. predictions -----------------------------------------------------------
-    if verbose:
-        _banner(f"4) PREVISIONI PROSSIMO TURNO (solo partite tra squadre del perimetro {label})")
+    # 3-8 are printed per section (3. ranking, 4. next matchday, 5-6. value + traps, 8. picks, 7. export); the
+    # predictions and the value engine run once for the whole perimeter first, so every section shares one fit.
     predictions: list[MatchPrediction] = []
     skipped: list[str] = []
     skipped_outside: list[str] = []
     skipped_season: list[str] = []
+    skip_lines: list[tuple[Girone, str]] = []
     for fx in fixtures:
         fixture_season = season_of(fx.date)
         if fixture_season != label:
@@ -550,13 +677,13 @@ def run_pipeline(
                 "fixture of another season skipped",
                 extra={"match_id": fx.match_id, "date": fx.date.isoformat(), "fixture_season": fixture_season, "season": label},
             )
-            say(f"[{fx.girone.value}] {fx.date} {fx.label}: partita saltata, {other_season_reason(fixture_season, label)}")
+            skip_lines.append((fx.girone, f"[{fx.girone.value}] {fx.date} {fx.label}: partita saltata, {other_season_reason(fixture_season, label)}"))
             continue
         outside = [t for t in (fx.home_team, fx.away_team) if t in params.alpha and not params.is_current(t)]
         if outside:
             skipped_outside.append(fx.label)
             log.warning("fixture outside the perimeter skipped", extra={"match_id": fx.match_id, "season": label, "historical_teams": outside})
-            say(f"[{fx.girone.value}] {fx.date} {fx.label}: partita saltata, squadra fuori dal perimetro {label} ({', '.join(outside)})")
+            skip_lines.append((fx.girone, f"[{fx.girone.value}] {fx.date} {fx.label}: partita saltata, squadra fuori dal perimetro {label} ({', '.join(outside)})"))
             continue
         try:
             predictions.append(engine.predict(fx))
@@ -569,14 +696,14 @@ def run_pipeline(
                 unknown.append(f"girone {fx.girone.value}")
             reason = ", ".join(unknown) if unknown else str(exc).splitlines()[0][:120]
             log.warning("fixture not predictable", extra={"match_id": fx.match_id, "error": str(exc)})
-            say(f"[{fx.girone.value}] {fx.date} {fx.label}: partita saltata, squadra non presente nello storico ({reason})")
+            skip_lines.append((fx.girone, f"[{fx.girone.value}] {fx.date} {fx.label}: partita saltata, squadra non presente nello storico ({reason})"))
     if skipped_season:
         notes.append(f"{len(skipped_season)} partite in programma saltate (partite di un'altra stagione, non della {label}): {', '.join(skipped_season[:5])}" + (" ..." if len(skipped_season) > 5 else "") + ".")
     if skipped_outside:
         notes.append(f"{len(skipped_outside)} partite in programma saltate (squadre fuori dal perimetro {label}): {', '.join(skipped_outside[:5])}" + (" ..." if len(skipped_outside) > 5 else "") + ".")
     if skipped:
         notes.append(f"{len(skipped)} partite in programma saltate (squadre non presenti nello storico): {', '.join(skipped[:5])}" + (" ..." if len(skipped) > 5 else "") + ".")
-    # the value engine runs here (its Book / EV / Flag columns belong to the matchday table); section 5 prints it
+    # the value engine runs here, once for the whole perimeter (its Book / EV / Flag columns belong to the matchday tables)
     trap_frame = current if len(current) else matches
     traps = [
         t
@@ -589,96 +716,59 @@ def run_pipeline(
         if params.is_current(t.team)
     ]
     opportunities = value_engine.evaluate(predictions, quotes, matches=trap_frame, traps=traps)
-    giornate = matchdays(p.fixture for p in predictions)
-    next_day = giornate[0] if giornate else None
-    matchday_frame = matchday_table(predictions, params=params, matches=trap_frame, opportunities=opportunities, traps=traps, matchday=next_day)
-    if next_day is None:
-        say("nessuna partita in programma nel dataset." if not (skipped or skipped_outside or skipped_season) else "nessuna partita in programma prevedibile.")
-    else:
-        others = len(predictions) - len(matchday_frame)
-        say(
-            f"{next_day.label} · {len(matchday_frame)} partite"
-            + (f" · altre {others} partite nelle {len(giornate) - 1} giornate successive (solo nel CSV delle previsioni)" if others else "")
-        )
-        say(format_matchday_console(matchday_frame))
-        say(MATCHDAY_CONSOLE_LEGEND)
-    results_frame = results_table(matches, engine=engine, season=label)
-    log.info(
-        "matchday table",
-        extra={"matchday": None if next_day is None else next_day.key, "n_rows": len(matchday_frame), "n_results": len(results_frame)},
-    )
-
-    # 5-6. value + traps -------------------------------------------------------
-    if verbose:
-        _banner("5) QUOTE BOOKMAKER DE-VIGGATE, EV E KELLY FRAZIONARIO")
     frame = value_engine.to_frame(opportunities)
-    value = value_engine.value_bets(opportunities)
-    say(f"quote valutate: {len(opportunities)}   soglia EV: {value_engine.min_ev:+.1%}   Kelly frazionario: x{value_engine.kelly.fraction}   bankroll: {value_engine.kelly.bankroll_units:.0f} unità")
-    if value:
-        vf = value_engine.to_frame(value)
-        show = vf[["home_team", "away_team", "market", "selection", "bookmaker", "book_odds", "fair_odds", "p_model", "p_implied_devig", "ev", "stake_units", "flags"]].copy()
-        show["ev"] = (show["ev"] * 100).round(2).astype(str) + "%"
-        show["p_model"] = (show["p_model"] * 100).round(1).astype(str) + "%"
-        show["p_implied_devig"] = (show["p_implied_devig"] * 100).round(1).astype(str) + "%"
-        say(show.to_string(index=False))
-    else:
-        say("nessuna opportunità sopra soglia." if quotes else "nessuna quota bookmaker fornita: salto il calcolo EV.")
-    summary = value_engine.summary(opportunities)
-    say(f"\nriepilogo: {summary}")
+    giornate = matchdays(p.fixture for p in predictions)
+    log.info("predictions and value computed", extra={"n_predictions": len(predictions), "n_opportunities": len(opportunities), "n_traps": len(traps), "n_matchdays": len(giornate)})
 
-    if verbose:
-        _banner(f"6) ALERT REGRESSION_TRAP (clean sheet anomali vs xGA, stagione {label})")
-    if traps:
-        for t in traps:
-            say(" * " + t.description())
-        flagged = [o for o in opportunities if "REGRESSION_TRAP" in o.flags]
-        say(f"selezioni Over/GG segnalate dal filtro: {len(flagged)}")
-    else:
-        say("nessuna squadra in trappola di regressione nella finestra corrente.")
-
-    # 8. picks of the matchday (printed before the export, which writes them too) -----
-    if verbose:
-        _banner("8) SELEZIONI DI GIORNATA (solo probabilità del modello: la quota e l'EV dicono se il prezzo vale)")
-    top_draws = draw_picks(predictions, n=n_draws, matchday=next_day, opportunities=opportunities) if next_day else []
-    top_btts = btts_picks(predictions, n=n_btts, matchday=next_day, opportunities=opportunities) if next_day else []
-    draws_frame, btts_frame = picks_frame(top_draws), picks_frame(top_btts)
-    if next_day is None:
-        say("nessuna partita in programma prevedibile: nessuna giornata da selezionare.")
-    else:
-        say(f"{next_day.label} · {next_day.n_fixtures} partite" + (f" · {len(giornate)} giornate in programma" if len(giornate) > 1 else ""))
-        say(f"\nle {len(top_draws)} partite più probabili da X (tutte le competizioni):")
-        say(draws_frame.to_string(index=False) if not draws_frame.empty else "nessuna partita.")
-        say(f"\nle {len(top_btts)} partite più probabili da GG (tutte le competizioni):")
-        say(btts_frame.to_string(index=False) if not btts_frame.empty else "nessuna partita.")
-    say(f"\n{LEGEND_POINTER}")
-    log.info(
-        "matchday picks",
-        extra={"matchday": None if next_day is None else next_day.key, "n_draws": len(top_draws), "n_btts": len(top_btts), "n_matchdays": len(giornate)},
-    )
-
-    # 7. export ----------------------------------------------------------------
     export_path: Path | None = None
-    picks_path: Path | None = None
-    matchday_path: Path | None = None
-    results_path: Path | None = None
     if export is not None:
-        if verbose:
-            _banner("7) EXPORT")
         export_path = value_engine.export_csv(opportunities, Path(export))
-        say(f"report CSV scritto in: {export_path}")
-        picks_path = picks_export_path(Path(export))
-        picks_path.parent.mkdir(parents=True, exist_ok=True)
-        picks_path.write_bytes(picks_csv_bytes(draws_frame, btts_frame, next_day))
-        log.info("matchday picks exported", extra={"path": str(picks_path), "rows": len(draws_frame) + len(btts_frame)})
-        say(f"selezioni di giornata scritte in: {picks_path}")
-        matchday_path = matchday_export_path(Path(export))
-        matchday_path.write_bytes(export_csv_bytes(matchday_frame))
-        log.info("matchday table exported", extra={"path": str(matchday_path), "rows": len(matchday_frame)})
-        say(f"tabella giornata scritta in: {matchday_path}")
-        results_path = results_export_path(Path(export))
-        results_path.write_bytes(export_csv_bytes(results_frame))
-        log.info("results table exported", extra={"path": str(results_path), "rows": len(results_frame)})
-        say(f"risultati giocati scritti in: {results_path}")
+    passes: list[str | None] = [None] if sections is None else [str(sec) for sec in sections]
+    multi = len(passes) > 1
+    section_outputs: dict[str, SectionOutput] = {}
+    for position, sec in enumerate(passes):
+        result = _run_section(
+            sec,
+            say=say,
+            verbose=verbose,
+            label=label,
+            registry=registry,
+            current=current,
+            history=history,
+            matches=matches,
+            engine=engine,
+            params=params,
+            predictions=predictions,
+            opportunities=opportunities,
+            traps=traps,
+            quotes=quotes,
+            value_engine=value_engine,
+            skip_lines=skip_lines,
+            n_draws=n_draws,
+            n_btts=n_btts,
+            export=None if export is None else section_export_stem(Path(export), sec, multi=multi),
+            value_report=export_path if position == 0 else None,
+            first=position == 0,
+        )
+        if sec is not None:
+            section_outputs[sec] = result
+
+    if len(passes) == 1:
+        head = result
+    else:  # several sections: the top-level fields describe the whole perimeter, nothing unsuffixed is written
+        next_day = giornate[0] if giornate else None
+        head = SectionOutput(
+            section=None,
+            gironi=tuple(Girone),
+            predictions=list(predictions),
+            opportunities=list(opportunities),
+            traps=list(traps),
+            matchdays=giornate,
+            matchday_frame=matchday_table(predictions, params=params, matches=trap_frame, opportunities=opportunities, traps=traps, matchday=next_day),
+            results_frame=results_table(matches, engine=engine, season=label),
+            draw_picks=draw_picks(predictions, n=n_draws, matchday=next_day, opportunities=opportunities) if next_day else [],
+            btts_picks=btts_picks(predictions, n=n_btts, matchday=next_day, opportunities=opportunities) if next_day else [],
+        )
 
     return PipelineOutput(
         matches,
@@ -697,12 +787,191 @@ def run_pipeline(
         current_matches=current,
         history_matches=history,
         skipped_fixtures=skipped_season + skipped_outside + skipped,
+        matchdays=head.matchdays,
+        draw_picks=head.draw_picks,
+        btts_picks=head.btts_picks,
+        picks_export_path=head.picks_export_path,
+        matchday_frame=head.matchday_frame,
+        results_frame=head.results_frame,
+        matchday_export_path=head.matchday_export_path,
+        results_export_path=head.results_export_path,
+        sections=section_outputs,
+    )
+
+
+def _run_section(
+    section: str | None,
+    *,
+    say: "Callable[..., object]",
+    verbose: bool,
+    label: str,
+    registry: TeamRegistry | None,
+    current: pd.DataFrame,
+    history: pd.DataFrame,
+    matches: pd.DataFrame,
+    engine: DixonColesEngine,
+    params: FittedParams,
+    predictions: Sequence[MatchPrediction],
+    opportunities: Sequence[ValueOpportunity],
+    traps: Sequence[RegressionTrap],
+    quotes: Sequence[OddsQuote],
+    value_engine: ValueEngine,
+    skip_lines: Sequence[tuple[Girone, str]],
+    n_draws: int,
+    n_btts: int,
+    export: Path | None,
+    value_report: Path | None,
+    first: bool = True,
+) -> SectionOutput:
+    """Steps 3-8 of :func:`run_pipeline` for one section (``None`` = the whole perimeter); see :class:`SectionOutput`.
+
+    ``export`` is the base path of the section's CSVs (already suffixed by the
+    caller when several sections run); ``value_report`` is the whole-perimeter
+    value report written by the caller, named in the export step of the first
+    section only; ``first`` marks the first pass, the only one that prints the
+    perimeter-wide list of historical teams excluded from the rankings.
+    """
+    gironi = configured_gironi(section)
+    suffix = "" if section is None else f" · {section}"
+    preds = [p for p in predictions if in_section(p.fixture.girone, section)]
+    opps = [o for o in opportunities if in_section(o.girone, section)]
+    section_traps = [t for t in traps if in_section(t.girone, section)]
+    section_quotes = [q for q in quotes if q.match_id in {p.fixture.match_id for p in preds}] if section is not None else list(quotes)
+    if section is not None and verbose:
+        banner_perimeter = perimeter_banner(registry, current, history, section) if registry is not None else f"Sezione {section}"
+        _banner(f"SEZIONE {section.upper()} -- {banner_perimeter}")
+        if section == SECTION_D:
+            say(f"Serie D {registry_serie_d_status(registry, current) if registry is not None else 'senza dizionario'}.")
+
+    # 3. ranking ---------------------------------------------------------------
+    current_by_girone = params.current_teams_by_girone()
+    if verbose:
+        _banner(f"3) RANKING FORZA PER COMPETIZIONE {label}{suffix} (alpha = attacco, beta = solidità difensiva, gamma = fattore campo; solo squadre del perimetro)")
+    for g in current_by_girone:
+        if not in_section(g, section):
+            continue
+        rk = engine.ranking(g)
+        say(f"\n--- {g.short} ({len(rk)} squadre) ---")
+        say(rk[["team", "alpha", "beta", "gamma", "attack_index", "defence_index"]].to_string(index=False))
+    if first and params.historical_teams:
+        say(f"\n{len(params.historical_teams)} squadre storiche escluse dal ranking (stimate solo come avversarie): {', '.join(params.historical_teams)}")
+
+    # 4. predictions -----------------------------------------------------------
+    if verbose:
+        _banner(f"4) PREVISIONI PROSSIMO TURNO{suffix} (solo partite tra squadre del perimetro {label})")
+    for g, line in skip_lines:
+        if in_section(g, section):
+            say(line)
+    giornate = matchdays((p.fixture for p in preds), gironi=gironi if section is not None else None)
+    next_day = giornate[0] if giornate else None
+    trap_frame = current if len(current) else matches
+    matchday_frame = matchday_table(preds, params=params, matches=trap_frame, opportunities=opps, traps=section_traps, matchday=next_day)
+    if next_day is None:
+        say("nessuna partita in programma nel dataset." if not any(in_section(g, section) for g, _ in skip_lines) else "nessuna partita in programma prevedibile.")
+    else:
+        others = len(preds) - len(matchday_frame)
+        say(
+            f"{next_day.label} · {len(matchday_frame)} partite"
+            + (f" · altre {others} partite nelle {len(giornate) - 1} giornate successive (solo nel CSV delle previsioni)" if others else "")
+        )
+        say(format_matchday_console(matchday_frame))
+        say(MATCHDAY_CONSOLE_LEGEND)
+    results_frame = results_table(matches, engine=engine, season=label, gironi=gironi if section is not None else None)
+    log.info(
+        "matchday table",
+        extra={"section": section, "matchday": None if next_day is None else next_day.key, "n_rows": len(matchday_frame), "n_results": len(results_frame)},
+    )
+
+    # 5-6. value + traps -------------------------------------------------------
+    if verbose:
+        _banner(f"5) QUOTE BOOKMAKER DE-VIGGATE, EV E KELLY FRAZIONARIO{suffix}")
+    value = value_engine.value_bets(opps)
+    say(f"quote valutate: {len(opps)}   soglia EV: {value_engine.min_ev:+.1%}   Kelly frazionario: x{value_engine.kelly.fraction}   bankroll: {value_engine.kelly.bankroll_units:.0f} unità")
+    if value:
+        vf = value_engine.to_frame(value)
+        show = vf[["home_team", "away_team", "market", "selection", "bookmaker", "book_odds", "fair_odds", "p_model", "p_implied_devig", "ev", "stake_units", "flags"]].copy()
+        show["ev"] = (show["ev"] * 100).round(2).astype(str) + "%"
+        show["p_model"] = (show["p_model"] * 100).round(1).astype(str) + "%"
+        show["p_implied_devig"] = (show["p_implied_devig"] * 100).round(1).astype(str) + "%"
+        say(show.to_string(index=False))
+    elif section_quotes:
+        say("nessuna opportunità sopra soglia.")
+    elif section == SECTION_D and quotes:
+        say("nessuna quota bookmaker per le partite di Serie D (su FootyStats la copertura delle quote di Serie D è parziale): salto il calcolo EV.")
+    else:
+        say("nessuna quota bookmaker fornita: salto il calcolo EV.")
+    summary = value_engine.summary(opps)
+    say(f"\nriepilogo: {summary}")
+
+    if verbose:
+        _banner(f"6) ALERT REGRESSION_TRAP{suffix} (clean sheet anomali vs xGA, stagione {label})")
+    if section_traps:
+        for t in section_traps:
+            say(" * " + t.description())
+        flagged = [o for o in opps if "REGRESSION_TRAP" in o.flags]
+        say(f"selezioni Over/GG segnalate dal filtro: {len(flagged)}")
+    else:
+        say(
+            "nessuna squadra in trappola di regressione nella finestra corrente."
+            + (" In Serie D gli xG mancano spesso: senza xG il filtro non può scattare." if section == SECTION_D else "")
+        )
+
+    # 8. picks of the matchday (printed before the export, which writes them too) -----
+    if verbose:
+        _banner(f"8) SELEZIONI DI GIORNATA{suffix} (solo probabilità del modello: la quota e l'EV dicono se il prezzo vale)")
+    top_draws = draw_picks(preds, n=n_draws, matchday=next_day, opportunities=opps) if next_day else []
+    top_btts = btts_picks(preds, n=n_btts, matchday=next_day, opportunities=opps) if next_day else []
+    draws_frame, btts_frame = picks_frame(top_draws), picks_frame(top_btts)
+    scope = "tutte le competizioni" if section is None else f"tutte le competizioni di {section}"
+    if next_day is None:
+        say("nessuna partita in programma prevedibile: nessuna giornata da selezionare.")
+    else:
+        say(f"{next_day.label} · {next_day.n_fixtures} partite" + (f" · {len(giornate)} giornate in programma" if len(giornate) > 1 else ""))
+        say(f"\nle {len(top_draws)} partite più probabili da X ({scope}):")
+        say(draws_frame.to_string(index=False) if not draws_frame.empty else "nessuna partita.")
+        say(f"\nle {len(top_btts)} partite più probabili da GG ({scope}):")
+        say(btts_frame.to_string(index=False) if not btts_frame.empty else "nessuna partita.")
+    say(f"\n{LEGEND_POINTER}")
+    log.info(
+        "matchday picks",
+        extra={"section": section, "matchday": None if next_day is None else next_day.key, "n_draws": len(top_draws), "n_btts": len(top_btts), "n_matchdays": len(giornate)},
+    )
+
+    # 7. export ----------------------------------------------------------------
+    picks_path: Path | None = None
+    matchday_path: Path | None = None
+    results_path: Path | None = None
+    if export is not None:
+        if verbose:
+            _banner(f"7) EXPORT{suffix}")
+        if value_report is not None:
+            say(f"report CSV scritto in: {value_report}")
+        picks_path = picks_export_path(Path(export))
+        picks_path.parent.mkdir(parents=True, exist_ok=True)
+        picks_path.write_bytes(picks_csv_bytes(draws_frame, btts_frame, next_day))
+        log.info("matchday picks exported", extra={"section": section, "path": str(picks_path), "rows": len(draws_frame) + len(btts_frame)})
+        say(f"selezioni di giornata scritte in: {picks_path}")
+        matchday_path = matchday_export_path(Path(export))
+        matchday_path.write_bytes(export_csv_bytes(matchday_frame))
+        log.info("matchday table exported", extra={"section": section, "path": str(matchday_path), "rows": len(matchday_frame)})
+        say(f"tabella giornata scritta in: {matchday_path}")
+        results_path = results_export_path(Path(export))
+        results_path.write_bytes(export_csv_bytes(results_frame))
+        log.info("results table exported", extra={"section": section, "path": str(results_path), "rows": len(results_frame)})
+        say(f"risultati giocati scritti in: {results_path}")
+
+    return SectionOutput(
+        section=section,
+        gironi=gironi,
+        predictions=preds,
+        opportunities=opps,
+        traps=section_traps,
         matchdays=giornate,
+        matchday_frame=matchday_frame,
+        results_frame=results_frame,
         draw_picks=top_draws,
         btts_picks=top_btts,
         picks_export_path=picks_path,
-        matchday_frame=matchday_frame,
-        results_frame=results_frame,
         matchday_export_path=matchday_path,
         results_export_path=results_path,
     )
@@ -804,6 +1073,21 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--n-draws", type=int, default=DEFAULT_N_DRAWS, metavar="N", help=f"section 8: most probable draws (X) of the next matchday to list (default {DEFAULT_N_DRAWS})")
     p.add_argument("--n-btts", type=int, default=DEFAULT_N_BTTS, metavar="N", help=f"section 8: most probable both-teams-to-score (GG) matches to list (default {DEFAULT_N_BTTS})")
     p.add_argument("--trap-team", default=None, help="team whose last 3 matches are rewritten to showcase REGRESSION_TRAP (simulated modes only; default: automatic)")
+    p.add_argument(
+        "--section",
+        choices=sorted(SECTION_CHOICES),
+        default="all",
+        help=(
+            "which section(s) to print and export after the joint fit: bc = Serie B e Serie C, d = Serie D, all (default) = every "
+            "section that has teams, one after the other with its own banner, ranking, matchday table, value, picks and CSVs "
+            "(suffixed _bc / _d when both run)"
+        ),
+    )
+    p.add_argument(
+        "--serie-d-demo",
+        action="store_true",
+        help="simulated full mode: add a synthetic Serie D registry (nine gironi of 18 clubs) to the perimeter so the Serie D section can be shown offline",
+    )
     p.add_argument("--log-level", default="WARNING")
     p.add_argument("--log-json", action="store_true")
     return p
@@ -832,6 +1116,10 @@ def main(argv: Sequence[str] | None = None) -> PipelineOutput:
     for option, value in (("--n-draws", args.n_draws), ("--n-btts", args.n_btts)):
         if value < 1:
             build_parser().error(f"{option} {value}: serve almeno 1 partita")
+    if args.serie_d_demo and (args.processed or args.mode != "full"):
+        build_parser().error("--serie-d-demo vale solo per la lega simulata di --mode full (senza --processed)")
+    if args.serie_d_demo and not serie_d_gironi():
+        build_parser().error("--serie-d-demo: nessuna competizione con family 'Serie D' in config/competitions.toml")
     as_of: date = args.as_of if args.as_of is not None else date.today()
 
     league: SimulatedLeague | None = None
@@ -858,6 +1146,12 @@ def main(argv: Sequence[str] | None = None) -> PipelineOutput:
             )
             calendar = "istantanea fissa di inizio stagione"
         else:
+            if args.serie_d_demo:
+                registry = serie_d_demo_registry(registry, seed=args.seed)
+                sim_notes.append(
+                    f"Demo Serie D: dizionario sintetico di {len(serie_d_gironi())} gironi x 18 squadre aggiunto al perimetro "
+                    f"({registry.n_teams} squadre in tutto); le composizioni reali arrivano dalla raccolta FootyStats."
+                )
             league, played = simulate_current_season(args.seed, registry, n_rounds=args.rounds, as_of=as_of, notes=sim_notes)
             swap = 3
             calendar = f"{played} giornate giocate" + (f" al {as_of.isoformat()}" if args.rounds is None else " (--rounds)")
@@ -902,8 +1196,14 @@ def main(argv: Sequence[str] | None = None) -> PipelineOutput:
     if args.l2 is not None:
         config = replace(config, l2_penalty=args.l2)
 
+    available = sections_for(registry.gironi)  # the sections with teams, display order
+    wanted = SECTION_CHOICES[args.section]
+    runnable = [sec for sec in available if sec in wanted]
+    unavailable = [sec for sec in wanted if sec not in available and (args.section != "all" or sec == SECTION_D)]
+
     _banner(f"SERIE C QUANT LAB -- {source}")
     print(perimeter_banner(registry, current, history))
+    print(f"Sezioni: {', '.join(runnable) if runnable else 'nessuna'} (--section {args.section})")
     for note in sim_notes:
         print(note)
     for note in input_notes:
@@ -920,8 +1220,24 @@ def main(argv: Sequence[str] | None = None) -> PipelineOutput:
         season=season_label,
         n_draws=args.n_draws,
         n_btts=args.n_btts,
+        sections=runnable,
     )
     out.notes = input_notes + sim_notes + out.notes
+    for sec in unavailable:
+        _banner(f"SEZIONE {sec.upper()} -- non disponibile")
+        if sec == SECTION_D and serie_d_gironi():
+            status = registry_serie_d_status(registry, current)
+            print(f"Serie D {status}.")
+            print(
+                f"Comando: {serie_d_harvest_command()} (oppure avvia.bat / avvia.command con la chiave FootyStats in .env): "
+                f"la prima raccolta inizializza i {len(serie_d_gironi())} gironi in config/teams_{season_label.replace('/', '_')}.json dalle liste squadre dell'API."
+            )
+        elif sec == SECTION_D:
+            print("Serie D non configurata: nessuna competizione con family 'Serie D' in config/competitions.toml.")
+        else:
+            print(f"Nessuna squadra del dizionario {season_label} nelle competizioni di {sec}.")
+        # expected with the shipped dictionaries (Serie D is initialised by the harvester): not a warning, not a note
+        log.info("section not available", extra={"section": sec, "season": season_label})
 
     if league is not None and args.mode == "full":
         _banner(f"VERIFICA: RECUPERO DEI PARAMETRI VERI DEL SIMULATORE (squadre {season_label})")

@@ -2,11 +2,20 @@
 
 The dictionary lives in ``config/teams_<season>.json``: under ``"gironi"`` one
 object per competition code of ``config/competitions.toml`` (``A``, ``B``, ``C``
-for the Serie C gironi, ``SB`` for Serie B, more as leagues are added), each
-mapping a canonical team name to its aliases. Code never hard-codes a team
-name: it asks :class:`TeamRegistry` for the canonical spelling. The registry
-works with any number of competitions: it iterates the dynamic
-:class:`src.common.schemas.Girone` enum and never assumes A/B/C.
+for the Serie C gironi, ``SB`` for Serie B, ``DA`` .. ``DI`` for the Serie D
+gironi, more as leagues are added), each mapping a canonical team name to its
+aliases. Code never hard-codes a team name: it asks :class:`TeamRegistry` for
+the canonical spelling. The registry works with any number of competitions: it
+iterates the dynamic :class:`src.common.schemas.Girone` enum and never assumes
+A/B/C.
+
+A configured competition may be **absent** from the file or hold an **empty**
+object (the Serie D gironi ship empty: the FootyStats harvester fills them from
+``/league-teams`` on its first run). Both cases are the same registry state:
+:meth:`TeamRegistry.teams` answers ``()``, :attr:`TeamRegistry.gironi` lists only
+the competitions that have teams, :meth:`TeamRegistry.missing_competitions`
+names the empty ones and :attr:`TeamRegistry.perimeter_label` counts only the
+teams present.
 
 Seasons and perimeter
 ---------------------
@@ -34,12 +43,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, Mapping
 
-from .competitions import describe_competitions
+from .competitions import describe_competitions, family_label
 from .paths import CONFIG_DIR
 from .schemas import Girone
 
 __all__ = [
     "DEFAULT_SEASON",
+    "PerimeterLabel",
     "TeamRegistry",
     "list_seasons",
     "load_registry",
@@ -74,20 +84,49 @@ def season_file_stem(season: str) -> str:
     return str(season).strip().replace("/", "_").replace("-", "_")
 
 
+class PerimeterLabel(str):
+    """The perimeter description of a registry: a plain ``str`` that can also be *called* with a family.
+
+    :attr:`TeamRegistry.perimeter_label` has always been a string property
+    (``'Serie C 2026/27 Gironi A/B/C + Serie B (80 squadre)'``) and every banner
+    uses it as such. The user-facing surfaces are split by family, so the same
+    attribute can now be narrowed: ``registry.perimeter_label('Serie D')`` (or
+    ``registry.perimeter_label(family='Serie D')``) returns the description of
+    that family alone, exactly like :meth:`TeamRegistry.perimeter_label_for`.
+    Equality, hashing, formatting and every other ``str`` behaviour are unchanged.
+    """
+
+    __slots__ = ("_registry",)
+
+    def __new__(cls, text: str, registry: "TeamRegistry") -> "PerimeterLabel":
+        label = super().__new__(cls, text)
+        label._registry = registry
+        return label
+
+    def __call__(self, family: str | None = None) -> str:
+        """Perimeter description restricted to ``family`` (``None``: the whole registry, i.e. this very text)."""
+        return self._registry.perimeter_label_for(family)
+
+    def __reduce__(self) -> tuple[type[str], tuple[str]]:
+        """Pickle as a plain string (the registry reference is a convenience, not state)."""
+        return (str, (str(self),))
+
+
 @dataclass(frozen=True)
 class TeamRegistry:
     """Canonical teams of one season, grouped by competition, plus an alias table.
 
     ``teams_by_girone`` maps a :class:`Girone` (competition) to its canonical
     names; a registry may hold any subset of the configured competitions (the
-    mini demo has three, the default perimeter four). ``aliases`` maps a
-    *normalised* spelling to a canonical name. The canonical names of
-    ``teams_by_girone`` are the **current** teams; ``historical_names`` lists
-    further canonical names reachable through the alias table that are *not*
-    current (teams of previous seasons merged in with
-    :meth:`with_historical_aliases`). An alias of a historical team resolves to
-    the historical canonical spelling, never to a current team, so history keeps
-    consistent names and :meth:`is_current_team` stays unambiguous.
+    mini demo has three, the default perimeter four with teams plus the nine
+    Serie D gironi awaiting their auto-init). ``aliases`` maps a *normalised*
+    spelling to a canonical name. The canonical names of ``teams_by_girone`` are
+    the **current** teams; ``historical_names`` lists further canonical names
+    reachable through the alias table that are *not* current (teams of previous
+    seasons merged in with :meth:`with_historical_aliases`). An alias of a
+    historical team resolves to the historical canonical spelling, never to a
+    current team, so history keeps consistent names and :meth:`is_current_team`
+    stays unambiguous.
     """
 
     season: str
@@ -98,8 +137,22 @@ class TeamRegistry:
     # ----------------------------------------------------------------- views
     @property
     def gironi(self) -> tuple[Girone, ...]:
-        """Competitions that have at least one team, in configuration order."""
+        """Competitions that have at least one team, in configuration order (empty or absent ones are left out)."""
         return tuple(g for g in Girone if self.teams_by_girone.get(g))
+
+    def missing_competitions(self) -> tuple[Girone, ...]:
+        """Configured competitions with no team in this registry, in configuration order.
+
+        ``(Girone.DA, ..., Girone.DI)`` for the shipped 2026/27 dictionary until the
+        FootyStats harvester initialises the Serie D gironi; ``()`` when every
+        competition of ``config/competitions.toml`` has teams.
+        """
+        present = set(self.gironi)
+        return tuple(g for g in Girone if g not in present)
+
+    def families(self) -> tuple[str, ...]:
+        """Families that have at least one team, in configuration order (``('Serie C', 'Serie B')`` before the Serie D auto-init)."""
+        return tuple(dict.fromkeys(g.family for g in self.gironi))
 
     @property
     def canonical_names(self) -> tuple[str, ...]:
@@ -117,16 +170,39 @@ class TeamRegistry:
         return str(self.season).strip().replace("_", "/").replace("-", "/")
 
     @property
-    def perimeter_label(self) -> str:
+    def perimeter_label(self) -> PerimeterLabel:
         """Italian description of the perimeter derived from the configuration, never hard-coded.
 
         ``'Serie C 2026/27 Gironi A/B/C + Serie B (80 squadre)'`` for the default
-        registry, ``'Serie C 2026/27 Gironi A/B/C (14 squadre)'`` for the mini
-        demo; only the competitions that have teams are named (see
-        :func:`src.common.competitions.describe_competitions`).
+        registry (the empty Serie D gironi are not named and not counted),
+        ``'Serie C 2026/27 Gironi A/B/C (14 squadre)'`` for the mini demo; only
+        the competitions that have teams are named (see
+        :func:`src.common.competitions.describe_competitions`). The value is a
+        :class:`PerimeterLabel`: a ``str`` that, called with a family
+        (``registry.perimeter_label('Serie D')``), gives the description of that
+        family alone (see :meth:`perimeter_label_for`).
         """
-        text = describe_competitions((g.competition for g in self.gironi), season=self.season_label)
-        return f"{text} ({self.n_teams} squadre)"
+        return PerimeterLabel(self.perimeter_label_for(None), self)
+
+    def perimeter_label_for(self, family: str | None = None) -> str:
+        """Perimeter description of one family, or of the whole registry with ``family=None``.
+
+        Only the competitions of ``family`` that have teams are named and only
+        their teams are counted: ``'Serie D 2026/27 Gironi A-I (162 squadre)'``
+        once the Serie D gironi are initialised, ``'Serie D 2026/27 (0 squadre)'``
+        before (so a banner can still say which family is empty). Any spelling of
+        the family that :func:`src.common.competitions.family_label` accepts works;
+        ``ValueError`` for an unknown family.
+        """
+        if family is None:
+            gironi = self.gironi
+            text = describe_competitions((g.competition for g in gironi), season=self.season_label)
+        else:
+            name = family_label(family)
+            gironi = tuple(g for g in self.gironi if g.family == name)
+            text = describe_competitions((g.competition for g in gironi), season=self.season_label) if gironi else f"{name} {self.season_label}"
+        n_teams = sum(len(self.teams_by_girone.get(g, ())) for g in gironi)
+        return f"{text} ({n_teams} squadre)"
 
     def girone_of(self, canonical: str) -> Girone:
         for g, teams in self.teams_by_girone.items():
@@ -135,8 +211,11 @@ class TeamRegistry:
         raise KeyError(canonical)
 
     def teams(self, girone: "Girone | str") -> tuple[str, ...]:
-        """Canonical teams of one competition (``KeyError`` when the registry has none for it)."""
-        return self.teams_by_girone[Girone.parse(girone)]
+        """Canonical teams of one competition; ``()`` when the registry has none for it (absent or empty).
+
+        ``ValueError`` only for a spelling that is not a configured competition.
+        """
+        return tuple(self.teams_by_girone.get(Girone.parse(girone), ()))
 
     def alias_table(self) -> dict[str, str]:
         """normalized spelling -> canonical name (canonicals included)."""
@@ -163,17 +242,21 @@ class TeamRegistry:
         """Build from ``{competition code: {canonical: [aliases]}}`` (the JSON layout).
 
         Keys are parsed with :meth:`Girone.parse`, so ``'SB'`` and ``'Serie B'``
-        both work. ``ValueError`` when a canonical name is listed under two
-        competitions (a club has one canonical name and plays one league per
-        season) or when a *normalised* spelling would resolve to two different
-        clubs, whatever competitions they play in: with 80 teams in four
-        competitions ``'Verona'`` as an alias of both ``'Virtus Verona'`` (girone
-        A) and ``'Hellas Verona'`` (Serie B) would otherwise silently keep only
-        the club listed last. Repeating a spelling for the *same* club is fine.
+        both work. A competition mapped to an **empty** object (the Serie D
+        gironi before their auto-init) is accepted and simply has no teams: it is
+        left out of ``teams_by_girone`` and reported by
+        :meth:`missing_competitions`. ``ValueError`` when a canonical name is
+        listed under two competitions (a club has one canonical name and plays
+        one league per season) or when a *normalised* spelling would resolve to
+        two different clubs, whatever competitions they play in: with 80 teams in
+        four competitions ``'Verona'`` as an alias of both ``'Virtus Verona'``
+        (girone A) and ``'Hellas Verona'`` (Serie B) would otherwise silently keep
+        only the club listed last. Repeating a spelling for the *same* club is fine.
         """
         teams_by_girone: dict[Girone, tuple[str, ...]] = {}
         aliases: dict[str, str] = {}
         owner: dict[str, Girone] = {}
+        seen: set[Girone] = set()
 
         def register(spelling: str, canonical: str, g: Girone) -> None:
             norm = normalize_name(spelling)
@@ -187,8 +270,11 @@ class TeamRegistry:
 
         for g_key, teams in gironi.items():
             g = Girone.parse(g_key)
-            if g in teams_by_girone:
+            if g in seen:
                 raise ValueError(f"season {season}: competition {g.value} listed twice")
+            seen.add(g)
+            if not teams:
+                continue  # configured but not yet populated (see missing_competitions)
             teams_by_girone[g] = tuple(teams.keys())
             for canonical, alias_list in teams.items():
                 if canonical in owner:

@@ -35,10 +35,28 @@ a league is simulated on the registry season's real calendar (2026/27 by
 default; played rounds derived from ``as_of``, today by default, see
 :func:`simulate_current_season`) together with ``history_seasons`` synthetic
 seasons *preceding* it (:func:`src.simulation.generator.history_seasons_for`).
+
+Sections (Serie B e Serie C / Serie D)
+--------------------------------------
+The fit is **one** for the whole perimeter (Serie B, Serie C and Serie D share
+the Dixon-Coles estimate: promoted and relegated clubs connect the divisions,
+the per-competition home advantage and the ``sum(alpha) = 0`` constraint per
+competition keep the groups comparable), but the user-facing views are split by
+*section*: :data:`SECTION_BC` groups the families ``'Serie C'`` and ``'Serie B'``,
+:data:`SECTION_D` is the family ``'Serie D'`` alone. Every table helper takes
+``section`` (``None`` = the whole perimeter, the pre-Serie-D behaviour) and
+restricts itself to the competitions of that section; picks are ranked within
+the section and the matchdays are grouped per section (:func:`matchdays`), so
+the Serie D calendar never disturbs the Serie B / Serie C "giornate".
+:func:`sections` lists the sections that have teams, :func:`section_options`
+the ones the sidebar offers (Serie D also when configured but not yet
+initialised, so the page can say how to initialise it, see
+:attr:`PipelineState.serie_d_status` and :func:`serie_d_harvest_command`).
 """
 from __future__ import annotations
 
 import math
+import re
 import time
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -50,6 +68,7 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 
+from src.common.competitions import describe_competitions
 from src.common.logging_config import get_logger
 from src.common.paths import ODDS_DIR, PROCESSED_DIR, ROOT
 from src.common.schemas import (
@@ -73,9 +92,9 @@ from src.engine.picks import (
     Pick,
     btts_picks,
     draw_picks,
-    matchdays,
     picks_frame,
 )
+from src.engine.picks import matchdays as group_matchdays
 from src.engine.tables import (
     MATCHDAY_COLUMNS,
     RESULTS_COLUMNS,
@@ -105,6 +124,7 @@ from src.simulation.generator import (
 __all__ = [
     "ALL_MATCHDAYS",
     "DEFAULT_HISTORY_SEASONS",
+    "DEFAULT_SECTION",
     "MARKETS_COLUMNS",
     "MARKET_LABELS",
     "MATCHDAY_COLUMNS",
@@ -118,36 +138,54 @@ __all__ = [
     "RANKING_COLUMNS",
     "RESULTS_COLUMNS",
     "RESULTS_MODEL_COLUMNS",
+    "SECTION_BC",
+    "SECTION_D",
+    "SECTION_FAMILIES",
+    "SECTION_SLUGS",
+    "SERIE_D_FAMILY",
+    "SERIE_D_HARVEST_SEASONS",
+    "SERIE_D_STATUS_NOT_CONFIGURED",
+    "SERIE_D_STATUS_NOT_INITIALISED",
     "TRAPS_COLUMNS",
     "VALUE_COLUMNS",
     "CoverageReport",
     "MatchdaySelector",
     "PipelineState",
     "Source",
+    "all_sections",
     "btts_picks_table",
     "build_state",
     "competition_label",
+    "competition_options",
+    "configured_gironi",
     "coverage_report",
+    "coverage_text",
     "current_teams",
     "draw_picks_table",
     "export_csv_bytes",
+    "family_gironi",
+    "family_label",
+    "family_predictions",
     "find_matchday",
     "fixture_label",
     "fixtures_for",
     "heatmap_figure",
     "history_label",
+    "in_section",
     "load_odds_quotes",
     "markets_table",
     "matchday_csv_bytes",
     "matchday_predictions",
     "matchday_table_for",
     "matchday_table_key",
+    "matchdays",
     "matches_per_team",
     "max_sim_rounds",
     "no_odds_message",
     "opportunities_table",
     "other_season_reason",
     "perimeter_matches",
+    "perimeter_text",
     "picks_csv_bytes",
     "picks_export_frame",
     "predictions_table",
@@ -159,7 +197,25 @@ __all__ = [
     "results_table_for",
     "results_team_options",
     "seasons_available",
+    "section_families",
+    "section_gironi",
+    "section_key",
+    "section_matches",
+    "section_of_family",
+    "section_opportunities",
+    "section_options",
+    "section_perimeter_label",
+    "section_predictions",
+    "section_ready",
+    "section_slug",
+    "section_team_count",
+    "section_traps",
+    "sections",
+    "sections_for",
     "selected_row_match_id",
+    "serie_d_gironi",
+    "serie_d_harvest_command",
+    "serie_d_status_text",
     "simulate_current_season",
     "split_by_season",
     "strength_figure",
@@ -179,6 +235,29 @@ MatchdaySelector = Matchday | Literal["all"] | None
 
 #: Columns of :func:`picks_export_frame`: ``Lista`` (``'X'`` / ``'GG'``) and ``Giornata`` in front of :data:`PICKS_COLUMNS`.
 PICKS_EXPORT_COLUMNS: Final[tuple[str, ...]] = ("Lista", "Giornata", *PICKS_COLUMNS)
+
+#: The two user-facing *sections* of the dashboard and the console. The fit is joint, the views are split:
+#: :data:`SECTION_BC` groups the families ``'Serie C'`` and ``'Serie B'`` (a UI grouping, not a league),
+#: :data:`SECTION_D` is the family ``'Serie D'`` on its own.
+SECTION_BC: Final[str] = "Serie B e Serie C"
+SECTION_D: Final[str] = "Serie D"
+#: Section shown by default (the first option of the sidebar radio and the one whose widget keys carry no suffix).
+DEFAULT_SECTION: Final[str] = SECTION_BC
+#: Competition families covered by each section (``config/competitions.toml`` ``family`` values). A family
+#: listed in no section (a league added later) is a section of its own, named after the family.
+SECTION_FAMILIES: Final[dict[str, tuple[str, ...]]] = {SECTION_BC: ("Serie C", "Serie B"), SECTION_D: ("Serie D",)}
+#: Short file-name / widget-key suffixes of the sections (``main.py`` exports ``<stem>_d_giornata.csv``, the
+#: dashboard keys ``matchday_d`` ...); another section gets a slug derived from its name (:func:`section_slug`).
+SECTION_SLUGS: Final[dict[str, str]] = {SECTION_BC: "bc", SECTION_D: "d"}
+#: ``family`` of the Serie D competitions in ``config/competitions.toml``.
+SERIE_D_FAMILY: Final[str] = "Serie D"
+#: Seasons the FootyStats harvester collects for Serie D (:func:`serie_d_harvest_command`).
+SERIE_D_HARVEST_SEASONS: Final[int] = 3
+#: :attr:`PipelineState.serie_d_status` when the configuration has no Serie D competition at all.
+SERIE_D_STATUS_NOT_CONFIGURED: Final[str] = "non configurata: nessuna competizione con family 'Serie D' in config/competitions.toml"
+#: :attr:`PipelineState.serie_d_status` when Serie D is configured but its gironi have no teams yet (the
+#: FootyStats harvester initialises them from ``/league-teams`` the first time it runs with the user's key).
+SERIE_D_STATUS_NOT_INITIALISED: Final[str] = "non inizializzata: esegui la raccolta FootyStats con la chiave"
 
 #: ``use_prior=None`` switches the Gaussian (MAP) prior on while the least-covered
 #: girone has fewer than this many played matches per team (same rule as ``main.py``).
@@ -289,7 +368,13 @@ class PipelineState:
     fixtures into "giornate" (:func:`src.engine.picks.matchdays`): with a real
     provider the fixture list is the whole remaining season, so the match
     selector, the value panel and the picks default to ``matchdays[0]``, the
-    next one (:attr:`next_matchday`).
+    next one (:attr:`next_matchday`). The per-section matchdays of the
+    dashboard are :func:`matchdays` ``(state, section)``, cached on the state.
+
+    The perimeter may span several *families* (:attr:`families`: ``'Serie C'``,
+    ``'Serie B'``, ``'Serie D'``); :attr:`serie_d_status` says whether the Serie D
+    section is usable (its gironi are initialised from the FootyStats API, not
+    shipped with the code).
     """
 
     matches: pd.DataFrame
@@ -312,6 +397,8 @@ class PipelineState:
     matchdays: list[Matchday] = field(default_factory=list)
     #: Lazily built per-team long frame of the current-season matches (see :meth:`team_matches_frame`).
     _team_matches: pd.DataFrame | None = field(default=None, init=False, repr=False, compare=False)
+    #: Lazily grouped matchdays per section (see :func:`matchdays`); a ``dataclasses.replace`` starts afresh.
+    _section_matchdays: dict[str, list[Matchday]] = field(default_factory=dict, init=False, repr=False, compare=False)
 
     def team_matches_frame(self) -> pd.DataFrame:
         """Per-team long frame of the **current-season** matches (:func:`src.engine.tables.team_matches`), built once.
@@ -395,6 +482,54 @@ class PipelineState:
         return tuple(g for g in Girone if g in self.params.teams_by_girone)
 
     @property
+    def perimeter_gironi(self) -> tuple[Girone, ...]:
+        """Competitions of the perimeter that have **current teams**, in configuration order.
+
+        From the registry when the state has one (a competition listed in the
+        dictionary with teams, played or not; a Serie D girone not yet
+        initialised has none and is left out), otherwise the competitions with
+        fitted current teams.
+        """
+        if self.registry is not None:
+            return self.registry.gironi
+        fitted = self.params.current_teams_by_girone()
+        return tuple(g for g in Girone if g in fitted)
+
+    @property
+    def families(self) -> tuple[str, ...]:
+        """Competition families present in the perimeter (``('Serie C', 'Serie B')``, plus ``'Serie D'`` once initialised), configuration order."""
+        return tuple(dict.fromkeys(g.family for g in self.perimeter_gironi))
+
+    def family_of(self, girone: Girone | str) -> str:
+        """Family of a competition (``'A'`` -> ``'Serie C'``, ``'SB'`` -> ``'Serie B'``, ``'DA'`` -> ``'Serie D'``)."""
+        return Girone.parse(girone).family
+
+    @property
+    def serie_d_initialised(self) -> bool:
+        """Whether at least one Serie D girone of the perimeter has teams (dictionary filled by the FootyStats harvester)."""
+        return section_team_count(self, SECTION_D) > 0
+
+    @property
+    def serie_d_status(self) -> str:
+        """Italian status of the Serie D section, for the sidebar notice and the console banner.
+
+        :data:`SERIE_D_STATUS_NOT_CONFIGURED` when ``config/competitions.toml``
+        has no ``'Serie D'`` family; :data:`SERIE_D_STATUS_NOT_INITIALISED` when
+        its gironi have no teams yet (``'non inizializzata: esegui la raccolta
+        FootyStats con la chiave'``, the command is :func:`serie_d_harvest_command`);
+        otherwise ``'inizializzata: 162 squadre, 648 partite della stagione
+        2026/27, 81 partite in programma previste'``, or, with teams but no
+        played match in the data, ``'inizializzata: 162 squadre, 0 partite nei
+        dati: esegui la raccolta FootyStats con la chiave'``.
+        """
+        return serie_d_status_text(
+            section_team_count(self, SECTION_D),
+            len(section_matches(self.current_matches, SECTION_D)),
+            len(section_predictions(self, SECTION_D)),
+            season_label=self.season_label,
+        )
+
+    @property
     def prior_enabled(self) -> bool:
         """Whether the fit used the Gaussian (MAP) prior."""
         cfg = self.engine.config
@@ -460,6 +595,144 @@ def other_season_reason(fixture_season: str, season_label: str) -> str:
     """
     kind = "precedente" if str(fixture_season) < str(season_label) else "successiva"
     return f"partita di una stagione {kind} ({fixture_season}), fuori dal perimetro {season_label}"
+
+
+# =============================================================================
+# Sections and families (pure: configuration only)
+# =============================================================================
+def section_of_family(family: str) -> str:
+    """Section a competition family belongs to (:data:`SECTION_FAMILIES`).
+
+    ``'Serie C'`` and ``'Serie B'`` -> :data:`SECTION_BC`, ``'Serie D'`` ->
+    :data:`SECTION_D`; a family listed in no section (a league added later) is a
+    section of its own, named after the family.
+    """
+    for section, members in SECTION_FAMILIES.items():
+        if family in members:
+            return section
+    return str(family)
+
+
+def family_label(family: str) -> str:
+    """User-facing label of the section a family is shown under: ``family_label('Serie C') == 'Serie B e Serie C'``.
+
+    The two families Serie B and Serie C are one *section* of the UI (a
+    grouping, not a league); ``family_label('Serie D') == 'Serie D'``. Not to be
+    confused with :func:`src.common.competitions.family_label`, which returns
+    the canonical spelling of a family name.
+    """
+    return section_of_family(family)
+
+
+def section_families(section: str) -> tuple[str, ...]:
+    """Families covered by a section (``('Serie C', 'Serie B')`` for :data:`SECTION_BC`; an unknown section is its own family)."""
+    return SECTION_FAMILIES.get(section, (str(section),))
+
+
+def section_slug(section: str) -> str:
+    """Short identifier of a section for file names and widget keys: ``'bc'``, ``'d'`` (:data:`SECTION_SLUGS`), else a slug of the name."""
+    slug = SECTION_SLUGS.get(section)
+    if slug is None:
+        slug = re.sub(r"[^a-z0-9]+", "_", str(section).lower()).strip("_") or "sezione"
+    return slug
+
+
+def section_key(base: str, section: str | None = None) -> str:
+    """``st.session_state`` key (or file stem) of ``base`` scoped to a section.
+
+    The default section (:data:`DEFAULT_SECTION`, or ``None``) keeps the bare
+    key, so the pre-Serie-D keys (``'matchday'``, ``'fixture'``, ...) are
+    unchanged; another section appends its slug (``'matchday_d'``). Each section
+    therefore owns its selected matchday, fixture and filters, and switching
+    section starts from that section's defaults.
+    """
+    if section is None or section == DEFAULT_SECTION:
+        return base
+    return f"{base}_{section_slug(section)}"
+
+
+def all_sections(gironi: Iterable[Girone] = Girone) -> tuple[str, ...]:
+    """Sections of the given competitions in display order: :data:`SECTION_BC`, :data:`SECTION_D`, then any other family's section."""
+    present = list(dict.fromkeys(section_of_family(g.family) for g in gironi))
+    ordered = [sec for sec in (SECTION_BC, SECTION_D) if sec in present]
+    ordered += [sec for sec in present if sec not in ordered]
+    return tuple(ordered)
+
+
+def sections_for(gironi: Iterable[Girone]) -> tuple[str, ...]:
+    """The sections that have at least one of ``gironi`` (e.g. a registry's competitions with teams), display order."""
+    return all_sections(gironi)
+
+
+def configured_gironi(section: str | None = None) -> tuple[Girone, ...]:
+    """Every configured competition of a section (``config/competitions.toml``), teams or not; all of them for ``None``."""
+    if section is None:
+        return tuple(Girone)
+    wanted = section_families(section)
+    return tuple(g for g in Girone if g.family in wanted)
+
+
+def in_section(girone: Girone | str, section: str | None) -> bool:
+    """Whether a competition belongs to ``section`` (``None`` = every section)."""
+    return section is None or Girone.parse(girone).family in section_families(section)
+
+
+def serie_d_gironi() -> tuple[Girone, ...]:
+    """The configured Serie D competitions (family :data:`SERIE_D_FAMILY`), ``()`` when the configuration has none."""
+    return tuple(g for g in Girone if g.family == SERIE_D_FAMILY)
+
+
+def serie_d_harvest_command(gironi: Iterable[Girone] | None = None) -> str:
+    """The exact console command that initialises and harvests Serie D with the user's FootyStats key.
+
+    ``'python -m src.ingestion.footystats --competitions DA DB DC DD DE DF DG DH DI --seasons 3'``
+    with the shipped configuration (the launchers ``avvia.bat`` / ``avvia.command``
+    run the harvester for every configured competition as well).
+    """
+    codes = [g.value for g in (serie_d_gironi() if gironi is None else gironi)]
+    return f"python -m src.ingestion.footystats --competitions {' '.join(codes)} --seasons {SERIE_D_HARVEST_SEASONS}"
+
+
+def serie_d_status_text(n_teams: int, n_matches: int, n_fixtures: int | None = None, *, season_label: str = "") -> str:
+    """The Italian Serie D status from its counts (shared by :attr:`PipelineState.serie_d_status` and the console).
+
+    :data:`SERIE_D_STATUS_NOT_CONFIGURED` when no Serie D competition is
+    configured, :data:`SERIE_D_STATUS_NOT_INITIALISED` for ``n_teams == 0``,
+    ``'inizializzata: 162 squadre, 0 partite nei dati: esegui la raccolta
+    FootyStats con la chiave'`` for teams without played matches, otherwise
+    ``'inizializzata: 162 squadre, 648 partite della stagione 2026/27, 81 partite
+    in programma previste'`` (the fixtures part only when ``n_fixtures`` is given).
+    """
+    if not serie_d_gironi():
+        return SERIE_D_STATUS_NOT_CONFIGURED
+    if n_teams <= 0:
+        return SERIE_D_STATUS_NOT_INITIALISED
+    if n_matches <= 0:
+        return f"inizializzata: {n_teams} squadre, 0 partite nei dati: esegui la raccolta FootyStats con la chiave"
+    season = f" della stagione {season_label}" if season_label else ""
+    text = f"inizializzata: {n_teams} squadre, {n_matches} partite{season}"
+    if n_fixtures is not None:
+        text += f", {n_fixtures} partite in programma previste"
+    return text
+
+
+def competition_options(section: str | None = None) -> tuple[str, ...]:
+    """Entries of the *Competizione* selector: ``'Tutti'`` plus the short label of every configured competition of the section.
+
+    ``('Tutti', 'Girone A', 'Girone B', 'Girone C', 'Serie B')`` for
+    :data:`SECTION_BC`, ``('Tutti', 'D-A', ..., 'D-I')`` for :data:`SECTION_D`,
+    every competition for ``None``.
+    """
+    return ("Tutti", *(g.short for g in configured_gironi(section)))
+
+
+def section_matches(matches: pd.DataFrame, section: str | None) -> pd.DataFrame:
+    """Rows of a canonical match frame whose competition belongs to ``section`` (the frame itself for ``None``)."""
+    if section is None or matches.empty:
+        return matches
+    codes = {g.value for g in configured_gironi(section)}
+    keep = matches["girone"].astype(str).isin(codes).to_numpy(dtype=bool)
+    return matches.loc[keep].reset_index(drop=True)
 
 
 # =============================================================================
@@ -1034,7 +1307,7 @@ def build_state(
         f"Kelly x{kelly_fraction:g} su {bankroll_units:g} unità, {len(traps)} squadre in trappola di regressione "
         f"(stagione {season_label}), {n_trap_flags} selezioni Over/GG segnalate."
     )
-    giornate = matchdays(p.fixture for p in predictions)
+    giornate = group_matchdays(p.fixture for p in predictions)
     if giornate:
         first = giornate[0]
         notes.append(
@@ -1081,18 +1354,186 @@ def competition_label(girone: Girone | str) -> str:
     return Girone.parse(girone).short
 
 
-def ranking_table(state: PipelineState, girone: Girone | None) -> pd.DataFrame:
+# ----------------------------------------------------------------------------- sections of a state
+def section_gironi(state: PipelineState, section: str | None = None) -> tuple[Girone, ...]:
+    """Competitions of the perimeter **with current teams** that belong to ``section`` (every one for ``None``), configuration order.
+
+    For filtering use :func:`configured_gironi` / :func:`in_section` (every
+    configured competition of the section); this is the "has teams" view behind
+    :func:`sections` and :func:`section_perimeter_label`.
+    """
+    return tuple(g for g in state.perimeter_gironi if in_section(g, section))
+
+
+def family_gironi(state: PipelineState, family: str) -> tuple[Girone, ...]:
+    """Competitions of one family (``'Serie C'``, ``'Serie D'``) that have current teams in the perimeter, configuration order."""
+    return tuple(g for g in state.perimeter_gironi if g.family == family)
+
+
+def section_team_count(state: PipelineState, section: str | None = None) -> int:
+    """Current teams of the perimeter in a section: dictionary teams with a registry, fitted current teams otherwise."""
+    gironi = configured_gironi(section)
+    if state.registry is not None:
+        return sum(len(state.registry.teams_by_girone.get(g, ())) for g in gironi)
+    fitted = state.params.current_teams_by_girone()
+    return sum(len(fitted.get(g, ())) for g in gironi)
+
+
+def section_ready(state: PipelineState, section: str | None = None) -> bool:
+    """Whether the section has at least one **fitted** current team, i.e. something to rank, predict and price.
+
+    False for Serie D before its gironi are initialised, and also when they are
+    initialised but no Serie D match has been harvested yet (teams without
+    matches are not fitted): the dashboard then shows the status notice instead
+    of empty tables.
+    """
+    fitted = state.params.current_teams_by_girone()
+    return any(g in fitted for g in configured_gironi(section))
+
+
+def sections(state: PipelineState) -> tuple[str, ...]:
+    """The sections that have at least one competition with current teams, display order.
+
+    ``('Serie B e Serie C',)`` with the shipped dictionaries (the Serie D gironi
+    are empty until the FootyStats harvester initialises them), ``('Serie B e
+    Serie C', 'Serie D')`` once Serie D has teams.
+    """
+    return sections_for(state.perimeter_gironi)
+
+
+def section_options(state: PipelineState) -> tuple[str, ...]:
+    """The sections the sidebar radio offers: :func:`sections` plus :data:`SECTION_D` when Serie D is configured but not initialised.
+
+    An uninitialised Serie D is offered on purpose, so that the page can show
+    :attr:`PipelineState.serie_d_status` and the command that initialises it
+    instead of hiding the section. Never empty: :data:`DEFAULT_SECTION` when the
+    perimeter has no competition with teams at all.
+    """
+    present = set(sections(state))
+    if serie_d_gironi():
+        present.add(SECTION_D)
+    if not present:
+        return (DEFAULT_SECTION,)
+    ordered = [sec for sec in (SECTION_BC, SECTION_D) if sec in present]
+    ordered += [sec for sec in all_sections() if sec in present and sec not in ordered]
+    return tuple(ordered)
+
+
+def section_predictions(state: PipelineState, section: str | None = None) -> list[MatchPrediction]:
+    """Every prediction of the section's competitions (all of them for ``None``), in ``state.predictions`` order."""
+    if section is None:
+        return list(state.predictions)
+    return [p for p in state.predictions if in_section(p.fixture.girone, section)]
+
+
+def family_predictions(state: PipelineState, family: str) -> list[MatchPrediction]:
+    """Every prediction whose competition belongs to ``family``, sorted by date, competition order and label."""
+    order = list(Girone)
+    preds = [p for p in state.predictions if p.fixture.girone.family == family]
+    return sorted(preds, key=lambda p: (p.fixture.date, order.index(p.fixture.girone), p.fixture.label, p.fixture.match_id))
+
+
+def matchdays(state: PipelineState, section: str | None = None) -> list[Matchday]:
+    """The "giornate" of a section, grouped from **its own** predicted fixtures (``state.matchdays`` for ``None``).
+
+    Serie D plays 34 rounds on its own calendar: grouped together with Serie B
+    and Serie C its rounds would rename every shared weekend and add midweek
+    matchdays nobody in the other section asked for, so each section groups its
+    fixtures separately (:func:`src.engine.picks.matchdays` with the section's
+    competitions) and its keys, labels and rounds only ever mention that
+    section. Grouped once per section and cached on the state.
+    """
+    if section is None:
+        return list(state.matchdays)
+    cached = state._section_matchdays.get(section)
+    if cached is None:
+        cached = group_matchdays((p.fixture for p in state.predictions), gironi=configured_gironi(section))
+        state._section_matchdays[section] = cached
+        log.debug("section matchdays grouped", extra={"section": section, "n_matchdays": len(cached)})
+    return list(cached)
+
+
+def section_perimeter_label(state: PipelineState, section: str | None = None) -> str:
+    """The perimeter of one section as the configuration describes it: ``'Serie D 2026/27 Gironi A-I (162 squadre)'``.
+
+    Built with :func:`src.common.competitions.describe_competitions` on the
+    section's competitions that have teams (``'Serie C 2026/27 Gironi A/B/C +
+    Serie B (80 squadre)'`` for :data:`SECTION_BC`, identical to
+    :attr:`PipelineState.perimeter_label` when the perimeter has no other
+    section); the whole perimeter for ``None``. A section without teams reads
+    ``'Serie D 2026/27 (nessuna squadra)'``.
+    """
+    if section is None:
+        return state.perimeter_label
+    gironi = section_gironi(state, section)
+    n_teams = section_team_count(state, section)
+    if not gironi or n_teams == 0:
+        return f"{section} {state.season_label} (nessuna squadra)".strip()
+    text = describe_competitions((g.competition for g in gironi), season=state.season_label)
+    return f"{text} ({n_teams} squadre)"
+
+
+def perimeter_text(state: PipelineState, section: str | None = None) -> str:
+    """Italian one-liner for badges and subtitles, restricted to a section when given.
+
+    ``'Perimetro: Serie D 2026/27 Gironi A-I (162 squadre) · 648 partite stagione
+    corrente · 0 partite storiche'``; with ``None`` exactly
+    :attr:`PipelineState.perimeter_text` (the whole perimeter). The match counts
+    are the rows of the section's competitions in the current season and in the
+    history, the history label spans the section's history seasons.
+    """
+    if section is None:
+        return state.perimeter_text
+    current = section_matches(state.current_matches, section)
+    history = section_matches(state.history_matches, section)
+    text = (
+        f"Perimetro: {section_perimeter_label(state, section)} · {len(current)} partite stagione corrente · "
+        f"{len(history)} partite storiche"
+    )
+    if len(history):
+        text += f" ({history_label(history)})"
+    return text
+
+
+def coverage_text(state: PipelineState, section: str | None = None) -> str:
+    """``'Copertura 2026/27: 8.0 partite per squadra nella competizione meno coperta'`` for the section's competitions.
+
+    Read from ``state.coverage`` restricted to the section (``''`` without a
+    coverage report or when none of the section's competitions is covered); the
+    ignored competitions of the section, if any, follow after ``' · '``.
+    """
+    report = state.coverage
+    if report is None:
+        return ""
+    per = {g: v for g, v in report.per_competition.items() if in_section(g, section)}
+    ignored = tuple(g for g in report.ignored if in_section(g, section))
+    if not per and not ignored:
+        return ""
+    restricted = CoverageReport(per_competition=per, ignored=ignored, season=report.season)
+    text = f"Copertura {state.season_label}: {restricted.thinnest:.1f} partite per squadra nella competizione meno coperta" if per else f"Copertura {state.season_label}: nessuna competizione coperta"
+    if ignored:
+        text += f" · {restricted.describe_ignored()}"
+    return text
+
+
+# ----------------------------------------------------------------------------- ranking
+def ranking_table(state: PipelineState, girone: Girone | None, section: str | None = None) -> pd.DataFrame:
     """Strength ranking (alpha desc) with Italian labels, rounded to 3 decimals.
 
     Only the current teams of the perimeter are listed and ``Competizione`` is
     the short label of their registry competition (historical opponents never
-    appear). ``girone=None`` returns every current team; a competition with no
-    fitted teams yields an empty frame with the same columns instead of raising.
+    appear). ``girone=None`` returns every current team of ``section`` (every
+    section when ``None``); a competition with no fitted teams yields an empty
+    frame with the same columns instead of raising.
     """
     g = _as_girone(girone)
     if g is not None and g not in state.params.teams_by_girone:
         return pd.DataFrame({c: pd.Series(dtype="string" if c in ("Squadra", "Competizione") else "float64") for c in RANKING_COLUMNS})
-    frame = state.engine.ranking(g)[list(_RANKING_RENAME)].rename(columns=_RANKING_RENAME)
+    ranking = state.engine.ranking(g)
+    if g is None and section is not None:
+        codes = {x.value for x in configured_gironi(section)}
+        ranking = ranking.loc[ranking["girone"].astype(str).isin(codes)]
+    frame = ranking[list(_RANKING_RENAME)].rename(columns=_RANKING_RENAME)
     numeric = [c for c in RANKING_COLUMNS if c not in ("Squadra", "Competizione")]
     frame = frame.assign(**{c: frame[c].astype("float64").round(3) for c in numeric})
     frame = frame.assign(
@@ -1102,65 +1543,74 @@ def ranking_table(state: PipelineState, girone: Girone | None) -> pd.DataFrame:
     return frame[list(RANKING_COLUMNS)].reset_index(drop=True)
 
 
-def find_matchday(state: PipelineState, key: str | None) -> Matchday | None:
-    """The matchday of ``state`` with that :attr:`Matchday.key`, ``None`` when unknown (or ``key`` is ``None``)."""
+def find_matchday(state: PipelineState, key: str | None, section: str | None = None) -> Matchday | None:
+    """The matchday of ``state`` (of ``section``, when given) with that :attr:`Matchday.key`, ``None`` when unknown (or ``key`` is ``None``)."""
     if key is None:
         return None
-    return next((m for m in state.matchdays if m.key == key), None)
+    return next((m for m in matchdays(state, section) if m.key == key), None)
 
 
-def resolve_matchday(state: PipelineState, matchday: MatchdaySelector | str = None) -> Matchday | None:
+def resolve_matchday(state: PipelineState, matchday: MatchdaySelector | str = None, section: str | None = None) -> Matchday | None:
     """Turn a selector into a :class:`Matchday` (or ``None`` meaning "no restriction").
 
-    ``None`` -> the next matchday (``None`` when the state has none, which then
-    means every prediction, i.e. none); :data:`ALL_MATCHDAYS` -> ``None`` (no
-    restriction); a :class:`Matchday` -> itself; a key string -> the matchday
-    with that key, falling back to the next one when the key is stale.
+    ``None`` -> the next matchday of the section (``None`` when it has none,
+    which then means every prediction, i.e. none); :data:`ALL_MATCHDAYS` ->
+    ``None`` (no restriction); a :class:`Matchday` -> itself; a key string ->
+    the matchday with that key among the section's matchdays, falling back to
+    the next one when the key is stale.
     """
     if matchday is ALL_MATCHDAYS or (isinstance(matchday, str) and matchday == ALL_MATCHDAYS):
         return None
+    days = matchdays(state, section)
+    first = days[0] if days else None
     if matchday is None:
-        return state.next_matchday
+        return first
     if isinstance(matchday, Matchday):
         return matchday
-    found = find_matchday(state, str(matchday))
+    found = next((m for m in days if m.key == str(matchday)), None)
     if found is None:
-        log.debug("unknown matchday key, using the next matchday", extra={"key": str(matchday)})
-        return state.next_matchday
+        log.debug("unknown matchday key, using the next matchday", extra={"key": str(matchday), "section": section})
+        return first
     return found
 
 
-def _restrict(state: PipelineState, matchday: MatchdaySelector) -> list[MatchPrediction]:
-    """Predictions of the selected matchday (every prediction for :data:`ALL_MATCHDAYS`).
+def _restrict(state: PipelineState, matchday: MatchdaySelector, section: str | None = None) -> list[MatchPrediction]:
+    """Predictions of the selected matchday within a section (every prediction of the section for :data:`ALL_MATCHDAYS`).
 
-    With ``None`` and no matchday in the state (no predicted fixture) there is
+    With ``None`` and no matchday in the section (no predicted fixture) there is
     nothing to show, so the result is empty, consistent with the selectors.
     """
+    preds = section_predictions(state, section)
     if matchday is ALL_MATCHDAYS or (isinstance(matchday, str) and matchday == ALL_MATCHDAYS):
-        return list(state.predictions)
-    chosen = resolve_matchday(state, matchday)
+        return preds
+    chosen = resolve_matchday(state, matchday, section)
     if chosen is None:
         return []
-    return [p for p in state.predictions if chosen.contains(p)]
+    return [p for p in preds if chosen.contains(p)]
 
 
-def matchday_predictions(state: PipelineState, matchday: MatchdaySelector = None) -> list[MatchPrediction]:
-    """Predictions of one matchday (the next by default, all with :data:`ALL_MATCHDAYS`), sorted by date, competition, label."""
-    preds = _restrict(state, matchday)
+def matchday_predictions(state: PipelineState, matchday: MatchdaySelector = None, section: str | None = None) -> list[MatchPrediction]:
+    """Predictions of one matchday (the next by default, all with :data:`ALL_MATCHDAYS`) of a section, sorted by date, competition, label."""
+    preds = _restrict(state, matchday, section)
     order = list(Girone)
     return sorted(preds, key=lambda p: (p.fixture.date, order.index(p.fixture.girone), p.fixture.label, p.fixture.match_id))
 
 
-def fixtures_for(state: PipelineState, girone: Girone | None, matchday: MatchdaySelector = None) -> list[MatchPrediction]:
-    """Predictions of the upcoming fixtures (optionally one girone), sorted by date then label.
+def fixtures_for(
+    state: PipelineState,
+    girone: Girone | None,
+    matchday: MatchdaySelector = None,
+    section: str | None = None,
+) -> list[MatchPrediction]:
+    """Predictions of the upcoming fixtures (optionally one girone, one section), sorted by date then label.
 
-    ``matchday`` defaults to the **next** matchday, so with a season-long fixture
-    list the match selector shows one "giornata" instead of hundreds of
-    fixtures; pass a :class:`Matchday` to pick another one or
+    ``matchday`` defaults to the **next** matchday of the section, so with a
+    season-long fixture list the match selector shows one "giornata" instead of
+    hundreds of fixtures; pass a :class:`Matchday` to pick another one or
     :data:`ALL_MATCHDAYS` for every predicted fixture (the exports do).
     """
     g = _as_girone(girone)
-    preds = [p for p in _restrict(state, matchday) if g is None or p.fixture.girone == g]
+    preds = [p for p in _restrict(state, matchday, section) if g is None or p.fixture.girone == g]
     return sorted(preds, key=lambda p: (p.fixture.date, p.fixture.label))
 
 
@@ -1176,18 +1626,20 @@ def matchday_table_for(
     state: PipelineState,
     matchday: MatchdaySelector = None,
     girone: Girone | None = None,
+    section: str | None = None,
 ) -> pd.DataFrame:
     """The whole matchday as one table (:func:`src.engine.tables.matchday_table`), one row per predicted fixture.
 
     ``matchday`` follows the selector semantics of :func:`fixtures_for` (the
-    next matchday by default, :data:`ALL_MATCHDAYS` for every predicted
-    fixture), ``girone`` keeps one competition. Strengths come from
+    next matchday of the section by default, :data:`ALL_MATCHDAYS` for every
+    predicted fixture), ``girone`` keeps one competition, ``section`` one
+    section (every competition when ``None``). Strengths come from
     ``state.params``, the form columns from the current-season matches
     (:meth:`PipelineState.team_matches_frame`, built once per state), the
     ``Book`` / ``EV max`` / ``Flag`` columns from ``state.opportunities`` and
     ``state.traps``. Columns exactly :data:`MATCHDAY_COLUMNS`, ``match_id`` last.
     """
-    preds = _restrict(state, matchday)
+    preds = _restrict(state, matchday, section)
     return matchday_table(
         preds,
         params=state.params,
@@ -1203,22 +1655,24 @@ def matchday_table_for(
 MATCHDAY_TABLE_KEY_PREFIX: Final[str] = "matchday_table"
 
 
-def matchday_table_key(matchday: Matchday | None, girone: Girone | None = None) -> str:
-    """``st.session_state`` key of the *Giornata* table widget, scoped to the matchday and competition it shows.
+def matchday_table_key(matchday: Matchday | None, girone: Girone | None = None, section: str | None = None) -> str:
+    """``st.session_state`` key of the *Giornata* table widget, scoped to the matchday, competition and section it shows.
 
     Streamlit derives a ``st.dataframe`` element id from its ``key`` and
     selection mode only, not from the data, so a row selection made on one
     table would survive a change of matchday or sidebar competition and be
     mapped onto the new table (a fixture the user never clicked). Scoping the
     key -- ``'matchday_table_2026-10-18_A'``, ``'matchday_table_tutte_all'`` for
-    every predicted fixture of every competition -- makes each scope its own
-    widget, which starts without a selection. The prefix is
-    :data:`MATCHDAY_TABLE_KEY_PREFIX`, so a test can still find the table by
-    ``key.startswith(...)``.
+    every predicted fixture of every competition, ``'matchday_table_2026-11-08_all_d'``
+    for the Serie D section (whose matchday may share its key with a Serie B /
+    Serie C one played the same weekend; the default section adds no suffix,
+    see :func:`section_key`) -- makes each scope its own widget, which starts
+    without a selection. The prefix is :data:`MATCHDAY_TABLE_KEY_PREFIX`, so a
+    test can still find the table by ``key.startswith(...)``.
     """
     scope_matchday = "tutte" if matchday is None else str(matchday.key)
     scope_girone = "all" if girone is None else str(_as_girone(girone).value)
-    return f"{MATCHDAY_TABLE_KEY_PREFIX}_{scope_matchday}_{scope_girone}"
+    return section_key(f"{MATCHDAY_TABLE_KEY_PREFIX}_{scope_matchday}_{scope_girone}", section)
 
 
 def fixture_label(prediction: MatchPrediction) -> str:
@@ -1250,41 +1704,55 @@ def selected_row_match_id(event: object, table: pd.DataFrame) -> str | None:
     return str(table["match_id"].iloc[position])
 
 
-def matchday_csv_bytes(state: PipelineState, matchday: MatchdaySelector = None, girone: Girone | None = None) -> bytes:
+def matchday_csv_bytes(
+    state: PipelineState,
+    matchday: MatchdaySelector = None,
+    girone: Girone | None = None,
+    section: str | None = None,
+) -> bytes:
     """CSV bytes (see :func:`export_csv_bytes`) of :func:`matchday_table_for`, for the download button and the console export."""
-    return export_csv_bytes(matchday_table_for(state, matchday, girone))
+    return export_csv_bytes(matchday_table_for(state, matchday, girone, section))
 
 
-def seasons_available(state: PipelineState) -> list[str]:
-    """Season labels present in ``state.matches``: the registry season first, then the others most recent first.
+def seasons_available(state: PipelineState, section: str | None = None) -> list[str]:
+    """Season labels present in ``state.matches`` (of the section's competitions, when given): the registry season first, then the others most recent first.
 
     The registry season is listed even when it has no match yet (the season has
     not started), so the *Risultati* selector always offers the current season.
     """
-    present = sorted(set(pd.to_datetime(state.matches["date"]).map(season_of)), reverse=True) if len(state.matches) else []
+    frame = section_matches(state.matches, section)
+    present = sorted(set(pd.to_datetime(frame["date"]).map(season_of)), reverse=True) if len(frame) else []
     current = str(state.season_label).replace("_", "/")
     if current:
         return [current, *[s for s in present if s != current]]
     return present
 
 
-def current_teams(state: PipelineState, girone: Girone | None = None) -> list[str]:
-    """Sorted current teams of the perimeter (one competition when ``girone`` is given).
+def current_teams(state: PipelineState, girone: Girone | None = None, section: str | None = None) -> list[str]:
+    """Sorted current teams of the perimeter (one competition when ``girone`` is given, one section with ``section``).
 
     From the registry when the state has one (every team of the dictionary,
-    with or without matches), otherwise the fitted current teams.
+    with or without matches), otherwise the fitted current teams. A competition
+    the registry lists without teams (an uninitialised Serie D girone) yields
+    ``[]``.
     """
     g = _as_girone(girone)
+    gironi = (g,) if g is not None else configured_gironi(section)
     if state.registry is not None:
-        names = state.registry.teams(g) if g is not None else state.registry.canonical_names
+        names = [t for x in gironi for t in state.registry.teams_by_girone.get(x, ())]
         return sorted(str(t) for t in names)
     by_girone = state.params.current_teams_by_girone()
-    names = by_girone.get(g, ()) if g is not None else [t for teams in by_girone.values() for t in teams]
+    names = [t for x in gironi for t in by_girone.get(x, ())]
     return sorted(str(t) for t in names)
 
 
-def results_team_options(state: PipelineState, girone: Girone | None = None, season: str | None = None) -> list[str]:
-    """Teams selectable in the *Risultati* tab for one season and competition: every option has at least one row.
+def results_team_options(
+    state: PipelineState,
+    girone: Girone | None = None,
+    season: str | None = None,
+    section: str | None = None,
+) -> list[str]:
+    """Teams selectable in the *Risultati* tab for one season, competition and section: every option has at least one row.
 
     The options are the clubs that **played** that season in that competition
     (home or away in ``state.matches``, filtered exactly like
@@ -1301,15 +1769,15 @@ def results_team_options(state: PipelineState, girone: Girone | None = None, sea
     label = str(state.season_label if season is None else season).replace("_", "/")
     current_label = str(state.season_label).replace("_", "/")
     names: set[str] = set()
-    if len(state.matches) and label:
-        frame = state.matches
+    frame = section_matches(state.matches, section)
+    if len(frame) and label:
         mask = (pd.to_datetime(frame["date"]).map(season_of) == label).to_numpy(dtype=bool)
         if g is not None:
             mask = mask & (frame["girone"] == g.value).to_numpy(dtype=bool)  # a new array: to_numpy() may be read-only
         subset = frame.loc[mask]
         names |= set(subset["home_team"].astype(str)) | set(subset["away_team"].astype(str))
     if not names or label == current_label:
-        names |= set(current_teams(state, g))
+        names |= set(current_teams(state, g, section))
     return sorted(names)
 
 
@@ -1318,16 +1786,19 @@ def results_table_for(
     girone: Girone | None = None,
     team: str | None = None,
     season: str | None = None,
+    section: str | None = None,
 ) -> pd.DataFrame:
     """Played matches of one season (the registry season by default) with the model's reading of each.
 
     :func:`src.engine.tables.results_table` on ``state.matches`` (every season
     the fit saw, so a past season can be chosen) with ``state.engine``:
     columns :data:`RESULTS_MODEL_COLUMNS`. ``girone`` keeps one competition,
-    ``team`` the matches of one team (home or away, historical teams included).
+    ``section`` one section, ``team`` the matches of one team (home or away,
+    historical teams included).
     """
     label = str(state.season_label if season is None else season).replace("_", "/") or None
-    return results_table(state.matches, engine=state.engine, season=label, girone=_as_girone(girone), team=team)
+    gironi = None if section is None else configured_gironi(section)
+    return results_table(state.matches, engine=state.engine, season=label, girone=_as_girone(girone), team=team, gironi=gironi)
 
 
 def results_csv_bytes(
@@ -1335,9 +1806,10 @@ def results_csv_bytes(
     girone: Girone | None = None,
     team: str | None = None,
     season: str | None = None,
+    section: str | None = None,
 ) -> bytes:
     """CSV bytes (see :func:`export_csv_bytes`) of :func:`results_table_for`, for the download button and the console export."""
-    return export_csv_bytes(results_table_for(state, girone, team, season))
+    return export_csv_bytes(results_table_for(state, girone, team, season, section))
 
 
 def no_odds_message(state: PipelineState) -> str:
@@ -1576,18 +2048,19 @@ def value_opportunities(
     min_ev: float,
     girone: Girone | None = None,
     matchday: MatchdaySelector = None,
+    section: str | None = None,
 ) -> list[ValueOpportunity]:
-    """The rows of the value panel as objects: ``ev >= min_ev``, one competition when given, one matchday.
+    """The rows of the value panel as objects: ``ev >= min_ev``, one competition when given, one matchday, one section.
 
     Exactly the selection and the order of :func:`value_table` (EV descending,
     then match label, market and selection), so a caller that needs the panel's
     first row -- the worked example of the *Legenda* tab -- reads it from here
     instead of re-filtering ``state.opportunities``. ``matchday`` defaults to
-    the next matchday like :func:`fixtures_for`; :data:`ALL_MATCHDAYS` lifts the
-    restriction.
+    the next matchday of the section like :func:`fixtures_for`;
+    :data:`ALL_MATCHDAYS` lifts the restriction.
     """
     g = _as_girone(girone)
-    allowed = {p.fixture.match_id for p in _restrict(state, matchday)}
+    allowed = {p.fixture.match_id for p in _restrict(state, matchday, section)}
     rows = [o for o in state.opportunities if o.ev >= min_ev and (g is None or o.girone == g) and o.match_id in allowed]
     # the table sorts on the EV rounded to 2 decimals in percent; do the same so the two orders agree
     rows.sort(key=lambda o: (-round(o.ev * 100.0, 2), f"{o.home_team} - {o.away_team}", MARKET_LABELS[o.market], o.selection))
@@ -1599,12 +2072,14 @@ def value_table(
     min_ev: float,
     girone: Girone | None = None,
     matchday: MatchdaySelector = None,
+    section: str | None = None,
 ) -> pd.DataFrame:
-    """Selections with ``ev >= min_ev`` (optionally one competition), EV descending, Italian labels.
+    """Selections with ``ev >= min_ev`` (optionally one competition, one section), EV descending, Italian labels.
 
-    Like :func:`fixtures_for`, ``matchday`` defaults to the next matchday; pass
-    :data:`ALL_MATCHDAYS` to list the value selections of the whole fixture list.
-    The rows are those of :func:`value_opportunities`, in the same order.
+    Like :func:`fixtures_for`, ``matchday`` defaults to the next matchday of the
+    section; pass :data:`ALL_MATCHDAYS` to list the value selections of the
+    whole fixture list. The rows are those of :func:`value_opportunities`, in
+    the same order.
     """
     rows = [
         {
@@ -1621,7 +2096,7 @@ def value_table(
             "Stake (unità)": round(o.stake_units, 1),
             "Flag": " | ".join(o.flags),
         }
-        for o in value_opportunities(state, min_ev, girone, matchday)
+        for o in value_opportunities(state, min_ev, girone, matchday, section)
     ]
     frame = pd.DataFrame(rows, columns=list(VALUE_COLUMNS))
     frame = frame.assign(Data=pd.to_datetime(frame["Data"]).astype("datetime64[ns]"))
@@ -1633,8 +2108,8 @@ def value_table(
     return frame.reset_index(drop=True)
 
 
-def traps_table(state: PipelineState) -> pd.DataFrame:
-    """REGRESSION_TRAP teams (severity descending) with Italian labels."""
+def traps_table(state: PipelineState, section: str | None = None) -> pd.DataFrame:
+    """REGRESSION_TRAP teams (severity descending) with Italian labels, of one section when given."""
     rows = [
         {
             "Squadra": t.team,
@@ -1644,7 +2119,7 @@ def traps_table(state: PipelineState) -> pd.DataFrame:
             "Severità": round(t.severity, 2),
             "Ultima Gara": pd.Timestamp(t.last_date),
         }
-        for t in sorted(state.traps, key=lambda t: (-t.severity, t.team))
+        for t in sorted(section_traps(state, section), key=lambda t: (-t.severity, t.team))
     ]
     frame = pd.DataFrame(rows, columns=list(TRAPS_COLUMNS))
     frame = frame.assign(
@@ -1657,12 +2132,22 @@ def traps_table(state: PipelineState) -> pd.DataFrame:
     return frame.reset_index(drop=True)
 
 
+def section_traps(state: PipelineState, section: str | None = None) -> list[RegressionTrap]:
+    """The REGRESSION_TRAP teams of one section (every trap for ``None``), in ``state.traps`` order."""
+    return [t for t in state.traps if in_section(t.girone, section)]
+
+
+def section_opportunities(state: PipelineState, section: str | None = None) -> list[ValueOpportunity]:
+    """Every evaluated selection of one section (every one for ``None``), in ``state.opportunities`` order."""
+    return [o for o in state.opportunities if in_section(o.girone, section)]
+
+
 def _slug(selection: str) -> str:
     return selection.strip().lower().replace(" ", "_")
 
 
-def predictions_table(state: PipelineState) -> pd.DataFrame:
-    """Export frame: one row per predicted fixture with rates, every market probability and fair odds.
+def predictions_table(state: PipelineState, section: str | None = None) -> pd.DataFrame:
+    """Export frame: one row per predicted fixture (of one section, when given) with rates, every market probability and fair odds.
 
     Columns: ``match_id, date, round, girone, home_team, away_team, lambda, mu, rho,
     most_likely_score, p_most_likely`` followed by ``p_<selection>`` and
@@ -1670,7 +2155,7 @@ def predictions_table(state: PipelineState) -> pd.DataFrame:
     (``p_1, p_x, p_2, p_over_1.5, ...``).
     """
     rows: list[dict[str, object]] = []
-    for p in fixtures_for(state, None, matchday=ALL_MATCHDAYS):
+    for p in fixtures_for(state, None, matchday=ALL_MATCHDAYS, section=section):
         fx = p.fixture
         hs, as_, p_top = p.most_likely_score()
         row: dict[str, object] = {
@@ -1702,9 +2187,9 @@ def predictions_table(state: PipelineState) -> pd.DataFrame:
     return frame.reset_index(drop=True)
 
 
-def opportunities_table(state: PipelineState) -> pd.DataFrame:
-    """The full :meth:`ValueEngine.to_frame` of every evaluated selection (value or not)."""
-    return ValueEngine().to_frame(state.opportunities)
+def opportunities_table(state: PipelineState, section: str | None = None) -> pd.DataFrame:
+    """The full :meth:`ValueEngine.to_frame` of every evaluated selection (value or not), of one section when given."""
+    return ValueEngine().to_frame(section_opportunities(state, section))
 
 
 # =============================================================================
@@ -1717,10 +2202,11 @@ def _picks(
     *,
     draws: bool,
     n: int,
+    section: str | None = None,
 ) -> list[Pick]:
-    """Shared body of :func:`draw_picks_table` / :func:`btts_picks_table`."""
+    """Shared body of :func:`draw_picks_table` / :func:`btts_picks_table`: ranked within the section (and competition)."""
     g = _as_girone(girone)
-    preds = _restrict(state, matchday)
+    preds = _restrict(state, matchday, section)
     if g is not None:
         preds = [p for p in preds if p.fixture.girone == g]
     chooser = draw_picks if draws else btts_picks
@@ -1732,14 +2218,17 @@ def draw_picks_table(
     matchday: MatchdaySelector = None,
     n: int = DEFAULT_N_DRAWS,
     girone: Girone | None = None,
+    section: str | None = None,
 ) -> pd.DataFrame:
     """The ``n`` most probable draws (``X``) of the matchday as a :func:`picks_frame` (Italian columns).
 
-    ``matchday`` defaults to the next one (:data:`ALL_MATCHDAYS` for the whole
-    fixture list); ``girone`` optionally restricts the candidates to one
-    competition, the default being all four, as the user asked.
+    ``matchday`` defaults to the next one of the section (:data:`ALL_MATCHDAYS`
+    for the whole fixture list); ``section`` ranks the candidates within one
+    section (Serie B and Serie C together, or Serie D alone) and ``girone``
+    optionally within one competition; with neither every competition of the
+    perimeter competes, as the user asked.
     """
-    return picks_frame(_picks(state, matchday, girone, draws=True, n=n))
+    return picks_frame(_picks(state, matchday, girone, draws=True, n=n, section=section))
 
 
 def btts_picks_table(
@@ -1747,9 +2236,10 @@ def btts_picks_table(
     matchday: MatchdaySelector = None,
     n: int = DEFAULT_N_BTTS,
     girone: Girone | None = None,
+    section: str | None = None,
 ) -> pd.DataFrame:
     """The ``n`` most probable both-teams-to-score matches (``GG``) of the matchday, see :func:`draw_picks_table`."""
-    return picks_frame(_picks(state, matchday, girone, draws=False, n=n))
+    return picks_frame(_picks(state, matchday, girone, draws=False, n=n, section=section))
 
 
 def picks_export_frame(draws: pd.DataFrame, btts: pd.DataFrame, matchday: Matchday | None = None) -> pd.DataFrame:

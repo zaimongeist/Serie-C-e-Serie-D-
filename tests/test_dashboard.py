@@ -33,6 +33,7 @@ from src.dashboard import LEGACY_FULL_WIDTH, MODERN_FULL_WIDTH, container_width_
 from src.dashboard.legend import legend_terms
 from src.dashboard.state import (
     ALL_MATCHDAYS,
+    DEFAULT_SECTION,
     MARKETS_COLUMNS,
     MATCHDAY_COLUMNS,
     MATCHDAY_TABLE_KEY_PREFIX,
@@ -40,27 +41,42 @@ from src.dashboard.state import (
     PICKS_EXPORT_COLUMNS,
     RANKING_COLUMNS,
     RESULTS_MODEL_COLUMNS,
+    SECTION_BC,
+    SECTION_D,
+    SECTION_FAMILIES,
+    SERIE_D_STATUS_NOT_CONFIGURED,
+    SERIE_D_STATUS_NOT_INITIALISED,
     TRAPS_COLUMNS,
     VALUE_COLUMNS,
     PipelineState,
+    all_sections,
     btts_picks_table,
     build_state,
+    competition_options,
+    configured_gironi,
+    coverage_text,
     current_teams,
     draw_picks_table,
     export_csv_bytes,
+    family_gironi,
+    family_label,
+    family_predictions,
     find_matchday,
     fixture_label,
     fixtures_for,
     heatmap_figure,
+    in_section,
     load_odds_quotes,
     markets_table,
     matchday_csv_bytes,
     matchday_predictions,
     matchday_table_for,
     matchday_table_key,
+    matchdays,
     max_sim_rounds,
     no_odds_message,
     opportunities_table,
+    perimeter_text,
     picks_csv_bytes,
     picks_export_frame,
     predictions_table,
@@ -71,23 +87,47 @@ from src.dashboard.state import (
     results_table_for,
     results_team_options,
     seasons_available,
+    section_families,
+    section_gironi,
+    section_key,
+    section_matches,
+    section_of_family,
+    section_opportunities,
+    section_options,
+    section_perimeter_label,
+    section_predictions,
+    section_ready,
+    section_slug,
+    section_team_count,
+    section_traps,
+    sections,
+    sections_for,
     selected_row_match_id,
+    serie_d_gironi,
+    serie_d_harvest_command,
+    serie_d_status_text,
     strength_figure,
     traps_table,
     value_opportunities,
     value_table,
 )
-from src.common.teams import load_registry
+from src.common.teams import TeamRegistry, load_registry
 from src.engine.picks import PICKS_COLUMNS
 from src.engine.tables import team_form
 from src.ingestion.harvester import save_fixtures, save_processed
-from src.simulation.generator import simulate_league, simulate_mini_dataset
+from src.simulation.generator import simulate_league, simulate_mini_dataset, simulate_serie_d_registry
 
 if TYPE_CHECKING:
     from streamlit.testing.v1 import AppTest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 APP_PATH = REPO_ROOT / "src" / "dashboard" / "app.py"
+#: The competitions of the shipped 2026/27 dictionary (Serie C A/B/C and Serie B): the Serie D gironi of
+#: ``config/competitions.toml`` ship without teams, so the simulated perimeter never contains them.
+PERIMETER_GIRONI = tuple(load_registry().gironi)
+#: The configured Serie D competitions (empty when the configuration has no 'Serie D' family).
+SERIE_D = serie_d_gironi()
+needs_serie_d = pytest.mark.skipif(not SERIE_D, reason="no competition of family 'Serie D' in config/competitions.toml")
 
 
 # ----------------------------------------------------------------------------- helpers
@@ -326,7 +366,7 @@ def test_ranking_table_labels_and_counts(sim_state: PipelineState) -> None:
     assert len(full) == len(sim_state.params.current_teams) == 80 < len(sim_state.params.teams)
     assert not set(full["Squadra"]) & set(sim_state.params.historical_teams)
     current_by_girone = sim_state.params.current_teams_by_girone()
-    for g in Girone:
+    for g in PERIMETER_GIRONI:
         table = ranking_table(sim_state, g)
         assert list(table.columns) == list(RANKING_COLUMNS)
         assert len(table) == len(current_by_girone[g]) == 20
@@ -359,7 +399,7 @@ def test_fixtures_for_sorted_and_filtered(sim_state: PipelineState) -> None:
     assert sum(len(fixtures_for(sim_state, g)) for g in Girone) == len(all_preds) and len(fixtures_for(sim_state, Girone.SB)) == 10
     # one matchday with every competition at round 16 (15 played); the explicit forms agree with the default
     assert len(sim_state.matchdays) == 1 and sim_state.next_matchday is not None
-    assert sim_state.next_matchday.rounds == {g: 16 for g in Girone} and sim_state.next_matchday.n_fixtures == 40
+    assert sim_state.next_matchday.rounds == {g: 16 for g in PERIMETER_GIRONI} and sim_state.next_matchday.n_fixtures == 40
     assert fixtures_for(sim_state, None, sim_state.next_matchday) == all_preds == fixtures_for(sim_state, None, ALL_MATCHDAYS)
     assert any("raggruppate in 1 giornata" in n for n in sim_state.notes)
 
@@ -372,7 +412,7 @@ def test_matchday_defaults_with_a_season_long_fixture_list(tmp_path: Path) -> No
     assert state.source == "processed" and len(state.fixtures) == 110 == len(state.predictions)  # 40 + 40 + 30 (Serie B has two rounds left)
     assert [m.n_fixtures for m in state.matchdays] == [40, 40, 30]
     first, second, third = state.matchdays
-    assert first.rounds == {g: 9 for g in Girone} and second.rounds == {g: 10 for g in Girone} and third.rounds == {g: 11 for g in (Girone.A, Girone.B, Girone.C)}
+    assert first.rounds == {g: 9 for g in PERIMETER_GIRONI} and second.rounds == {g: 10 for g in PERIMETER_GIRONI} and third.rounds == {g: 11 for g in (Girone.A, Girone.B, Girone.C)}
     assert first.fixture_ids == {f.match_id for f in by_round[9]} and third.fixture_ids == {f.match_id for f in by_round[11]}
     assert first.key == first.start.isoformat() and "g.9" in first.label and "Serie B g.9" in first.label and "Serie B" not in third.label
     assert state.next_matchday is first and find_matchday(state, second.key) is second and find_matchday(state, "nope") is None
@@ -681,6 +721,10 @@ def test_matchday_table_key_is_scoped_to_matchday_and_competition(sim_state: Pip
         *(matchday_table_key(md, g) for g in Girone),
     }
     assert len(keys) == 2 + 2 * len(Girone), "every (matchday, competition) pair is its own widget"
+    # ... and so is every section: the default section keeps the bare key, the others carry their slug
+    assert matchday_table_key(md, None, DEFAULT_SECTION) == matchday_table_key(md, None) == matchday_table_key(md, None, SECTION_BC)
+    assert matchday_table_key(md, None, SECTION_D) == f"{MATCHDAY_TABLE_KEY_PREFIX}_{md.key}_all_d" != matchday_table_key(md, None)
+    assert matchday_table_key(md, Girone.A, SECTION_D).endswith("_A_d")
     assert all(k.startswith(MATCHDAY_TABLE_KEY_PREFIX + "_") for k in keys)
     assert matchday_table_key(None, None) == f"{MATCHDAY_TABLE_KEY_PREFIX}_tutte_all"
     assert matchday_table_key(md, Girone.SB) == f"{MATCHDAY_TABLE_KEY_PREFIX}_{md.key}_SB" == matchday_table_key(md, "Serie B")
@@ -704,7 +748,7 @@ def test_results_team_options_offer_only_teams_with_rows(sim_state: PipelineStat
     registry = sim_state.registry
     assert registry is not None
     for season in seasons_available(sim_state):
-        for g in (None, *Girone):
+        for g in (None, *PERIMETER_GIRONI):
             table = results_table_for(sim_state, girone=g, season=season)
             with_rows = set(table["Casa"].astype(str)) | set(table["Ospiti"].astype(str))
             options = results_team_options(sim_state, g, season)
@@ -773,8 +817,13 @@ def test_app_renders_with_apptest(monkeypatch: pytest.MonkeyPatch) -> None:
     picks_tables = [d.value for d in at.dataframe if list(d.value.columns) == list(PICKS_COLUMNS)]
     assert [len(t) for t in picks_tables] == [5, 12]
     assert picks_tables[0]["Esito"].eq("X").all() and picks_tables[1]["Esito"].eq("GG").all()
-    assert any("Le 5 partite più probabili da X (tutte le competizioni)" in m.value for m in at.markdown)
-    assert any("Le 12 partite più probabili da GG (tutte le competizioni)" in m.value for m in at.markdown)
+    assert any("Le 5 partite più probabili da X (tutte le competizioni di Serie B e Serie C)" in m.value for m in at.markdown)
+    assert any("Le 12 partite più probabili da GG (tutte le competizioni di Serie B e Serie C)" in m.value for m in at.markdown)
+    # the section radio: Serie B e Serie C by default, Serie D offered as soon as it is configured (initialised or not)
+    section_radio = at.radio(key="section")
+    assert section_radio.value == "Serie B e Serie C" == section_radio.options[0]
+    assert section_radio.options == (["Serie B e Serie C", "Serie D"] if SERIE_D else ["Serie B e Serie C"])
+    assert any("sezione: Serie B e Serie C" in c.value for c in at.caption)
     assert any("solo per probabilità" in c.value for c in at.caption)
     assert any(b.label == "Scarica le due liste (CSV)" for b in at.get("download_button"))
     # Legenda: the glossary and the worked example on the first value row
@@ -1268,3 +1317,265 @@ def test_app_resolves_today_on_every_run_and_survives_a_pipeline_error(monkeypat
     assert received and received[0] == date.today()  # the refused call (the fallback may be served by the cache)
     assert any("Perimetro: Serie C 2026/27 Gironi A/B/C + Serie B (80 squadre)" in i.value for i in at.sidebar.info)
     assert at.metric, "the fallback state renders the match tab"
+
+
+# ----------------------------------------------------------------------------- sections (Serie B e Serie C / Serie D)
+def serie_d_registry(seed: int = 7) -> TeamRegistry:
+    """The real 2026/27 perimeter plus the synthetic Serie D gironi (18 clubs each), as the console demo builds it."""
+    base = load_registry()
+    extra = simulate_serie_d_registry(seed=seed, season=base.season)
+    teams = {g.value: tuple(base.teams_by_girone[g]) for g in base.gironi}
+    teams.update({g.value: tuple(extra.teams_by_girone[g]) for g in extra.gironi})
+    return TeamRegistry.from_teams(base.season, teams)
+
+
+@pytest.fixture(scope="module")
+def serie_d_state() -> PipelineState:
+    """A simulated perimeter with Serie D initialised: 242 teams, 4 rounds, no history (one joint fit)."""
+    if not SERIE_D:
+        pytest.skip("no competition of family 'Serie D' in config/competitions.toml")
+    return build_state(simulate=True, seed=7, xi=0.0, n_rounds=4, history_seasons=0, registry=serie_d_registry())
+
+
+def test_section_helpers_are_configuration_driven() -> None:
+    """The pure section helpers: families -> sections, slugs, keys, configured competitions, options, status texts."""
+    assert SECTION_BC == "Serie B e Serie C" and SECTION_D == "Serie D" and DEFAULT_SECTION == SECTION_BC
+    assert SECTION_FAMILIES == {SECTION_BC: ("Serie C", "Serie B"), SECTION_D: ("Serie D",)}
+    assert section_of_family("Serie C") == section_of_family("Serie B") == family_label("Serie C") == SECTION_BC
+    assert section_of_family("Serie D") == family_label("Serie D") == SECTION_D
+    assert section_of_family("Eccellenza") == "Eccellenza", "an unknown family is a section of its own"
+    assert section_families(SECTION_BC) == ("Serie C", "Serie B") and section_families(SECTION_D) == ("Serie D",) and section_families("Eccellenza") == ("Eccellenza",)
+    assert section_slug(SECTION_BC) == "bc" and section_slug(SECTION_D) == "d" and section_slug("Lega Pro Élite!") == "lega_pro_lite"
+    assert section_key("matchday") == section_key("matchday", None) == section_key("matchday", SECTION_BC) == "matchday"
+    assert section_key("matchday", SECTION_D) == "matchday_d" and section_key("fixture", "Eccellenza") == "fixture_eccellenza"
+    # configured competitions per section, from config/competitions.toml
+    assert configured_gironi(None) == tuple(Girone) and configured_gironi(SECTION_BC) == (Girone.A, Girone.B, Girone.C, Girone.SB)
+    assert configured_gironi(SECTION_D) == SERIE_D and all(g.family == "Serie D" for g in SERIE_D)
+    assert all(in_section(g, None) for g in Girone) and in_section("A", SECTION_BC) and in_section(Girone.SB, SECTION_BC)
+    assert not in_section(Girone.A, SECTION_D) and (not SERIE_D or in_section(SERIE_D[0], SECTION_D) and not in_section(SERIE_D[0], SECTION_BC))
+    assert competition_options(SECTION_BC) == ("Tutti", "Girone A", "Girone B", "Girone C", "Serie B")
+    assert competition_options(None) == ("Tutti", *(g.short for g in Girone))
+    assert all_sections() == ((SECTION_BC, SECTION_D) if SERIE_D else (SECTION_BC,)) and sections_for([Girone.SB]) == (SECTION_BC,)
+    assert sections_for([]) == ()
+    if SERIE_D:
+        assert [g.value for g in SERIE_D] == ["DA", "DB", "DC", "DD", "DE", "DF", "DG", "DH", "DI"]
+        assert competition_options(SECTION_D) == ("Tutti", "D-A", "D-B", "D-C", "D-D", "D-E", "D-F", "D-G", "D-H", "D-I")
+        assert sections_for(SERIE_D[:1]) == (SECTION_D,) and sections_for([Girone.A, SERIE_D[0]]) == (SECTION_BC, SECTION_D)
+        assert serie_d_harvest_command() == "python -m src.ingestion.footystats --competitions DA DB DC DD DE DF DG DH DI --seasons 3"
+        assert serie_d_harvest_command(SERIE_D[:2]) == "python -m src.ingestion.footystats --competitions DA DB --seasons 3"
+        # the status texts, by counts
+        assert serie_d_status_text(0, 0) == SERIE_D_STATUS_NOT_INITIALISED == "non inizializzata: esegui la raccolta FootyStats con la chiave"
+        assert serie_d_status_text(162, 0) == "inizializzata: 162 squadre, 0 partite nei dati: esegui la raccolta FootyStats con la chiave"
+        assert serie_d_status_text(162, 648, season_label="2026/27") == "inizializzata: 162 squadre, 648 partite della stagione 2026/27"
+        assert serie_d_status_text(162, 648, 81, season_label="2026/27") == "inizializzata: 162 squadre, 648 partite della stagione 2026/27, 81 partite in programma previste"
+    else:
+        assert serie_d_status_text(0, 0) == SERIE_D_STATUS_NOT_CONFIGURED
+
+
+def test_sections_of_the_shipped_perimeter_without_serie_d_teams(sim_state: PipelineState) -> None:
+    """With the shipped dictionaries Serie D has no teams: one section with data, Serie D offered but not ready."""
+    assert sim_state.perimeter_gironi == PERIMETER_GIRONI == (Girone.A, Girone.B, Girone.C, Girone.SB)
+    assert sim_state.families == ("Serie C", "Serie B") and sim_state.family_of("A") == "Serie C" and sim_state.family_of(Girone.SB) == "Serie B"
+    assert sections(sim_state) == (SECTION_BC,)
+    assert section_options(sim_state) == ((SECTION_BC, SECTION_D) if SERIE_D else (SECTION_BC,))
+    assert not sim_state.serie_d_initialised and section_team_count(sim_state, SECTION_D) == 0 and section_team_count(sim_state, SECTION_BC) == 80 == section_team_count(sim_state)
+    assert sim_state.serie_d_status == (SERIE_D_STATUS_NOT_INITIALISED if SERIE_D else SERIE_D_STATUS_NOT_CONFIGURED)
+    assert section_ready(sim_state, SECTION_BC) and section_ready(sim_state) and not section_ready(sim_state, SECTION_D)
+    assert section_gironi(sim_state, SECTION_BC) == PERIMETER_GIRONI and section_gironi(sim_state, SECTION_D) == () and family_gironi(sim_state, "Serie C") == (Girone.A, Girone.B, Girone.C)
+    # restricting to the only section with data changes nothing; restricting to Serie D yields empty views, never errors
+    assert perimeter_text(sim_state, SECTION_BC) == perimeter_text(sim_state) == sim_state.perimeter_text
+    assert section_perimeter_label(sim_state, SECTION_BC) == sim_state.perimeter_label == "Serie C 2026/27 Gironi A/B/C + Serie B (80 squadre)"
+    assert perimeter_text(sim_state, SECTION_D) == "Perimetro: Serie D 2026/27 (nessuna squadra) · 0 partite stagione corrente · 0 partite storiche"
+    assert ranking_table(sim_state, None, SECTION_BC).equals(ranking_table(sim_state, None)) and ranking_table(sim_state, None, SECTION_D).empty
+    assert list(ranking_table(sim_state, None, SECTION_D).columns) == list(RANKING_COLUMNS)
+    assert matchdays(sim_state, SECTION_BC) == sim_state.matchdays == matchdays(sim_state) and matchdays(sim_state, SECTION_D) == []
+    assert matchdays(sim_state, SECTION_BC) is not sim_state.matchdays, "a copy, the state's list is never handed out"
+    assert fixtures_for(sim_state, None, section=SECTION_BC) == fixtures_for(sim_state, None) and fixtures_for(sim_state, None, section=SECTION_D) == []
+    assert section_predictions(sim_state, SECTION_D) == [] and family_predictions(sim_state, "Serie D") == [] and len(family_predictions(sim_state, "Serie B")) == 10
+    assert len(family_predictions(sim_state, "Serie C")) == 30 and len(section_predictions(sim_state, SECTION_BC)) == 40 == len(section_predictions(sim_state))
+    assert resolve_matchday(sim_state, None, SECTION_D) is None and find_matchday(sim_state, sim_state.next_matchday.key, SECTION_D) is None
+    assert value_table(sim_state, 0.0, section=SECTION_BC).equals(value_table(sim_state, 0.0)) and value_table(sim_state, -1.0, section=SECTION_D).empty
+    assert draw_picks_table(sim_state, section=SECTION_BC).equals(draw_picks_table(sim_state)) and btts_picks_table(sim_state, section=SECTION_D).empty
+    assert results_table_for(sim_state, section=SECTION_BC).equals(results_table_for(sim_state)) and results_table_for(sim_state, section=SECTION_D).empty
+    assert traps_table(sim_state, SECTION_BC).equals(traps_table(sim_state)) and traps_table(sim_state, SECTION_D).empty and section_traps(sim_state, SECTION_D) == []
+    assert predictions_table(sim_state, SECTION_BC).equals(predictions_table(sim_state)) and predictions_table(sim_state, SECTION_D).empty
+    assert opportunities_table(sim_state, SECTION_BC).equals(opportunities_table(sim_state)) and section_opportunities(sim_state, SECTION_D) == []
+    assert current_teams(sim_state, section=SECTION_BC) == current_teams(sim_state) and current_teams(sim_state, section=SECTION_D) == []
+    assert results_team_options(sim_state, section=SECTION_D) == [] and seasons_available(sim_state, SECTION_D) == ["2026/27"]
+    assert seasons_available(sim_state, SECTION_BC) == seasons_available(sim_state) == ["2026/27", "2025/26", "2024/25"]
+    assert section_matches(sim_state.matches, SECTION_BC).equals(sim_state.matches) and section_matches(sim_state.matches, SECTION_D).empty
+    assert coverage_text(sim_state, SECTION_BC) == coverage_text(sim_state) == f"Copertura 2026/27: {sim_state.coverage.thinnest:.1f} partite per squadra nella competizione meno coperta"
+    assert coverage_text(sim_state, SECTION_D) == ""
+
+
+@needs_serie_d
+def test_serie_d_state_splits_every_view_by_section(serie_d_state: PipelineState) -> None:
+    """One joint fit, two sections: every table, pick list, matchday and export is restricted to the chosen section."""
+    state = serie_d_state
+    assert state.registry is not None and state.registry.n_teams == 242 and len(state.params.current_teams) == 242
+    assert state.perimeter_gironi == tuple(Girone) and state.families == ("Serie C", "Serie B", "Serie D")
+    assert sections(state) == section_options(state) == (SECTION_BC, SECTION_D)
+    assert state.serie_d_initialised and section_team_count(state, SECTION_D) == 162 and section_team_count(state) == 242
+    assert state.serie_d_status == "inizializzata: 162 squadre, 324 partite della stagione 2026/27, 81 partite in programma previste"
+    assert section_ready(state, SECTION_D) and section_ready(state, SECTION_BC)
+    assert section_gironi(state, SECTION_D) == SERIE_D == family_gironi(state, "Serie D")
+    # perimeter texts: the whole perimeter, and each section on its own
+    assert state.perimeter_label == "Serie C 2026/27 Gironi A/B/C + Serie B + Serie D Gironi A-I (242 squadre)"
+    assert perimeter_text(state, SECTION_BC) == "Perimetro: Serie C 2026/27 Gironi A/B/C + Serie B (80 squadre) · 160 partite stagione corrente · 0 partite storiche"
+    assert perimeter_text(state, SECTION_D) == "Perimetro: Serie D 2026/27 Gironi A-I (162 squadre) · 324 partite stagione corrente · 0 partite storiche"
+    assert section_perimeter_label(state, SECTION_D) == "Serie D 2026/27 Gironi A-I (162 squadre)"
+    # ranking: 242 teams in all, 80 + 162 by section, one girone of Serie D
+    assert len(ranking_table(state, None)) == 242 and len(ranking_table(state, None, SECTION_BC)) == 80 and len(ranking_table(state, None, SECTION_D)) == 162
+    d_ranking = ranking_table(state, None, SECTION_D)
+    assert set(d_ranking["Competizione"]) == {g.short for g in SERIE_D} and len(ranking_table(state, SERIE_D[2])) == 18
+    assert d_ranking["Competizione"].str.startswith("D-").all() and not ranking_table(state, None, SECTION_BC)["Competizione"].str.startswith("D-").any()
+    # matchdays are grouped per section: same weekend, different labels, keys shared, rounds disjoint
+    bc_days, d_days, all_days = matchdays(state, SECTION_BC), matchdays(state, SECTION_D), matchdays(state)
+    assert len(bc_days) == len(d_days) == len(all_days) == 1
+    assert set(bc_days[0].rounds) == set(PERIMETER_GIRONI) and set(d_days[0].rounds) == set(SERIE_D) and set(all_days[0].rounds) == set(Girone)
+    assert "D-A" not in bc_days[0].label and "Girone A" not in d_days[0].label and bc_days[0].key == d_days[0].key
+    assert bc_days[0].n_fixtures == 40 and d_days[0].n_fixtures == 81 and all_days[0].n_fixtures == 121
+    assert resolve_matchday(state, None, SECTION_D) == d_days[0] and find_matchday(state, d_days[0].key, SECTION_D) == d_days[0]
+    assert matchdays(state, SECTION_D) == d_days, "cached per section and returned as a copy"
+    # fixtures, matchday table, predictions
+    assert len(fixtures_for(state, None, section=SECTION_BC)) == 40 and len(fixtures_for(state, None, section=SECTION_D)) == 81 and len(fixtures_for(state, None)) == 121
+    assert all(p.fixture.girone.family == "Serie D" for p in fixtures_for(state, None, section=SECTION_D))
+    assert len(fixtures_for(state, SERIE_D[0], section=SECTION_D)) == 9 and fixtures_for(state, Girone.A, section=SECTION_D) == []
+    assert len(matchday_predictions(state, section=SECTION_D)) == 81 and len(family_predictions(state, "Serie D")) == 81
+    d_table = matchday_table_for(state, section=SECTION_D)
+    assert len(d_table) == 81 and d_table["Competizione"].str.startswith("D-").all() and list(d_table.columns) == list(MATCHDAY_COLUMNS)
+    assert len(matchday_table_for(state, section=SECTION_BC)) == 40 and len(matchday_table_for(state)) == 121
+    assert len(pd.read_csv(io.BytesIO(matchday_csv_bytes(state, section=SECTION_D)))) == 81
+    assert len(predictions_table(state, SECTION_D)) == 81 and predictions_table(state, SECTION_D)["girone"].str.startswith("D").all() and len(predictions_table(state)) == 121
+    # picks are ranked within the section: 5 X / 12 GG of Serie D are Serie D matches, the top P(X) of that section
+    d_draws, d_btts = draw_picks_table(state, section=SECTION_D), btts_picks_table(state, section=SECTION_D)
+    assert len(d_draws) == 5 and len(d_btts) == 12 and d_draws["Competizione"].str.startswith("D-").all() and d_btts["Competizione"].str.startswith("D-").all()
+    top_x = sorted((round(p.probabilities[Market.MATCH_ODDS]["X"] * 100.0, 1) for p in section_predictions(state, SECTION_D)), reverse=True)[:5]
+    assert d_draws["P. Modello (%)"].tolist() == top_x
+    bc_draws = draw_picks_table(state, section=SECTION_BC)
+    assert len(bc_draws) == 5 and not bc_draws["Competizione"].str.startswith("D-").any()
+    assert len(draw_picks_table(state, section=SECTION_D, girone=SERIE_D[1])) == 5 and draw_picks_table(state, section=SECTION_D, girone=SERIE_D[1])["Competizione"].eq(SERIE_D[1].short).all()
+    assert draw_picks_table(state, section=SECTION_BC, girone=SERIE_D[1]).empty, "a competition outside the section has no candidates"
+    # value, traps, results, teams, exports
+    n_bc, n_d, n_all = (len(value_table(state, -1.0, section=s)) for s in (SECTION_BC, SECTION_D, None))
+    assert n_bc + n_d == n_all == len(state.opportunities) and n_d == len(section_opportunities(state, SECTION_D)) == 891
+    assert value_table(state, -1.0, section=SECTION_D)["Competizione"].str.startswith("D-").all()
+    assert len(value_opportunities(state, -1.0, section=SECTION_D, matchday=ALL_MATCHDAYS)) == 891
+    assert len(opportunities_table(state, SECTION_D)) == 891 and len(opportunities_table(state)) == len(state.opportunities)
+    assert len(traps_table(state, SECTION_BC)) + len(traps_table(state, SECTION_D)) == len(traps_table(state)) == len(state.traps)
+    assert all(t.girone.family == "Serie D" for t in section_traps(state, SECTION_D))
+    assert len(results_table_for(state, section=SECTION_D)) == 324 and results_table_for(state, section=SECTION_D)["Competizione"].str.startswith("D-").all()
+    assert len(results_table_for(state, section=SECTION_BC)) == 160 and len(results_table_for(state)) == 484 == state.n_current_matches
+    assert len(results_table_for(state, girone=SERIE_D[0], section=SECTION_D)) == 36 and results_table_for(state, girone=Girone.A, section=SECTION_D).empty
+    assert len(current_teams(state, section=SECTION_D)) == 162 == len(results_team_options(state, section=SECTION_D)) and len(current_teams(state, SERIE_D[0])) == 18
+    assert len(current_teams(state, section=SECTION_BC)) == 80 and len(current_teams(state)) == 242
+    assert seasons_available(state, SECTION_D) == ["2026/27"] and len(section_matches(state.current_matches, SECTION_D)) == 324
+    assert coverage_text(state, SECTION_D) == "Copertura 2026/27: 4.0 partite per squadra nella competizione meno coperta"
+    # the Serie D fixture labels carry the code, the widget keys the section slug
+    assert fixture_label(fixtures_for(state, None, section=SECTION_D)[0]).startswith("[D")
+    assert matchday_table_key(d_days[0], None, SECTION_D) == f"{MATCHDAY_TABLE_KEY_PREFIX}_{d_days[0].key}_all_d"
+    assert dataclasses.replace(state, quotes=[])._section_matchdays == {}, "a copy of the state starts a fresh matchday cache"
+
+
+@needs_serie_d
+def test_app_section_radio_switches_to_serie_d(monkeypatch: pytest.MonkeyPatch) -> None:
+    """With Serie D initialised the sidebar offers two sections; Serie D swaps every selector, table and list to its own data."""
+    from streamlit.testing.v1 import AppTest
+
+    import src.dashboard.state as state_module
+
+    original = state_module.build_state
+    registry = serie_d_registry()
+
+    def serie_d_build_state(**kwargs):
+        return original(registry=registry, **kwargs)
+
+    monkeypatch.setattr(state_module, "build_state", serie_d_build_state)
+    monkeypatch.setenv("SERIEC_FORCE_SIMULATE", "1")
+    monkeypatch.setenv("SERIEC_SIM_ROUNDS", "4")
+    monkeypatch.setenv("SERIEC_HISTORY", "0")
+    monkeypatch.setenv("SERIEC_SEED", "29")  # a cache key no other test uses
+    at = AppTest.from_file(str(APP_PATH), default_timeout=240)
+    at.run()
+    assert not at.exception, [e.value for e in at.exception]
+    radio = at.radio(key="section")
+    assert radio.options == ["Serie B e Serie C", "Serie D"] and radio.value == "Serie B e Serie C"
+    assert at.selectbox(key="girone").options == ["Tutti", "Girone A", "Girone B", "Girone C", "Serie B"]
+    rankings = [d.value for d in at.dataframe if list(d.value.columns) == list(RANKING_COLUMNS)]
+    assert len(rankings) == 1 and len(rankings[0]) == 80, "the default section ranks the 80 Serie B / Serie C teams only"
+    assert len(matchday_table_shown(at)) == 40 and len(at.selectbox(key="fixture").options) == 40
+    assert any("Perimetro: Serie C 2026/27 Gironi A/B/C + Serie B (80 squadre) · 160 partite stagione corrente" in i.value for i in at.sidebar.info)
+    assert any("Serie D: inizializzata: 162 squadre, 324 partite" in i.value for i in at.sidebar.info)
+    assert "matchday" in at.session_state and "matchday_d" not in at.session_state
+
+    # switch to Serie D: competition options, ranking, matchday table, picks, perimeter, keys
+    radio.set_value("Serie D").run()
+    assert not at.exception, [e.value for e in at.exception]
+    assert at.radio(key="section").value == "Serie D"
+    assert at.selectbox(key="girone").options == ["Tutti", "D-A", "D-B", "D-C", "D-D", "D-E", "D-F", "D-G", "D-H", "D-I"] and at.selectbox(key="girone").value == "Tutti"
+    rankings = [d.value for d in at.dataframe if list(d.value.columns) == list(RANKING_COLUMNS)]
+    assert len(rankings) == 1 and len(rankings[0]) == 162 and rankings[0]["Competizione"].str.startswith("D-").all()
+    assert any(h.value.startswith("Classifica di forza · Serie D") for h in at.subheader)
+    assert any("sezione: Serie D" in c.value for c in at.caption)
+    assert any("Perimetro: Serie D 2026/27 Gironi A-I (162 squadre) · 324 partite stagione corrente · 0 partite storiche" in i.value for i in at.sidebar.info)
+    assert any("Perimetro: Serie D 2026/27 Gironi A-I (162 squadre)" in c.value for c in at.caption)
+    d_table = matchday_table_shown(at)
+    assert len(d_table) == 81 and d_table["Competizione"].str.startswith("D-").all()
+    assert matchday_table_element(at).key.endswith("_all_d")
+    fixture_box = at.selectbox(key="fixture_d")
+    assert len(fixture_box.options) == 81 and all(o.startswith("[D") for o in fixture_box.options)
+    assert at.session_state["matchday_d"] == "2026-09-20", "round 5 of Serie D on the first Sunday after four played rounds, under the section's own key"
+    assert "matchday" not in at.session_state, "Streamlit drops the state of the Serie B / Serie C selector while it is not rendered"
+    assert at.selectbox(key="matchday_d").options[0].startswith("Giornata del 20 set 2026 · D-A g.5")
+    assert any("D-A g.5" in c.value and "D-I g.5" in c.value and "Girone A" not in c.value for c in at.caption), "the Serie D matchday label names Serie D rounds only"
+    picks_tables = [d.value for d in at.dataframe if list(d.value.columns) == list(PICKS_COLUMNS)]
+    assert [len(t) for t in picks_tables] == [5, 12] and all(t["Competizione"].str.startswith("D-").all() for t in picks_tables)
+    assert any("Le 5 partite più probabili da X (tutte le competizioni di Serie D)" in m.value for m in at.markdown)
+    assert at.selectbox(key="results_team_d").options[0] == "Tutte" and len(at.selectbox(key="results_team_d").options) == 163
+    assert len(results_table_shown(at)) == 324
+    assert_example_is_the_panel_row(at)
+    assert not any("non inizializzata" in i.value for i in at.info)
+    # one Serie D girone: 9 fixtures of 18 teams, the table widget is its own
+    at.selectbox(key="girone").select("D-C").run()
+    assert not at.exception, [e.value for e in at.exception]
+    assert len(at.selectbox(key="fixture_d").options) == 9 and all(o.startswith("[DC]") for o in at.selectbox(key="fixture_d").options)
+    assert len(matchday_table_shown(at)) == 9 and matchday_table_element(at).key.endswith("_DC_d")
+    assert len(at.selectbox(key="results_team_d").options) == 19 and len(results_table_shown(at)) == 36
+    assert any("vista: D-C" in c.value for c in at.caption)
+    # back to Serie B e Serie C: the competition filter resets (D-C is not an option there), the tables are the old ones
+    at.radio(key="section").set_value("Serie B e Serie C").run()
+    assert not at.exception, [e.value for e in at.exception]
+    assert at.selectbox(key="girone").value == "Tutti" and len(matchday_table_shown(at)) == 40 and len(at.selectbox(key="fixture").options) == 40
+    rankings = [d.value for d in at.dataframe if list(d.value.columns) == list(RANKING_COLUMNS)]
+    assert len(rankings[0]) == 80
+
+
+@needs_serie_d
+def test_app_serie_d_not_initialised_shows_the_notice_in_every_tab(monkeypatch: pytest.MonkeyPatch) -> None:
+    """With the shipped dictionary Serie D has no teams: the section is offered and every tab shows the status and the command."""
+    from streamlit.testing.v1 import AppTest
+
+    monkeypatch.setenv("SERIEC_FORCE_SIMULATE", "1")
+    monkeypatch.setenv("SERIEC_SIM_ROUNDS", "8")
+    at = AppTest.from_file(str(APP_PATH), default_timeout=240)
+    at.run()
+    assert not at.exception, [e.value for e in at.exception]
+    assert at.radio(key="section").options == ["Serie B e Serie C", "Serie D"]
+    assert any("Serie D: non inizializzata: esegui la raccolta FootyStats con la chiave" in i.value for i in at.sidebar.info)
+    at.radio(key="section").set_value("Serie D").run()
+    assert not at.exception, [e.value for e in at.exception]
+    assert at.selectbox(key="girone").options == ["Tutti", "D-A", "D-B", "D-C", "D-D", "D-E", "D-F", "D-G", "D-H", "D-I"]
+    command = "python -m src.ingestion.footystats --competitions DA DB DC DD DE DF DG DH DI --seasons 3"
+    notices = [i.value for i in at.info if command in i.value]
+    assert len(notices) == 6, "one notice per tab (Classifica, Giornata, Risultati, Valore, Selezioni, Export); the Legenda carries its own status line"
+    assert all("Serie D non inizializzata: esegui la raccolta FootyStats con la chiave" in n and "avvia.bat" in n for n in notices)
+    assert any("Sezione Serie D: non inizializzata" in i.value for i in at.info)
+    assert not any(list(d.value.columns) == list(RANKING_COLUMNS) for d in at.dataframe), "no Serie D table is rendered"
+    assert not any(list(d.value.columns) == list(MATCHDAY_COLUMNS) for d in at.dataframe)
+    assert "matchday_d" not in at.session_state and "fixture_d" not in at.session_state
+    assert any("Perimetro: Serie D 2026/27 (nessuna squadra)" in i.value for i in at.sidebar.info)
+    assert any("## Legenda" in m.value for m in at.markdown), "the glossary is still shown"
+    # back to the default section: everything renders as before
+    at.radio(key="section").set_value("Serie B e Serie C").run()
+    assert not at.exception, [e.value for e in at.exception]
+    assert len(matchday_table_shown(at)) == 40 and at.selectbox(key="girone").options == ["Tutti", "Girone A", "Girone B", "Girone C", "Serie B"]

@@ -1,8 +1,8 @@
 {
   "season": "2026/27",
-  "competition": "Serie C Sky Wifi (Gironi A/B/C) + Serie B",
+  "competition": "Serie C Sky Wifi (Gironi A/B/C) + Serie B + Serie D (Gironi A-I, auto-init)",
   "source": "Lega Pro, Comunicato Ufficiale n. 33/L del 29 luglio 2026 (composizione dei gironi di Serie C); Lega B, organico 2026/27 dopo i playoff/playout 2026",
-  "note": "Canonical team names per competition for the CURRENT season (keys = competition codes of config/competitions.toml: A/B/C = Serie C gironi, SB = Serie B). Aliases are the spellings used by FootyStats, SofaScore, FotMob and bookmakers. Only these 80 teams are ranked, predicted and priced; previous seasons are used as history only. A club keeps ONE canonical name across divisions (Pescara relegated from Serie B is 'Pescara' in girone B, Vicenza promoted is 'Vicenza' in SB). The SB composition (20 clubs after the 2026 playoffs/playouts) is from our research and is to be confirmed with the FootyStats league-teams endpoint (python -m src.ingestion.footystats --init-registry, built by the other chain).",
+  "note": "Canonical team names per competition for the CURRENT season (keys = competition codes of config/competitions.toml: A/B/C = Serie C gironi, SB = Serie B). Aliases are the spellings used by FootyStats, SofaScore, FotMob and bookmakers. Only these 80 teams are ranked, predicted and priced; previous seasons are used as history only. A club keeps ONE canonical name across divisions (Pescara relegated from Serie B is 'Pescara' in girone B, Vicenza promoted is 'Vicenza' in SB). The SB composition (20 clubs after the 2026 playoffs/playouts) is from our research and is to be confirmed with the FootyStats league-teams endpoint (python -m src.ingestion.footystats --init-registry, built by the other chain). SERIE D (keys DA..DI, Serie D Gironi A-I, 18 teams each): the objects are EMPTY on purpose and are filled automatically by the FootyStats harvester (auto-init: python -m src.ingestion.footystats, or the GitHub Actions job) from /league-teams the first time it runs with a key covering Serie D; canonical = FootyStats cleanName, aliases = name/english_name/alt_names. Until then the Serie D competitions are listed by TeamRegistry.missing_competitions() and the perimeter counts only the 80 teams present.",
   "gironi": {
     "A": {
       "AlbinoLeffe": ["Albinoleffe", "U.C. AlbinoLeffe"],
@@ -91,6 +91,15 @@
       "Südtirol": ["FC Südtirol", "Sudtirol", "Alto Adige", "FC Sudtirol"],
       "Vicenza": ["LR Vicenza", "L.R. Vicenza", "Lane Rossi Vicenza", "Vicenza Calcio"],
       "Virtus Entella": ["Entella", "Virtus Entella Chiavari"]
-    }
+    },
+    "DA": {},
+    "DB": {},
+    "DC": {},
+    "DD": {},
+    "DE": {},
+    "DF": {},
+    "DG": {},
+    "DH": {},
+    "DI": {}
   }
 }

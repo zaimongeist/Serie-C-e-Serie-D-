@@ -124,7 +124,9 @@ def test_season_bounds_roundtrip_and_validation() -> None:
 def test_default_registry_is_2026_27_with_80_teams(registry: TeamRegistry) -> None:
     assert DEFAULT_SEASON == "2026_27"
     assert registry.season_label == "2026/27" and registry.n_teams == 80
-    assert all(len(registry.teams(g)) == 20 for g in Girone) and registry.gironi == tuple(Girone)
+    assert all(len(registry.teams(g)) == 20 for g in registry.gironi) and registry.gironi == (Girone.A, Girone.B, Girone.C, Girone.SB)
+    # the Serie D gironi are configured but ship empty (filled by the FootyStats auto-init): not part of the perimeter yet
+    assert registry.missing_competitions() == tuple(g for g in Girone if g.family == "Serie D") and registry.teams("DA") == ()
     assert registry.perimeter_label == "Serie C 2026/27 Gironi A/B/C + Serie B (80 squadre)"
     assert list_seasons() == ["2025_26", "2026_27"]
     assert load_registry("2026/27").canonical_names == registry.canonical_names  # label with a slash works too
@@ -197,7 +199,7 @@ def test_simulate_history_composition_and_determinism(history, current, registry
     historical = set(history.teams) - set(registry.canonical_names)
     assert historical and historical <= set(HISTORICAL_TEAMS)
     for label, comp in history.season_registries.items():
-        assert all(len(comp.teams(g)) == 20 for g in Girone), label
+        assert comp.gironi == registry.gironi and all(len(comp.teams(g)) == 20 for g in registry.gironi), label
         assert len(set(comp.canonical_names) - set(registry.canonical_names)) >= 12  # 3 swaps per competition
     # real past compositions: Inter U23 in A (2025/26, absent in 2024/25), Atalanta U23 C/A, Juventus Next Gen B/C,
     # Pescara / Spezia / Reggiana / Bari in Serie B 2025/26, Vicenza / Arezzo / Ascoli / Benevento in Serie C
@@ -223,7 +225,7 @@ def test_simulate_history_composition_and_determinism(history, current, registry
     extra_hist = set(comp.canonical_names) - set(registry.canonical_names)
     assert len(extra_hist) == 4 and extra_hist <= set(HISTORICAL_TEAMS)
     assert sorted(comp.girone_of(t).value for t in extra_hist) == ["B", "SB", "SB", "SB"]
-    assert comp.girone_of("Inter U23") is Girone.A and all(len(comp.teams(g)) == 20 for g in Girone)
+    assert comp.girone_of("Inter U23") is Girone.A and all(len(comp.teams(g)) == 20 for g in registry.gironi)
     assert set(registry.teams("A")) - set(comp.teams("A")) == {"Carpi", "Juventus Next Gen"}
     assert len(set(registry.teams("C")) - set(comp.teams("C"))) == 3  # Bari + Inter U23 (moved) + one dropped
     assert set(registry.teams("SB")) - set(comp.teams("SB")) == {"Arezzo", "Ascoli", "Benevento", "Vicenza", "Cremonese", "Pisa", "Hellas Verona"}
@@ -258,7 +260,7 @@ def test_fit_with_registry_assigns_current_teams_to_registry_girone(fit, registr
     assert table.loc[table["team"] == "Pescara", "girone"].item() == "B" and table.loc[table["team"] == "Vicenza", "girone"].item() == "SB"
     assert table.loc[table["team"] == "Atalanta U23", "girone"].item() == "B"
     assert table.loc[table["team"] == "Juventus Next Gen", "girone"].item() == "A"
-    for g in Girone:
+    for g in registry.gironi:
         assert set(engine.ranking(g)["team"]) == set(registry.teams(g))
     everything = engine.ranking(include_historical=True)
     assert len(everything) == len(params.teams) and set(params.historical_teams) <= set(everything["team"])
@@ -266,9 +268,9 @@ def test_fit_with_registry_assigns_current_teams_to_registry_girone(fit, registr
     # sum(alpha) == 0 per constraint group (registry girone + the historical teams that played most there)
     for g, members in params.teams_by_girone.items():
         assert sum(params.alpha[t] for t in members) == pytest.approx(0.0, abs=1e-6), g
-    assert params.current_teams_by_girone() == {g: tuple(sorted(registry.teams(g))) for g in Girone}
+    assert params.current_teams_by_girone() == {g: tuple(sorted(registry.teams(g))) for g in registry.gironi}
     # gamma is indexed by the girone the match was played in: one per girone, as without a registry
-    assert set(params.gamma) == set(Girone)
+    assert set(params.gamma) == set(registry.gironi)  # the empty Serie D gironi have no home advantage to estimate
 
 
 def test_registry_fit_recovers_current_strengths(fit, current) -> None:
@@ -555,7 +557,7 @@ def test_historical_pool_is_size_safe(caplog: pytest.LogCaptureFixture, registry
     assert any("historical pool exhausted" in rec.getMessage() for rec in caplog.records)
     assert len(history.matches) == 2 * 4 * 380
     for label, comp in history.season_registries.items():
-        assert all(len(comp.teams(g)) == 20 for g in Girone), label
+        assert comp.gironi == old.gironi and all(len(comp.teams(g)) == 20 for g in old.gironi), label
         extra = set(comp.canonical_names) - set(old.canonical_names)
         assert len(extra) >= 12 and not extra & set(old.canonical_names)
     synthetic = {t for t in history.teams if t.startswith(SYNTHETIC_HISTORICAL_PREFIX)}

@@ -2015,7 +2015,7 @@ class Harvester:
             rng=self._rng,
         )
         mapper = _footystats.FootyStatsTeamMapper(self.registry, self.matcher, mapping_path=self.mapping_path)
-        return _footystats.FootyStatsProvider(client, mapper, self.endpoints.footystats)
+        return _footystats.FootyStatsProvider(client, mapper, self.endpoints.footystats, config_dir=self.config_dir)
 
     def _base_url(self, name: str) -> str:
         return self.endpoints.sofascore.base_url if name == SofaScoreProvider.name else self.endpoints.fotmob.base_url
@@ -2023,23 +2023,45 @@ class Harvester:
     def _supports(self, name: str, girone: Girone) -> str | None:
         """Why provider ``name`` cannot serve ``girone`` at all (``None`` when it can).
 
-        SofaScore needs a configured tournament id; FotMob resolves ids at runtime
-        and FootyStats resolves seasons by competition name, so both always qualify.
+        SofaScore needs a tournament id: one configured in ``[sofascore]
+        tournament_ids`` of ``endpoints.toml`` *and* a non-zero
+        ``sofascore_tournament_id`` in ``config/competitions.toml`` (the Serie D
+        gironi have ``0``: unknown, not served). FotMob resolves ids at runtime and
+        FootyStats resolves seasons by competition name, so both serve every
+        competition the configuration marks as theirs
+        (:meth:`~src.common.competitions.Competition.supports_provider`).
         """
+        try:
+            configured = girone.competition.supports_provider(name)
+        except LookupError:  # pragma: no cover - only a hand-built enum lacks the competition table
+            configured = True
+        if not configured:
+            return f"provider {name} does not cover competition {girone.value} (no provider id configured)"
         if name == SofaScoreProvider.name and girone not in self.endpoints.sofascore.tournament_ids:
             return f"no SofaScore tournament id configured for girone {girone.value}"
         return None
 
-    def supported_gironi(self) -> tuple[Girone, ...]:
-        """The competitions at least one configured provider can serve, in configuration order.
+    def supported_gironi(self, provider: str | None = None) -> tuple[Girone, ...]:
+        """The competitions the configured providers can serve, in configuration order.
 
+        With ``provider=None`` a competition qualifies when *at least one* of this
+        facade's providers serves it; with a provider name only that provider is
+        considered (``ValueError`` for a name outside :data:`PROVIDER_NAMES`).
         This is the default of :meth:`harvest_all`: a SofaScore-only installation
         (no FootyStats key) harvests the gironi that have a SofaScore tournament
-        id (the three Serie C gironi) and never records Serie B as a failure,
-        while with the FootyStats provider every competition qualifies. A girone
-        requested explicitly is always attempted and reported.
+        id (the three Serie C gironi) and never records Serie B or Serie D as a
+        failure, while with the FootyStats provider every configured competition
+        (13 with the shipped file) qualifies. A girone requested explicitly is
+        always attempted and reported.
         """
-        return tuple(girone for girone in Girone if any(self._supports(name, girone) is None for name in self.providers))
+        if provider is None:
+            names: tuple[str, ...] = self.providers
+        else:
+            wanted = str(provider).lower()
+            if wanted not in PROVIDER_NAMES:
+                raise ValueError(f"unknown provider {provider!r}; expected one of {PROVIDER_NAMES}")
+            names = (wanted,)
+        return tuple(girone for girone in Girone if any(self._supports(name, girone) is None for name in names))
 
     @staticmethod
     def registry_with_history(registry: TeamRegistry, config_dir: Path = CONFIG_DIR) -> TeamRegistry:
@@ -2096,6 +2118,15 @@ class Harvester:
             return None, exc, provider.client.client_stats()
         finally:
             await provider.client.close()
+        if result.initialised_competitions:
+            # the provider filled empty competitions of the dictionary (Serie D auto-init) and reloaded
+            # its registry: adopt it, so the facade classifies those teams as current, not unmapped
+            self.registry = provider.mapper.registry
+            self.matcher = provider.mapper.matcher
+            log.info(
+                "registry adopted after the FootyStats auto-init",
+                extra={"competitions": list(result.initialised_competitions), "n_teams": self.registry.n_teams},
+            )
         return result, None, provider.client.client_stats()
 
     async def harvest_all(

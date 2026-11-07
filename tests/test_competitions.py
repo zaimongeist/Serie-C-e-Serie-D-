@@ -1,5 +1,6 @@
 """Config-driven competitions: ``config/competitions.toml`` -> dynamic ``Girone`` enum -> registry,
-engine, simulator, console and dashboard (Serie C Gironi A/B/C + Serie B, more leagues later).
+engine, simulator, console and dashboard (Serie C Gironi A/B/C + Serie B + Serie D Gironi A-I; the Serie D
+dictionaries ship empty and are covered in ``tests/test_serie_d.py``).
 """
 from __future__ import annotations
 
@@ -22,6 +23,7 @@ from src.common.competitions import (
     competition,
     competitions_by_family,
     describe_competitions,
+    families,
     find_competition,
     load_competitions,
     normalize_competition_name,
@@ -122,20 +124,22 @@ def sim_state():
 
 
 # ----------------------------------------------------------------------------- configuration file
-def test_shipped_toml_defines_the_four_competitions_in_display_order() -> None:
+def test_shipped_toml_defines_the_thirteen_competitions_in_display_order() -> None:
     assert COMPETITIONS_PATH == Path(competitions_module.CONFIG_DIR) / "competitions.toml" and COMPETITIONS_PATH.is_file()
     loaded = load_competitions(COMPETITIONS_PATH)
     assert loaded == COMPETITIONS == DEFAULT_COMPETITIONS, "the file and the built-in fallback must agree"
-    assert [c.code for c in COMPETITIONS] == ["A", "B", "C", "SB"]
+    assert [c.code for c in COMPETITIONS] == ["A", "B", "C", "SB", "DA", "DB", "DC", "DD", "DE", "DF", "DG", "DH", "DI"]
     sb = competition("SB")
-    assert sb == competition("sb") == Competition("SB", "Serie B", "Serie B", "Italy", "Italy Serie B", 53, 2, "Serie B")
+    assert sb == competition("sb") == Competition("SB", "Serie B", "Serie B", "Italy", "Italy Serie B", 53, 2, "Serie B", {"2024/25": 12621, "2025/26": 15632, "2026/27": 17404})
     assert sb.to_dict()["footystats_name"] == "Italy Serie B" and sb.tier == 2
     assert competition("A").sofascore_tournament_id == 141 and competition("C").footystats_name == "Italy Serie C Group C"
     with pytest.raises(KeyError):
         competition("SA")
-    assert competitions_by_family() == {"Serie C": COMPETITIONS[:3], "Serie B": (COMPETITIONS[3],)}
-    assert describe_competitions() == "Serie C Gironi A/B/C + Serie B"
-    assert describe_competitions(season="2026/27") == "Serie C 2026/27 Gironi A/B/C + Serie B"
+    assert competitions_by_family() == {"Serie C": COMPETITIONS[:3], "Serie B": (COMPETITIONS[3],), "Serie D": COMPETITIONS[4:]}
+    assert families() == ("Serie C", "Serie B", "Serie D")
+    assert describe_competitions() == "Serie C Gironi A/B/C + Serie B + Serie D Gironi A-I"
+    assert describe_competitions(season="2026/27") == "Serie C 2026/27 Gironi A/B/C + Serie B + Serie D Gironi A-I"
+    assert describe_competitions(COMPETITIONS[:4], season="2026/27") == "Serie C 2026/27 Gironi A/B/C + Serie B"
     assert describe_competitions(COMPETITIONS[:3], season="2026/27") == "Serie C 2026/27 Gironi A/B/C"
     assert describe_competitions([COMPETITIONS[3]]) == "Serie B" and describe_competitions([]) == "" and describe_competitions([], season="2026/27") == "2026/27"
 
@@ -144,7 +148,8 @@ def test_custom_toml_with_an_extra_competition_builds_a_fresh_five_member_enum(t
     path = tmp_path / "competitions.toml"
     path.write_text(EXTRA_TOML, encoding="utf-8")
     comps = load_competitions(path)
-    assert [c.code for c in comps] == ["A", "B", "C", "SB", "SA"] and comps[:4] == COMPETITIONS
+    assert [c.code for c in comps] == ["A", "B", "C", "SB", "SA"]
+    assert [c.to_dict() | {"season_ids": {}} for c in comps[:4]] == [c.to_dict() | {"season_ids": {}} for c in COMPETITIONS[:4]]  # no ids in EXTRA_TOML
     fresh = build_girone_enum(comps, name="GironeTest", module=__name__)
     assert issubclass(fresh, CompetitionBase) and fresh is not Girone
     assert [m.value for m in fresh] == ["A", "B", "C", "SB", "SA"] and len(fresh) == 5
@@ -156,7 +161,7 @@ def test_custom_toml_with_an_extra_competition_builds_a_fresh_five_member_enum(t
     with pytest.raises(ValueError):
         Girone.parse(fresh.SA)  # the global configuration has no Serie A
     # the global enum used by every other test is untouched
-    assert [m.value for m in Girone] == ["A", "B", "C", "SB"] and Girone.competitions() == COMPETITIONS
+    assert [m.value for m in Girone] == [c.code for c in COMPETITIONS] and Girone.competitions() == COMPETITIONS
     assert fresh.A is not Girone.A and fresh.A == Girone.A == "A"  # str mixin: equal as strings, distinct members
     assert describe_competitions(comps) == "Serie C Gironi A/B/C + Serie B + Serie A"
     with pytest.raises(ValueError):
@@ -211,7 +216,7 @@ def test_loading_the_shipped_file_is_silent_at_info_level(caplog: pytest.LogCapt
     with caplog.at_level(logging.DEBUG, logger="src.common.competitions"):
         competitions_module._load_or_default(COMPETITIONS_PATH)
     debug = [r for r in caplog.records if r.getMessage() == "competitions loaded"]
-    assert len(debug) == 1 and debug[0].levelno == logging.DEBUG and debug[0].__dict__["codes"] == ["A", "B", "C", "SB"]
+    assert len(debug) == 1 and debug[0].levelno == logging.DEBUG and debug[0].__dict__["codes"] == [c.code for c in COMPETITIONS]
 
 
 # ----------------------------------------------------------------------------- dynamic enum
@@ -274,7 +279,7 @@ def test_girone_parse_rejects_contradictory_spellings(spelling: str) -> None:
 
 
 def test_girone_members_properties_order_and_pickling() -> None:
-    assert [m.value for m in Girone] == ["A", "B", "C", "SB"] == [c.code for c in COMPETITIONS]
+    assert [m.value for m in Girone] == [c.code for c in COMPETITIONS] and [m.value for m in Girone][:4] == ["A", "B", "C", "SB"]
     assert Girone.A.value == "A" and Girone("SB").value == "SB" and Girone.SB.name == "SB"
     assert Girone.A == "A" and str(Girone.SB) == "SB" and Girone.SB in Girone and "SB" in Girone.__members__
     assert Girone.A.label == "Serie C Girone A" and Girone.A.short == "Girone A" and Girone.A.family == "Serie C" and Girone.A.tier == 3
@@ -295,14 +300,14 @@ def test_contracts_accept_serie_b() -> None:
     assert frame["girone"].tolist() == ["SB"]
     raw = pd.DataFrame({"match_id": ["m1", "m2"], "date": ["2026-08-23"] * 2, "round": [1, 1], "girone": ["Serie B", "Italy Serie B"], "home_team": ["a", "c"], "away_team": ["b", "d"], "home_goals": [1, 2], "away_goals": [0, 2]})
     assert validate_matches_df(raw)["girone"].tolist() == ["SB", "SB"]
-    with pytest.raises(ValueError, match=r"expected one of \['A', 'B', 'C', 'SB'\]"):
+    with pytest.raises(ValueError, match=r"expected one of \['A', 'B', 'C', 'SB', 'DA'"):
         validate_matches_df(raw.assign(girone=["A", "SA"]))
 
 
 # ----------------------------------------------------------------------------- registry
 def test_registry_has_80_teams_in_four_competitions_and_a_config_derived_perimeter_label(registry: TeamRegistry) -> None:
     assert registry.n_teams == 80 and registry.gironi == (Girone.A, Girone.B, Girone.C, Girone.SB)
-    assert all(len(registry.teams(g)) == 20 for g in Girone) and len(registry.teams("Serie B")) == 20
+    assert all(len(registry.teams(g)) == 20 for g in registry.gironi) and len(registry.teams("Serie B")) == 20
     assert registry.perimeter_label == "Serie C 2026/27 Gironi A/B/C + Serie B (80 squadre)"
     assert registry.canonical_names[60:] == registry.teams(Girone.SB)  # configuration order: Serie B last
     for team in ("Arezzo", "Ascoli", "Benevento", "Vicenza", "Hellas Verona", "Sampdoria", "Südtirol"):
@@ -412,7 +417,8 @@ def test_dashboard_and_console_name_the_ignored_competition(tmp_path: Path, caps
 
 # ----------------------------------------------------------------------------- simulator + engine
 def test_simulated_league_covers_every_competition_and_the_fit_has_a_separate_serie_b_gamma(registry: TeamRegistry) -> None:
-    assert DEFAULT_HOME_ADVANTAGE["SB"] == 0.25 and default_home_advantage() == {Girone.A: 0.30, Girone.B: 0.22, Girone.C: 0.38, Girone.SB: 0.25}
+    serie_d = {g: 0.25 for g in Girone if g.family == "Serie D"}
+    assert DEFAULT_HOME_ADVANTAGE["SB"] == 0.25 and default_home_advantage() == {Girone.A: 0.30, Girone.B: 0.22, Girone.C: 0.38, Girone.SB: 0.25, **serie_d}
     assert default_home_advantage([Girone.SB]) == {Girone.SB: 0.25} and FALLBACK_HOME_ADVANTAGE == 0.28
     tp = sample_true_params(registry, np.random.default_rng(0))
     assert set(tp.gamma) == set(Girone) and tp.gamma[Girone.SB] == 0.25
@@ -436,7 +442,7 @@ def test_simulated_league_covers_every_competition_and_the_fit_has_a_separate_se
     frame = pd.concat([history.matches, league.matches], ignore_index=True)
     engine = DixonColesEngine(DixonColesConfig(xi=0.0))
     params = engine.fit(frame, registry=registry)
-    assert params.converged and set(params.gamma) == set(Girone) and len(params.teams_by_girone) == 4
+    assert params.converged and set(params.gamma) == set(registry.gironi) and len(params.teams_by_girone) == 4
     assert set(params.current_teams) == set(registry.canonical_names) and len(params.current_teams) == 80
     for g, members in params.teams_by_girone.items():
         assert sum(params.alpha[t] for t in members) == pytest.approx(0.0, abs=1e-6), g

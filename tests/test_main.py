@@ -350,3 +350,123 @@ def test_console_value_table_names_the_bookmaker(tmp_path: Path, capsys: pytest.
     header = next(line for line in table.splitlines() if "book_odds" in line)
     assert header.split().index("bookmaker") == header.split().index("book_odds") - 1
     assert "OtherBook" in table
+
+
+# ============================================================================ sections (--section bc|d|all, --serie-d-demo)
+from src.common.schemas import Girone  # noqa: E402
+from src.dashboard.state import SECTION_BC, SECTION_D, serie_d_gironi  # noqa: E402
+
+SERIE_D = serie_d_gironi()
+needs_serie_d = pytest.mark.skipif(not SERIE_D, reason="no competition of family 'Serie D' in config/competitions.toml")
+DEMO_ARGS = ["--mode", "full", "--rounds", "4", "--history", "0", "--serie-d-demo", "--log-level", "ERROR", "--seed", "7"]
+
+
+@needs_serie_d
+def test_section_d_with_the_demo_registry_prints_the_serie_d_section(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    export = tmp_path / "value.csv"
+    out = pipeline.main([*DEMO_ARGS, "--section", "d", "--export", str(export)])
+    console = capsys.readouterr().out
+    # the joint fit covers the whole perimeter (80 + 162 teams), the printed section is Serie D alone
+    assert out.registry is not None and out.registry.n_teams == 242 and len(out.params.current_teams) == 242
+    assert "Perimetro: Serie C 2026/27 Gironi A/B/C + Serie B + Serie D Gironi A-I (242 squadre)" in console
+    assert "Sezioni: Serie D (--section d)" in console and "Demo Serie D: dizionario sintetico di 9 gironi x 18 squadre" in console
+    assert "SEZIONE SERIE D -- Perimetro: Serie D 2026/27 Gironi A-I (162 squadre) · stagione corrente: 324 partite" in console
+    assert "Serie D inizializzata: 162 squadre, 324 partite della stagione 2026/27." in console
+    assert "SEZIONE SERIE B E SERIE C" not in console and "--- Girone A (" not in console and "--- Serie B (" not in console
+    for g in SERIE_D:
+        assert f"--- {g.short} (18 squadre) ---" in console, g
+    assert console.count("squadre) ---") == 9
+    for section in ("3) RANKING FORZA PER COMPETIZIONE 2026/27 · Serie D", "4) PREVISIONI PROSSIMO TURNO · Serie D", "5) QUOTE BOOKMAKER DE-VIGGATE, EV E KELLY FRAZIONARIO · Serie D", "6) ALERT REGRESSION_TRAP · Serie D", "8) SELEZIONI DI GIORNATA · Serie D", "7) EXPORT · Serie D"):
+        assert section in console, section
+    assert "le 5 partite più probabili da X (tutte le competizioni di Serie D):" in console and "le 12 partite più probabili da GG (tutte le competizioni di Serie D):" in console
+    # the single section is mirrored by the top-level fields: Serie D matchday, picks within Serie D, unsuffixed exports
+    assert list(out.sections) == [SECTION_D] and out.sections[SECTION_D].section == SECTION_D and out.sections[SECTION_D].gironi == SERIE_D
+    assert len(out.matchdays) == 1 and out.next_matchday is not None and out.next_matchday.n_fixtures == 81 and set(out.next_matchday.rounds) == set(SERIE_D)
+    assert "D-A g.5" in out.next_matchday.label and "Girone A" not in out.next_matchday.label
+    assert len(out.matchday_frame) == 81 and out.matchday_frame["Competizione"].str.startswith("D-").all()
+    assert len(out.results_frame) == 324 and out.results_frame["Competizione"].str.startswith("D-").all()
+    assert len(out.draw_picks) == 5 and len(out.btts_picks) == 12 and all(p.girone.family == "Serie D" for p in out.draw_picks + out.btts_picks)
+    assert len(out.predictions) == 121 and len(out.sections[SECTION_D].predictions) == 81 and len(out.sections[SECTION_D].opportunities) == 891
+    assert out.export_path == export and export.exists() and len(pd.read_csv(export)) == len(out.opportunities), "the value report covers the whole perimeter"
+    assert out.matchday_export_path == tmp_path / "value_giornata.csv" and out.picks_export_path == tmp_path / "value_selezioni.csv" and out.results_export_path == tmp_path / "value_risultati.csv"
+    assert len(pd.read_csv(out.matchday_export_path)) == 81 and len(pd.read_csv(out.results_export_path)) == 324
+    assert not (tmp_path / "value_d_giornata.csv").exists(), "one section: no suffix"
+    # the recovery report covers every competition of the perimeter, Serie D included
+    assert out.recovery is not None and len(out.recovery) == 13 and set(out.recovery["girone"]) == {g.value for g in Girone}
+
+
+@needs_serie_d
+def test_section_all_with_the_demo_registry_runs_both_sections_with_suffixed_exports(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    export = tmp_path / "value.csv"
+    out = pipeline.main([*DEMO_ARGS, "--section", "all", "--export", str(export)])
+    console = capsys.readouterr().out
+    assert "Sezioni: Serie B e Serie C, Serie D (--section all)" in console
+    assert console.index("SEZIONE SERIE B E SERIE C -- Perimetro: Serie C 2026/27 Gironi A/B/C + Serie B (80 squadre) · stagione corrente: 160 partite") < console.index("SEZIONE SERIE D -- Perimetro: Serie D 2026/27 Gironi A-I (162 squadre)")
+    assert console.count("3) RANKING FORZA PER COMPETIZIONE") == 2 and console.count("8) SELEZIONI DI GIORNATA") == 2 and console.count("7) EXPORT") == 2
+    assert "--- Girone A (20 squadre) ---" in console and "--- D-I (18 squadre) ---" in console
+    assert list(out.sections) == [SECTION_BC, SECTION_D]
+    bc, d = out.sections[SECTION_BC], out.sections[SECTION_D]
+    assert len(bc.matchday_frame) == 40 and len(d.matchday_frame) == 81 and len(bc.results_frame) == 160 and len(d.results_frame) == 324
+    assert len(bc.draw_picks) == len(d.draw_picks) == 5 and all(p.girone.family != "Serie D" for p in bc.draw_picks) and all(p.girone.family == "Serie D" for p in d.btts_picks)
+    # suffixed CSVs per section, the whole-perimeter value report at --export, no unsuffixed section files
+    assert bc.matchday_export_path == tmp_path / "value_bc_giornata.csv" and d.matchday_export_path == tmp_path / "value_d_giornata.csv"
+    assert bc.picks_export_path == tmp_path / "value_bc_selezioni.csv" and d.results_export_path == tmp_path / "value_d_risultati.csv"
+    assert {p.name for p in tmp_path.iterdir()} == {"value.csv", "value_bc_giornata.csv", "value_bc_selezioni.csv", "value_bc_risultati.csv", "value_d_giornata.csv", "value_d_selezioni.csv", "value_d_risultati.csv"}
+    assert len(pd.read_csv(d.matchday_export_path)) == 81 and pd.read_csv(d.picks_export_path)["Lista"].tolist() == ["X"] * 5 + ["GG"] * 12
+    assert f"tabella giornata scritta in: {d.matchday_export_path}" in console and console.count("report CSV scritto in:") == 1
+    # with several sections the top-level fields describe the whole perimeter and nothing unsuffixed is written
+    assert len(out.matchday_frame) == 121 and len(out.results_frame) == 484 and out.next_matchday is not None and out.next_matchday.n_fixtures == 121
+    assert len(out.draw_picks) == 5 and out.matchday_export_path is None and out.picks_export_path is None and out.results_export_path is None
+    assert out.export_path == export and export.exists()
+    assert pipeline.section_export_stem(export, SECTION_D, multi=True) == tmp_path / "value_d.csv" and pipeline.section_export_stem(export, SECTION_D, multi=False) == export
+    assert pipeline.section_export_stem(export, None, multi=True) == export
+
+
+@needs_serie_d
+def test_section_d_without_initialised_serie_d_prints_the_status_and_the_command(capsys: pytest.CaptureFixture[str]) -> None:
+    """The shipped dictionary has empty Serie D gironi: the console says so and names the harvest command instead of failing."""
+    out = pipeline.main(["--mode", "mini", "--no-export", "--log-level", "ERROR", "--section", "d"])
+    console = capsys.readouterr().out
+    assert "Sezioni: nessuna (--section d)" in console and "SEZIONE SERIE D -- non disponibile" in console
+    assert "Serie D non inizializzata: esegui la raccolta FootyStats con la chiave." in console
+    assert "Comando: python -m src.ingestion.footystats --competitions DA DB DC DD DE DF DG DH DI --seasons 3 (oppure avvia.bat / avvia.command" in console
+    assert "3) RANKING" not in console and "8) SELEZIONI" not in console, "no section ran"
+    # no section ran: the top-level fields describe the whole perimeter (computed, not printed), nothing is exported
+    assert out.sections == {} and len(out.matchdays) == 1 and len(out.draw_picks) == 5 and len(out.matchday_frame) == 7
+    assert out.matchday_export_path is None and out.picks_export_path is None and out.results_export_path is None
+    assert not any("Serie D" in n for n in out.notes), "an uninitialised Serie D is the shipped state, not a data problem: no note, no warning"
+    assert pipeline.registry_serie_d_status(out.registry, out.current_matches) == "non inizializzata: esegui la raccolta FootyStats con la chiave"
+    # --section all (the default) prints the available section and closes with the Serie D note
+    out_all = pipeline.main(["--mode", "mini", "--no-export", "--log-level", "ERROR"])
+    console_all = capsys.readouterr().out
+    assert "Sezioni: Serie B e Serie C (--section all)" in console_all and list(out_all.sections) == [SECTION_BC]
+    assert console_all.index("8) SELEZIONI DI GIORNATA · Serie B e Serie C") < console_all.index("SEZIONE SERIE D -- non disponibile")
+    assert len(out_all.draw_picks) == 5 and out_all.sections[SECTION_BC].draw_picks == out_all.draw_picks
+    # --section bc never mentions Serie D
+    pipeline.main(["--mode", "mini", "--no-export", "--log-level", "ERROR", "--section", "bc"])
+    console_bc = capsys.readouterr().out
+    assert "SEZIONE SERIE D" not in console_bc and "Sezioni: Serie B e Serie C (--section bc)" in console_bc
+
+
+@needs_serie_d
+def test_serie_d_demo_requires_the_simulated_full_mode(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    with pytest.raises(SystemExit) as exc:
+        pipeline.main(["--mode", "mini", "--no-export", "--serie-d-demo"])
+    assert exc.value.code == 2 and "--serie-d-demo vale solo per la lega simulata di --mode full" in capsys.readouterr().err
+    processed = tmp_path / "matches.csv"
+    from src.ingestion.harvester import save_processed
+
+    save_processed(simulate_league(seed=9, n_rounds=4).matches, processed)
+    with pytest.raises(SystemExit) as exc:
+        pipeline.main(["--processed", str(processed), "--no-export", "--mode", "full", "--serie-d-demo"])
+    assert exc.value.code == 2 and "--serie-d-demo" in capsys.readouterr().err
+    # the merged demo registry: the real perimeter plus 18 synthetic clubs per Serie D girone
+    from src.common.teams import load_registry
+
+    merged = pipeline.serie_d_demo_registry(load_registry(), seed=3)
+    assert merged.n_teams == 242 and merged.season_label == "2026/27" and [g.value for g in merged.gironi] == [g.value for g in Girone]
+    assert all(len(merged.teams(g)) == 18 and all(t.startswith("Squadra ") for t in merged.teams(g)) for g in SERIE_D)
+    assert set(merged.teams(Girone.A)) == set(load_registry().teams(Girone.A))
+    assert pipeline.perimeter_banner(merged, pd.DataFrame(columns=["girone"]).astype({"girone": "string"}), pd.DataFrame(columns=["girone"]).astype({"girone": "string"}), SECTION_D).startswith(
+        "Perimetro: Serie D 2026/27 Gironi A-I (162 squadre) · stagione corrente: 0 partite"
+    )

@@ -47,7 +47,7 @@ from scipy.special import gammaln, xlogy
 from src.common.logging_config import get_logger
 from src.common.schemas import Girone, Market, MatchPrediction, season_of, validate_matches_df
 from src.engine.model import DixonColesEngine, FittedParams, tau
-from src.engine.picks import Matchday
+from src.engine.picks import Matchday, in_gironi
 from src.engine.value import (
     FLAG_LONGSHOT,
     FLAG_REGRESSION_TRAP,
@@ -623,6 +623,7 @@ def matchday_table(
     matchday: Matchday | None = None,
     girone: Girone | None = None,
     long: pd.DataFrame | None = None,
+    gironi: Iterable[Girone | str] | None = None,
 ) -> pd.DataFrame:
     """One row per fixture of the matchday: strengths, form, model, markets, best prices, EV and flags.
 
@@ -647,7 +648,9 @@ def matchday_table(
       nothing is quoted;
     * ``match_id`` last, so a UI can map a selected row back to its fixture.
 
-    ``matchday`` keeps only its fixtures, ``girone`` only one competition.
+    ``matchday`` keeps only its fixtures, ``girone`` only one competition and
+    ``gironi`` only a set of competitions (the dashboard section's, see
+    :func:`~src.engine.picks.in_gironi`; ``None`` = every competition).
     ``long`` is a :func:`team_matches` frame built in advance (``matches`` and
     ``as_of`` are then ignored for the form): callers that build several tables
     pass it so the per-team frame is computed once. The form is computed with
@@ -659,10 +662,13 @@ def matchday_table(
     if form_n < 1 or xg_n < 1:
         raise ValueError(f"form_n and xg_n must be >= 1, got {form_n} and {xg_n}")
     g = None if girone is None else Girone.parse(girone)
+    allowed = None if gironi is None else tuple(Girone.parse(x) for x in gironi)
     preds = [
         p
         for p in predictions
-        if (matchday is None or matchday.contains(p)) and (g is None or Girone.parse(p.fixture.girone) == g)
+        if (matchday is None or matchday.contains(p))
+        and (g is None or Girone.parse(p.fixture.girone) == g)
+        and in_gironi(p.fixture.girone, allowed)
     ]
     columns = matchday_columns(form_n, xg_n)
     if not preds:
@@ -748,6 +754,7 @@ def matchday_table(
             "n_trapped": int(frame["Flag"].str.contains(FLAG_REGRESSION_TRAP, regex=False).fillna(False).sum()),
             "matchday": None if matchday is None else matchday.key,
             "girone": None if g is None else g.value,
+            "gironi": None if allowed is None else [x.value for x in allowed],
             "seconds": round(time.perf_counter() - started, 4),
         },
     )
@@ -850,6 +857,7 @@ def results_table(
     season: str | None = None,
     girone: Girone | None = None,
     team: str | None = None,
+    gironi: Iterable[Girone | str] | None = None,
 ) -> pd.DataFrame:
     """One row per **played** match with its statistics and, with ``engine``, the model's view of it.
 
@@ -866,9 +874,11 @@ def results_table(
     matches, so ``P esito`` is an in-sample reading, not a forecast.
 
     ``season`` (``'2026/27'`` or ``'2026_27'``) keeps one season, ``girone`` one
-    competition, ``team`` the matches of one team, home or away -- historical
-    teams included, since they are rows of ``matches`` like any other. Sorted by
-    date descending, then competition order and home team; ``match_id`` last.
+    competition, ``gironi`` a set of competitions (the dashboard section's, see
+    :func:`~src.engine.picks.in_gironi`), ``team`` the matches of one team, home
+    or away -- historical teams included, since they are rows of ``matches``
+    like any other. Sorted by date descending, then competition order and home
+    team; ``match_id`` last.
     """
     df = validate_matches_df(matches)
     if season is not None and len(df):
@@ -876,6 +886,9 @@ def results_table(
         df = df.loc[(df["date"].map(season_of) == wanted).to_numpy(dtype=bool)]
     if girone is not None and len(df):
         df = df.loc[df["girone"] == Girone.parse(girone).value]
+    if gironi is not None and len(df):
+        codes = {Girone.parse(x).value for x in gironi}
+        df = df.loc[df["girone"].isin(codes).to_numpy(dtype=bool)]
     if team is not None and len(df):
         df = df.loc[(df["home_team"] == team) | (df["away_team"] == team)]
     df = df.reset_index(drop=True)
@@ -938,6 +951,7 @@ def results_table(
             "n_matches": len(frame),
             "season": season,
             "girone": None if girone is None else Girone.parse(girone).value,
+            "gironi": None if gironi is None else sorted(Girone.parse(x).value for x in gironi),
             "team": team,
             "with_model": engine is not None,
         },

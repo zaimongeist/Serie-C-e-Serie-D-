@@ -21,10 +21,25 @@ The module is layered like :mod:`src.ingestion.harvester`:
   :class:`TeamRegistry`, persisted in ``config/footystats_teams.json`` so ids map
   deterministically on the next run;
 * :class:`FootyStatsProvider` -- harvests the newest seasons of every requested
-  competition (Serie C gironi ``A``/``B``/``C`` and Serie B ``SB``) into one
-  canonical frame, with the current season's fixtures and their odds, and can
-  seed a team dictionary from ``/league-teams`` (:meth:`init_registry`);
+  competition (Serie C gironi ``A``/``B``/``C``, Serie B ``SB`` and the nine
+  Serie D gironi ``DA`` .. ``DI``) into one canonical frame, with the current
+  season's fixtures and their odds, seeds a team dictionary from
+  ``/league-teams`` (:meth:`init_registry`) and **auto-initialises** the
+  competitions whose dictionary entry is still empty (the Serie D gironi ship
+  without a team list) before harvesting them
+  (``FootyStatsProvider.harvest(auto_init_registry=True)``);
 * a CLI (``python -m src.ingestion.footystats``).
+
+Serie D
+-------
+FootyStats covers the nine Serie D gironi but with thinner statistics: shots
+and xG are often not collected (reported as ``0``/``-1`` and read as missing by
+:func:`parse_stats`) and pre-match odds exist for fewer matches
+(:func:`parse_odds` simply skips the markets without a complete book). The
+season ids of every configured competition (``[competition.season_ids]`` in
+``config/competitions.toml``) are the fallback when ``/league-list`` cannot be
+reached or does not list the league among the account's chosen ones
+(:func:`competition_season_ids`, :meth:`FootyStatsClient.resolve_seasons`).
 
 Competition codes
 -----------------
@@ -112,6 +127,7 @@ __all__ = [
     "SeasonRef",
     "TeamInfo",
     "competition_label",
+    "competition_season_ids",
     "configured_league_names",
     "find_api_key",
     "footystats_league_name",
@@ -132,11 +148,25 @@ __all__ = [
 
 log = get_logger(__name__)
 
-#: Competitions harvested when none is given: every competition of the perimeter, in the
-#: order of ``config/competitions.toml`` (the :class:`~src.common.schemas.Girone` members:
-#: ``A``, ``B``, ``C`` and ``SB`` by default), so a league added to the configuration is
-#: harvested, documented and listed in the key instructions without a code change.
-DEFAULT_COMPETITIONS: Final[tuple[str, ...]] = tuple(str(member.value) for member in Girone)
+def _footystats_members() -> tuple[str, ...]:
+    """Codes of the configured competitions FootyStats can serve (every one with a ``footystats_name``)."""
+    codes: list[str] = []
+    for member in Girone:
+        try:
+            supported = member.competition.supports_provider("footystats")
+        except LookupError:  # pragma: no cover - only a hand-built enum lacks the competition table
+            supported = True
+        if supported:
+            codes.append(str(member.value))
+    return tuple(codes)
+
+
+#: Competitions harvested when none is given: every competition of the perimeter the provider
+#: supports, in the order of ``config/competitions.toml`` (the :class:`~src.common.schemas.Girone`
+#: members: ``A``, ``B``, ``C``, ``SB`` and the Serie D gironi ``DA`` .. ``DI``, 13 by default), so a
+#: league added to the configuration is harvested, documented and listed in the key instructions
+#: without a code change.
+DEFAULT_COMPETITIONS: Final[tuple[str, ...]] = _footystats_members()
 #: ``.env`` file read by :func:`find_api_key` when the environment has no key.
 DEFAULT_ENV_FILE: Final[Path] = ROOT / ".env"
 #: Persisted FootyStats team-id mapping (see :class:`FootyStatsTeamMapper`).
@@ -457,6 +487,30 @@ def configured_league_names(
     return names or list(_FALLBACK_LEAGUE_NAMES.values())
 
 
+def competition_season_ids(code: "Girone | str", endpoints: FootyStatsEndpoints | None = None) -> dict[str, int]:
+    """Known FootyStats season ids of a competition (season label -> id), ``{}`` when none is configured.
+
+    The ``season_ids`` of the :class:`~src.common.competitions.Competition` record
+    (``[competition.season_ids]`` in ``config/competitions.toml``) come first;
+    ``[footystats.season_ids]`` of ``endpoints.toml`` adds the labels the record
+    does not list. These ids are the fallback of
+    :meth:`FootyStatsClient.resolve_seasons`; the live ``/league-list`` always wins.
+    """
+    normalized = normalize_code(code)
+    ids: dict[str, int] = {}
+    if _shared_competition is not None:
+        try:
+            shared = getattr(_shared_competition(normalized), "season_ids", None)
+        except (KeyError, ValueError, LookupError):
+            shared = None
+        if isinstance(shared, Mapping):
+            ids.update({str(label): int(season_id) for label, season_id in shared.items()})
+    if endpoints is not None:
+        for label, season_id in endpoints.known_season_ids(normalized).items():
+            ids.setdefault(str(label), int(season_id))
+    return ids
+
+
 def competition_label(codes: Iterable["Girone | str"]) -> str:
     """Human label of the leagues behind ``codes``: their ``family`` names in configuration order, ``' + '``-joined.
 
@@ -585,10 +639,8 @@ class TeamInfo:
     english_name: str = ""
     alt_names: tuple[str, ...] = ()
 
-    @property
-    def spellings(self) -> tuple[str, ...]:
-        """Distinct non-empty spellings in matching order: clean name, name, english name, alternatives."""
-        ordered = [self.clean_name, self.name, self.english_name, *self.alt_names]
+    @staticmethod
+    def _distinct(ordered: Iterable[str]) -> tuple[str, ...]:
         seen: set[str] = set()
         out: list[str] = []
         for spelling in ordered:
@@ -598,6 +650,22 @@ class TeamInfo:
                 seen.add(key)
                 out.append(text)
         return tuple(out)
+
+    @property
+    def spellings(self) -> tuple[str, ...]:
+        """Distinct non-empty spellings in matching order: clean name, name, english name, alternatives."""
+        return self._distinct([self.clean_name, self.name, self.english_name, *self.alt_names])
+
+    @property
+    def identity_spellings(self) -> tuple[str, ...]:
+        """The spellings that *identify* the club: clean name, name and english name, without ``alt_names``.
+
+        Nicknames in ``alt_names`` are shared between clubs (``'The Blues'`` is
+        Everton's and Chelsea's), so :func:`write_registry_update` never uses them
+        to decide which dictionary entry a FootyStats team is; they are only
+        written as aliases, and only when no other club already answers to them.
+        """
+        return self._distinct([self.clean_name, self.name, self.english_name])
 
     @classmethod
     def from_payload(cls, entry: Mapping[str, Any]) -> "TeamInfo | None":
@@ -831,29 +899,35 @@ class FootyStatsClient:
         """Newest ``seasons`` seasons (label + id) of every competition code, newest first.
 
         Competitions are looked up by :func:`footystats_league_name` among the
-        account's *chosen* leagues; a competition that is not chosen raises
-        :class:`FootyStatsError` naming the leagues to add on footystats.org.
-        When ``/league-list`` itself cannot be reached and ``[footystats.season_ids]``
-        knows every requested competition, the configured ids are used instead
-        (logged as a warning).
+        account's *chosen* leagues. A competition that is **not chosen** falls
+        back to its configured season ids (:func:`competition_season_ids`:
+        ``[competition.season_ids]`` of ``config/competitions.toml``, then
+        ``[footystats.season_ids]`` of ``endpoints.toml``) with a warning naming
+        the league the user should add on footystats.org; only a competition with
+        no configured ids raises :class:`FootyStatsError` with the same advice.
+        When ``/league-list`` itself cannot be reached the configured ids are
+        used for every requested competition (logged as a warning) and the error
+        propagates when one of them has none.
         """
         if int(seasons) < 1:
             raise ValueError("seasons must be >= 1")
         codes = list(dict.fromkeys(normalize_code(code) for code in competition_codes))
         names = {code: footystats_league_name(code, self.endpoints) for code in codes}
         list_url = self.endpoints.url_league_list()
+        fallback = {code: competition_season_ids(code, self.endpoints) for code in codes}
+
+        def from_configured(code: str) -> list[SeasonRef]:
+            return LeagueInfo(names[code], names[code], "", fallback[code]).newest_seasons(seasons)
+
         try:
             leagues = await self.league_list(chosen_only=True)
         except HarvestError as exc:
-            fallback = {code: self.endpoints.known_season_ids(code) for code in codes}
             if codes and all(fallback.values()):
                 log.warning(
                     "league-list unavailable, using configured season ids",
                     extra={"error": self.mask(exc), "competitions": codes},
                 )
-                return {
-                    code: LeagueInfo(names[code], names[code], "", ids).newest_seasons(seasons) for code, ids in fallback.items()
-                }
+                return {code: from_configured(code) for code in codes}
             raise
         by_name = {league.name.casefold(): league for league in leagues}
         out: dict[str, list[SeasonRef]] = {}
@@ -861,6 +935,18 @@ class FootyStatsClient:
         for code in codes:
             league = by_name.get(names[code].casefold())
             if league is None:
+                if fallback[code]:
+                    out[code] = from_configured(code)
+                    log.warning(
+                        "league not among the account's chosen leagues, using configured season ids",
+                        extra={
+                            "competition": code,
+                            "league": names[code],
+                            "seasons": [ref.label for ref in out[code]],
+                            "advice": f"add {names[code]!r} on footystats.org (your account -> Choose leagues)",
+                        },
+                    )
+                    continue
                 missing.append(names[code])
                 continue
             refs = league.newest_seasons(seasons)
@@ -869,13 +955,13 @@ class FootyStatsClient:
             out[code] = refs
         if missing:
             raise FootyStatsError(
-                "competitions not among the account's chosen leagues: "
+                "competitions not among the account's chosen leagues and without configured season ids: "
                 + ", ".join(repr(name) for name in missing)
                 + " -- add them on footystats.org (your account -> Choose leagues) and retry; chosen now: "
                 + ", ".join(sorted(league.name for league in leagues)),
                 url=list_url,
             )
-        return out
+        return {code: out[code] for code in codes if code in out}
 
     async def league_teams(self, season_id: int, *, stable: bool = False) -> list[TeamInfo]:
         """``/league-teams`` of one season (``stable`` for a completed season: long cache TTL)."""
@@ -1270,6 +1356,10 @@ class FootyStatsHarvest:
     ``n_matches_by_season`` the same totals per season. ``failures`` records a
     season that could not be fetched (``"<code>:<season>"``), ``skipped`` a
     competition the schema cannot store yet (code -> reason).
+    ``initialised_competitions`` lists the competitions whose team dictionary was
+    empty and was filled from ``/league-teams`` during this harvest (the Serie D
+    gironi on the first run; see ``FootyStatsProvider.harvest(auto_init_registry=...)``),
+    ``registry_path`` the dictionary file that was written (``None`` when none was).
     """
 
     matches: pd.DataFrame
@@ -1285,6 +1375,8 @@ class FootyStatsHarvest:
     failures: dict[str, str] = field(default_factory=dict)
     skipped: dict[str, str] = field(default_factory=dict)
     provider: str = "footystats"
+    initialised_competitions: tuple[str, ...] = ()
+    registry_path: Path | None = None
 
     def problem_for(self, code: "Girone | str") -> str | None:
         """Why competition ``code`` delivered nothing (``None`` when it delivered)."""
@@ -1324,12 +1416,22 @@ class FootyStatsHarvest:
             f"historical_teams={len(self.historical_teams)} unmapped_teams={len(self.unmapped_teams)} "
             f"requests={self.stats.get('requests', 0)} cache_hits={self.stats.get('cache_hits', 0)} "
             f"retries={self.stats.get('retries', 0)} errors={self.stats.get('errors', 0)} "
-            f"failures={len(self.failures)} skipped={len(self.skipped)}"
+            f"failures={len(self.failures)} skipped={len(self.skipped)} "
+            f"initialised={','.join(self.initialised_competitions) or '-'}"
         )
 
 
 class FootyStatsProvider:
-    """Harvest Serie C gironi and Serie B from FootyStats into the canonical schema."""
+    """Harvest the configured competitions (Serie C gironi, Serie B, Serie D gironi) from FootyStats into the canonical schema.
+
+    ``mapper`` carries the perimeter registry and its matcher. ``config_dir`` is
+    the directory of the ``teams_<season>.json`` dictionaries and
+    ``registry_path`` the file of the perimeter season (by default
+    ``config_dir / teams_<registry season>.json``): :meth:`harvest` writes the
+    team lists of the competitions whose dictionary entry is empty into that file
+    (auto-init) and reloads the registry from it, so tests point both at a
+    temporary copy.
+    """
 
     name: Final[str] = "footystats"
 
@@ -1340,11 +1442,92 @@ class FootyStatsProvider:
         endpoints: FootyStatsEndpoints | None = None,
         *,
         now: Clock | None = None,
+        config_dir: Path = CONFIG_DIR,
+        registry_path: Path | None = None,
     ) -> None:
         self.client = client
         self.mapper = mapper
         self.endpoints = endpoints if endpoints is not None else client.endpoints
         self._now: Clock = now if now is not None else _utc_now
+        self.config_dir = Path(config_dir)
+        self._registry_path = Path(registry_path) if registry_path is not None else None
+
+    @property
+    def registry(self) -> TeamRegistry:
+        """The perimeter registry currently used (replaced after an auto-init)."""
+        return self.mapper.registry
+
+    @property
+    def registry_path(self) -> Path:
+        """``teams_<season>.json`` of the perimeter season (``registry_path`` given to the constructor, else under ``config_dir``)."""
+        if self._registry_path is not None:
+            return self._registry_path
+        return self.config_dir / f"teams_{season_file_stem(str(self.registry.season))}.json"
+
+    # ----------------------------------------------------------- auto-init
+    def _reload_registry(self) -> None:
+        """Rebuild the mapper on the dictionary file just written (same mapping path, older seasons' aliases merged)."""
+        from src.ingestion.harvester import Harvester  # local import keeps the module import graph acyclic
+
+        registry = TeamRegistry.from_json(self.registry_path)
+        matcher = TeamMatcher(Harvester.registry_with_history(registry, self.config_dir))
+        self.mapper = FootyStatsTeamMapper(registry, matcher, mapping_path=self.mapper.mapping_path)
+
+    async def _auto_init_registry(
+        self, codes: Sequence[str], season_refs: Mapping[str, Sequence[SeasonRef]], *, now: datetime
+    ) -> tuple[tuple[str, ...], dict[str, list[TeamInfo]]]:
+        """Fill the dictionary of every competition in ``codes`` that has no current team, from ``/league-teams``.
+
+        The season fetched is the one labelled like the registry season when the
+        competition lists it, else its newest. Returns the codes initialised (in
+        request order) and the team listings fetched, so the harvest of the current
+        season reuses them instead of calling ``/league-teams`` twice. Nothing is
+        written when every competition already has teams; a registry whose season is
+        not a season label (synthetic leagues) is never touched.
+        """
+        registry = self.registry
+        empty = [code for code in codes if not registry.teams(code) and season_refs.get(code)]
+        if not empty:
+            return (), {}
+        try:
+            season_bounds(registry.season_label)
+        except ValueError:
+            log.info(
+                "registry auto-init skipped: the registry season is not a season label",
+                extra={"season": str(registry.season), "competitions": empty},
+            )
+            return (), {}
+        listings: dict[str, list[TeamInfo]] = {}
+        for code in empty:
+            refs = season_refs[code]
+            chosen = next((ref for ref in refs if ref.label == registry.season_label), refs[0])
+            if chosen.label != registry.season_label:
+                log.warning(
+                    "registry auto-init: the registry season is not listed for the competition, using its newest season",
+                    extra={"competition": code, "registry_season": registry.season_label, "season": chosen.label},
+                )
+            listings[code] = await self.client.league_teams(chosen.season_id, stable=season_completed(chosen.label, now.date()))
+        diff = write_registry_update(self.registry_path, registry.season_label, listings, matcher=self.mapper.matcher)
+        self._reload_registry()
+        initialised = tuple(code for code in empty if self.registry.teams(code))
+        log.info(
+            "registry initialised from FootyStats league-teams",
+            extra={
+                "path": str(self.registry_path),
+                "season": registry.season_label,
+                "competitions": list(initialised),
+                "teams": {code: len(self.registry.teams(code)) for code in initialised},
+                "added": {code: len(teams) for code, teams in diff.added_teams.items()},
+                "conflicts": len(diff.conflicts),
+            },
+        )
+        not_filled = [code for code in empty if code not in initialised]
+        if not_filled:
+            log.warning(
+                "registry auto-init left competitions without teams",
+                extra={"competitions": not_filled, "listed_by_footystats": {code: len(listings[code]) for code in not_filled}},
+            )
+        return initialised, listings
 
     # --------------------------------------------------------------- harvest
     async def _harvest_season(
@@ -1355,9 +1538,11 @@ class FootyStatsProvider:
         current: bool,
         with_odds: bool,
         now: datetime,
+        teams: Sequence[TeamInfo] | None = None,
     ) -> tuple[list[MatchRecord], list[Fixture], list[OddsQuote], ParseReport]:
         completed = season_completed(ref.label, now.date())
-        teams = await self.client.league_teams(ref.season_id, stable=completed)
+        if teams is None:
+            teams = await self.client.league_teams(ref.season_id, stable=completed)
         names = self.mapper.names_for(teams, code, ref.label, current=current)
         raw = await self.client.league_matches(ref.season_id, stable=completed)
         report = ParseReport()
@@ -1410,6 +1595,7 @@ class FootyStatsProvider:
         *,
         seasons: int = 3,
         with_odds: bool = True,
+        auto_init_registry: bool = True,
     ) -> FootyStatsHarvest:
         """Harvest the newest ``seasons`` seasons of every competition in ``codes``.
 
@@ -1417,8 +1603,17 @@ class FootyStatsProvider:
         newest season of each competition only. A season that fails is recorded
         in :attr:`FootyStatsHarvest.failures` and the rest is kept; a competition
         the schema cannot store yet is recorded in :attr:`FootyStatsHarvest.skipped`.
-        Raises :class:`HarvestError` when the seasons cannot be resolved at all,
-        or when every season of every competition failed.
+        With ``auto_init_registry`` (the default) every requested competition that
+        has **no current team** in the registry (the Serie D gironi on the first
+        run, or a new season's file) is initialised first: its ``/league-teams``
+        of the registry season are merged into :attr:`registry_path` through
+        :func:`write_registry_update` (canonical = ``cleanName`` unless the
+        dictionaries know the club, aliases = ``name`` / ``english_name`` /
+        ``alt_names``, existing aliases preserved), the registry and the mapper are
+        reloaded and the codes are reported in
+        :attr:`FootyStatsHarvest.initialised_competitions`. Raises
+        :class:`HarvestError` when the seasons cannot be resolved at all, or when
+        every season of every competition failed.
         """
         if int(seasons) < 1:
             raise ValueError("seasons must be >= 1")
@@ -1441,16 +1636,21 @@ class FootyStatsProvider:
         fixtures: list[Fixture] = []
         odds: list[OddsQuote] = []
         last_error: HarvestError | None = None
+        initialised: tuple[str, ...] = ()
+        prefetched: dict[str, list[TeamInfo]] = {}
         if supported:
             season_refs = await self.client.resolve_seasons(supported, seasons=seasons)
+            if auto_init_registry:
+                initialised, prefetched = await self._auto_init_registry(supported, season_refs, now=now)
             for code in supported:
                 refs = season_refs.get(code, [])
                 labels[code] = [ref.label for ref in refs]
                 counts[code] = {}
                 for index, ref in enumerate(refs):
+                    listing = prefetched.get(code) if index == 0 and ref.label == self.registry.season_label else None
                     try:
                         season_records, season_fixtures, season_odds, report = await self._harvest_season(
-                            code, ref, current=index == 0, with_odds=with_odds, now=now
+                            code, ref, current=index == 0, with_odds=with_odds, now=now, teams=listing
                         )
                     except HarvestError as exc:
                         last_error = exc
@@ -1494,6 +1694,8 @@ class FootyStatsProvider:
             n_matches_by_competition=counts,
             failures=failures,
             skipped=skipped,
+            initialised_competitions=initialised,
+            registry_path=self.registry_path if initialised else None,
         )
         log.info("footystats harvest complete", extra={"summary": result.summary()})
         return result
@@ -1538,7 +1740,10 @@ class RegistryDiff:
     competition that FootyStats did not list for it: the function never removes
     them, so they are reported for a manual check (a club that folded, left the
     perimeter or sits in the wrong girone). ``removed_aliases`` is filled only by
-    ``keep_existing_aliases=False``.
+    ``keep_existing_aliases=False``. ``skipped_aliases`` (canonical -> spellings)
+    are FootyStats spellings that were **not** written because another club of
+    the file already answers to them (one normalised spelling must resolve to
+    one club, or the dictionary would not load).
     """
 
     path: Path
@@ -1551,6 +1756,7 @@ class RegistryDiff:
     skipped: dict[str, str]
     unlisted_teams: dict[str, list[str]] = field(default_factory=dict)
     removed_aliases: dict[str, list[str]] = field(default_factory=dict)
+    skipped_aliases: dict[str, list[str]] = field(default_factory=dict)
 
     def describe(self) -> str:
         lines = [f"{'created' if self.created else 'updated'} {self.path} (season {self.season})"]
@@ -1560,6 +1766,11 @@ class RegistryDiff:
             lines.append(f"  new aliases for {len(self.new_aliases)} teams: " + "; ".join(f"{c} <- {', '.join(a)}" for c, a in self.new_aliases.items()))
         if self.removed_aliases:
             lines.append(f"  aliases removed from {len(self.removed_aliases)} teams: " + "; ".join(f"{c} -> {', '.join(a)}" for c, a in self.removed_aliases.items()))
+        if self.skipped_aliases:
+            lines.append(
+                f"  aliases not written for {len(self.skipped_aliases)} teams (spelling already used by another club): "
+                + "; ".join(f"{c}: {', '.join(a)}" for c, a in self.skipped_aliases.items())
+            )
         lines.append(f"  unchanged teams: {self.unchanged_teams}")
         for code, teams in self.unlisted_teams.items():
             lines.append(
@@ -1621,10 +1832,22 @@ def write_registry_update(
     added: dict[str, list[str]] = {}
     new_aliases: dict[str, list[str]] = {}
     removed_aliases: dict[str, list[str]] = {}
+    skipped_aliases: dict[str, list[str]] = {}
     conflicts: dict[str, str] = {}
     skipped: dict[str, str] = {}
     listed_by_code: dict[str, set[str]] = {}
     unchanged = 0
+
+    def spelling_owners() -> dict[str, str]:
+        """Normalised spelling (canonical names and aliases of every competition of the file) -> canonical."""
+        owners: dict[str, str] = {}
+        for members in gironi.values():
+            for canonical_name, alias_list in members.items():
+                owners.setdefault(normalize_name(canonical_name), canonical_name)
+                for alias in alias_list:
+                    owners.setdefault(normalize_name(alias), canonical_name)
+        return owners
+
     for raw_code, teams in teams_by_code.items():
         code = normalize_code(raw_code)
         if not schema_supports(code):
@@ -1632,20 +1855,30 @@ def write_registry_update(
             continue
         group = gironi.setdefault(code, {})
         listed = listed_by_code.setdefault(code, set())
-        existing_norm = {normalize_name(c): c for g in gironi.values() for c in g}
+        owners = spelling_owners()
         for team in teams:
             canonical: str | None = None
+            fuzzy: str | None = None
             if matcher is not None:
-                for spelling in team.spellings:
+                for spelling in team.identity_spellings:
                     result = matcher.match(spelling, None)
-                    if result.canonical is not None:
+                    if result.canonical is None:
+                        continue
+                    if result.method in {"exact", "alias"}:
                         canonical = result.canonical
                         break
+                    if fuzzy is None:
+                        fuzzy = result.canonical
             if canonical is None:
-                for spelling in team.spellings:
-                    canonical = existing_norm.get(normalize_name(spelling))
+                for spelling in team.identity_spellings:
+                    canonical = owners.get(normalize_name(spelling))
                     if canonical is not None:
                         break
+            if canonical is None and fuzzy is not None:
+                # a fuzzy guess is trusted only when it does not clash with a club the file already
+                # places elsewhere: 'Pro Sesto' must not land on 'Pro Patria' and vanish as a conflict
+                if not any(g != code and fuzzy in members for g, members in gironi.items()):
+                    canonical = fuzzy
             if canonical is None:
                 canonical = team.clean_name or team.name
             elsewhere = [g for g, members in gironi.items() if g != code and canonical in members]
@@ -1656,12 +1889,18 @@ def write_registry_update(
             existing_aliases = list(group.get(canonical, []))
             current_aliases = existing_aliases if keep_existing_aliases else []
             known = {normalize_name(canonical), *(normalize_name(a) for a in current_aliases)}
-            fresh = []
+            fresh: list[str] = []
+            refused: list[str] = []
             for spelling in team.spellings:
                 norm = normalize_name(spelling)
-                if spelling != canonical and norm not in known:
-                    known.add(norm)
-                    fresh.append(spelling)
+                if spelling == canonical or norm in known:
+                    continue
+                owner = owners.get(norm)
+                if owner is not None and owner != canonical:
+                    refused.append(spelling)  # another club already answers to this spelling
+                    continue
+                known.add(norm)
+                fresh.append(spelling)
             merged = [*current_aliases, *fresh]
             truly_new = [alias for alias in fresh if alias not in existing_aliases]
             dropped = [alias for alias in existing_aliases if alias not in merged]
@@ -1673,8 +1912,16 @@ def write_registry_update(
                 new_aliases[canonical] = truly_new
             if dropped:
                 removed_aliases[canonical] = dropped
+            if refused:
+                skipped_aliases[canonical] = refused
+                log.warning(
+                    "FootyStats spellings not written as aliases: already used by another club",
+                    extra={"path": str(path), "competition": code, "team": canonical, "spellings": refused},
+                )
             group[canonical] = merged
-            existing_norm[normalize_name(canonical)] = canonical
+            owners[normalize_name(canonical)] = canonical
+            for alias in fresh:
+                owners[normalize_name(alias)] = canonical
     unlisted: dict[str, list[str]] = {}
     for code, listed in listed_by_code.items():
         missing = [name for name in gironi.get(code, {}) if name not in listed and name not in conflicts]
@@ -1685,10 +1932,25 @@ def write_registry_update(
                 extra={"path": str(path), "competition": code, "teams": missing},
             )
     payload["season"] = label
+    # never write a dictionary the registry would refuse to load (the whole app reads it at start-up)
+    try:
+        TeamRegistry.from_mapping(label, gironi)
+    except ValueError as exc:
+        raise ValueError(f"{path}: the updated dictionary would not load, nothing written: {exc}") from exc
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     diff = RegistryDiff(
-        path, label, created, added, new_aliases, unchanged, conflicts, skipped, unlisted_teams=unlisted, removed_aliases=removed_aliases
+        path,
+        label,
+        created,
+        added,
+        new_aliases,
+        unchanged,
+        conflicts,
+        skipped,
+        unlisted_teams=unlisted,
+        removed_aliases=removed_aliases,
+        skipped_aliases=skipped_aliases,
     )
     log.info(
         "team dictionary written",
@@ -1698,6 +1960,7 @@ def write_registry_update(
             "added": {c: len(t) for c, t in added.items()},
             "new_aliases": len(new_aliases),
             "removed_aliases": len(removed_aliases),
+            "skipped_aliases": len(skipped_aliases),
             "unlisted": {c: len(t) for c, t in unlisted.items()},
         },
     )
@@ -1710,7 +1973,11 @@ def write_registry_update(
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m src.ingestion.footystats",
-        description="Harvest Serie C (gironi A/B/C) and Serie B from the official FootyStats API into the canonical CSVs, with pre-match odds.",
+        description=(
+            "Harvest the configured competitions (Serie C gironi A/B/C, Serie B, Serie D gironi A-I) from the official "
+            "FootyStats API into the canonical CSVs, with pre-match odds. Competitions whose team dictionary is still "
+            "empty (Serie D) are initialised from /league-teams first (auto-init)."
+        ),
     )
     parser.add_argument(
         "--competitions",
@@ -1719,7 +1986,13 @@ def _build_parser() -> argparse.ArgumentParser:
         metavar="CODE",
         help="competition codes of config/competitions.toml: "
         + ", ".join(f"{member.value} = {member.label}" for member in Girone)
-        + "; default: %(default)s",
+        + "; default: every configured competition (%(default)s)",
+    )
+    parser.add_argument(
+        "--no-auto-init",
+        action="store_true",
+        help="do not fill the empty competitions of config/teams_<season>.json from /league-teams before harvesting "
+        "(their teams are then harvested as historical, outside the perimeter)",
     )
     parser.add_argument("--seasons", type=int, default=3, help="seasons per competition, newest first (default: %(default)s)")
     parser.add_argument(
@@ -1835,11 +2108,20 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     async def run_harvest() -> int:
         async with client:
-            result = await provider.harvest(codes, seasons=args.seasons, with_odds=not args.no_odds)
+            result = await provider.harvest(
+                codes, seasons=args.seasons, with_odds=not args.no_odds, auto_init_registry=not args.no_auto_init
+            )
         complete = not result.failures and len(result.matches) > 0
         write, reason = _write_decision(result, args.out, allow_partial=args.allow_partial)
         print(result.summary())
-        print(f"perimeter: season {registry.season_label} ({len(registry.canonical_names)} current teams)")
+        perimeter = provider.registry  # reloaded when the auto-init filled competitions
+        print(f"perimeter: season {perimeter.season_label} ({len(perimeter.canonical_names)} current teams)")
+        if result.initialised_competitions:
+            print(
+                "registry initialised: "
+                + ", ".join(f"{code} ({len(perimeter.teams(code))} teams)" for code in result.initialised_competitions)
+                + f" -> {result.registry_path}"
+            )
         print("competitions harvested:")
         for line in result.season_lines() or ["  (none)"]:
             print(line)

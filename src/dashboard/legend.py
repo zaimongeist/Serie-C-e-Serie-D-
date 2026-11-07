@@ -387,23 +387,26 @@ LEGEND: Final[tuple[LegendSection, ...]] = (
         (
             _e(
                 "Giornata",
-                "i turni delle quattro competizioni giocati nello stesso blocco della settimana calcistica: fine settimana "
+                "i turni delle competizioni della sezione scelta (Serie B e i tre gironi di Serie C, oppure i nove gironi di "
+                "Serie D) giocati nello stesso blocco della settimana calcistica: fine settimana "
                 "(venerdì-lunedì) oppure turno infrasettimanale (martedì-giovedì). Ogni turno è ancorato alla data in cui "
                 "si gioca la maggior parte delle sue partite, i numeri di giornata possono differire (Serie B alla 13ª, "
                 "gironi di Serie C alla 14ª) e una competizione che in quel blocco non gioca (Serie B in sosta per le "
                 "nazionali) semplicemente manca dall'etichetta. I recuperi di turni passati (poche partite con un numero di "
-                "giornata vecchio) sono aggregati alla giornata più vicina per data.",
+                "giornata vecchio) sono aggregati alla giornata più vicina per data. Le giornate di Serie D sono raggruppate "
+                "a parte, dal suo calendario: non spostano quelle di Serie B e Serie C.",
             ),
             _e(
                 "Le 5 partite più probabili da X",
-                "fra tutte le partite della giornata di Serie B e Serie C gironi A, B e C, le cinque con la probabilità "
+                "fra tutte le partite della giornata della sezione scelta (Serie B e Serie C gironi A, B e C insieme, oppure "
+                "i nove gironi di Serie D insieme), le cinque con la probabilità "
                 "di pareggio più alta secondo il modello. Ordinate **solo per probabilità**, non per valore: una X al 33% "
                 "a quota 2.90 (EV −4%) sta in lista anche se non conviene. Nota «lambda e mu vicini» = squadre equilibrate, "
                 "«pochi gol attesi» = gara chiusa: entrambe spingono il pareggio.",
             ),
             _e(
                 "Le 12 partite più probabili da GG",
-                "le dodici partite della giornata, sulle quattro competizioni, con la probabilità più alta che entrambe "
+                "le dodici partite della giornata, su tutte le competizioni della sezione, con la probabilità più alta che entrambe "
                 "le squadre segnino. Stesso criterio: solo probabilità del modello. Nota «xG attese alte» = tanti gol "
                 "attesi in totale, «entrambi gli attacchi sopra 1.2 gol attesi» = nessuna delle due dovrebbe restare a "
                 "secco.",
@@ -441,8 +444,21 @@ LEGEND: Final[tuple[LegendSection, ...]] = (
             _e(
                 "Squadre storiche e perimetro",
                 "il perimetro è il dizionario squadre della stagione (config/teams_<stagione>.json): le 80 squadre di "
-                "Serie C A/B/C e Serie B. Una partita in programma con una squadra fuori perimetro o datata in un'altra "
-                "stagione viene saltata e segnalata in «Dettagli pipeline».",
+                "Serie C A/B/C e Serie B, più le 162 di Serie D quando la sezione è inizializzata. Una partita in programma "
+                "con una squadra fuori perimetro o datata in un'altra stagione viene saltata e segnalata in «Dettagli pipeline».",
+            ),
+            _e(
+                "Serie D (sezione dedicata)",
+                "il selettore «Sezione» della sidebar separa Serie B e Serie C da Serie D: nove gironi (A-I) di 18 squadre, "
+                "34 giornate ciascuno, codici DA-DI. La stima Dixon-Coles è unica per tutto il perimetro (le squadre promosse e "
+                "retrocesse collegano le divisioni; fattore campo e Σα = 0 per competizione tengono i gironi confrontabili), ma "
+                "classifica, giornate, risultati, valore, selezioni ed export mostrano solo la sezione scelta e le liste X / GG "
+                "sono calcolate dentro la sezione. Le liste squadre dei gironi non sono nel codice: la prima raccolta FootyStats "
+                "con la chiave le inizializza dall'API (python -m src.ingestion.footystats --competitions DA DB DC DD DE DF DG "
+                "DH DI --seasons 3, oppure avvia.bat), e fino ad allora la sezione mostra solo questo avviso. Le statistiche di "
+                "Serie D su FootyStats sono più povere: xG e tiri spesso mancano (colonne «-», λ e μ restano stimati dai gol), "
+                "senza xG il filtro REGRESSION_TRAP non può scattare, e le quote coprono meno partite (pannello valore in parte "
+                "vuoto): leggi gli EV di Serie D con prudenza ancora maggiore.",
             ),
             _e(
                 "Copertura minima",

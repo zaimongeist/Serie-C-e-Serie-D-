@@ -399,7 +399,7 @@ async def test_league_list_parses_italian_entries(http_cfg: HttpConfig) -> None:
 
 
 @pytest.mark.asyncio
-async def test_resolve_seasons_newest_three_and_missing_competition(http_cfg: HttpConfig) -> None:
+async def test_resolve_seasons_newest_three_and_missing_competition(http_cfg: HttpConfig, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch) -> None:
     client, _ = make_client(http_cfg)
     async with client:
         resolved = await client.resolve_seasons(["A", Girone.SB, "a"], seasons=3)
@@ -413,8 +413,18 @@ async def test_resolve_seasons_newest_three_and_missing_competition(http_cfg: Ht
         with pytest.raises(ValueError, match="unknown competition code"):
             await client.resolve_seasons(["ZZ"])
 
+    # a league that is not among the chosen ones falls back to the configured season ids (competitions.toml) with a warning
     without_serie_b = load_fixture("league_list_sample.json")
     without_serie_b["data"] = [entry for entry in without_serie_b["data"] if entry["name"] != "Italy Serie B"]
+    client, _ = make_client(http_cfg, router=make_router(league_list=without_serie_b))
+    with caplog.at_level(logging.WARNING):
+        async with client:
+            resolved = await client.resolve_seasons(["A", "SB"])
+    assert list(resolved) == ["A", "SB"] and [(r.label, r.season_id) for r in resolved["SB"]] == [("2026/27", 17404), ("2025/26", 15632), ("2024/25", 12621)]
+    warning = next(r for r in caplog.records if r.getMessage() == "league not among the account's chosen leagues, using configured season ids")
+    assert warning.league == "Italy Serie B" and warning.competition == "SB" and "footystats.org" in warning.advice
+    # ... and only a league without configured ids is an error naming what to add on footystats.org
+    monkeypatch.setattr(fs, "competition_season_ids", lambda code, endpoints=None: {})
     client, _ = make_client(http_cfg, router=make_router(league_list=without_serie_b))
     async with client:
         with pytest.raises(fs.FootyStatsError) as caught:
@@ -424,7 +434,7 @@ async def test_resolve_seasons_newest_three_and_missing_competition(http_cfg: Ht
 
 
 @pytest.mark.asyncio
-async def test_resolve_seasons_falls_back_to_configured_ids_when_list_is_down(http_cfg: HttpConfig, endpoints: FootyStatsEndpoints, caplog: pytest.LogCaptureFixture) -> None:
+async def test_resolve_seasons_falls_back_to_configured_ids_when_list_is_down(http_cfg: HttpConfig, endpoints: FootyStatsEndpoints, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch) -> None:
     def list_down(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/league-list":
             return json_response({"error": "down"}, status=503)
@@ -437,7 +447,12 @@ async def test_resolve_seasons_falls_back_to_configured_ids_when_list_is_down(ht
     assert [(r.label, r.season_id) for r in resolved["SB"]] == [("2026/27", 17404), ("2025/26", 15632)]
     assert [(r.label, r.season_id) for r in resolved["A"]] == [("2026/27", 17487), ("2025/26", 15535)]
     assert any("configured season ids" in r.getMessage() for r in caplog.records)
-    bare = FootyStatsEndpoints()  # no configured ids: the error propagates
+    bare = FootyStatsEndpoints()  # no ids in endpoints.toml: those of config/competitions.toml still apply
+    client, _ = make_client(http_cfg, router=list_down, endpoints=bare)
+    async with client:
+        assert [r.season_id for r in (await client.resolve_seasons(["DA"], seasons=3))["DA"]] == [17664, 15710, 13475]
+    assert fs.competition_season_ids("DA", bare) == {"2024/25": 13475, "2025/26": 15710, "2026/27": 17664}
+    monkeypatch.setattr(fs, "competition_season_ids", lambda code, endpoints=None: {})  # no ids anywhere: the error propagates
     client, _ = make_client(http_cfg, router=list_down, endpoints=bare)
     async with client:
         with pytest.raises(HarvestError):
@@ -710,7 +725,7 @@ async def test_harvest_skips_unsupported_codes_and_records_season_failures(provi
 
 
 @pytest.mark.asyncio
-async def test_harvest_without_odds_and_missing_competition_propagates(provider_factory: Callable[..., Any]) -> None:
+async def test_harvest_without_odds_and_missing_competition_propagates(provider_factory: Callable[..., Any], caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch) -> None:
     provider, _ = provider_factory()
     async with provider.client:
         result = await provider.harvest(["A"], seasons=1, with_odds=False)
@@ -719,6 +734,13 @@ async def test_harvest_without_odds_and_missing_competition_propagates(provider_
 
     only_serie_a = load_fixture("league_list_sample.json")
     only_serie_a["data"] = [e for e in only_serie_a["data"] if e["name"] == "Italy Serie A"]
+    provider, _ = provider_factory(router=make_router(league_list=only_serie_a))
+    with caplog.at_level(logging.WARNING):
+        async with provider.client:
+            fallback = await provider.harvest(["A"], seasons=1, with_odds=False)
+    assert len(fallback.matches) == 13 and fallback.seasons == {"A": ["2026/27"]}  # configured season ids, league not chosen
+    assert any("using configured season ids" in r.getMessage() for r in caplog.records)
+    monkeypatch.setattr(fs, "competition_season_ids", lambda code, endpoints=None: {})
     provider, _ = provider_factory(router=make_router(league_list=only_serie_a))
     async with provider.client:
         with pytest.raises(fs.FootyStatsError, match="chosen leagues"):
@@ -976,7 +998,8 @@ def test_cli_harvest_failure_is_masked_and_exit_1(cli_env: CountingTransport, mo
 
 def test_cli_parser_defaults_and_endpoints_section(endpoints: FootyStatsEndpoints) -> None:
     args = fs._build_parser().parse_args([])
-    assert args.competitions == ["A", "B", "C", "SB"] and args.seasons == 3 and args.key is None and not args.no_odds
+    assert args.competitions == list(fs.DEFAULT_COMPETITIONS) == [m.value for m in Girone] and len(args.competitions) == 13
+    assert args.seasons == 3 and args.key is None and not args.no_odds and not args.no_auto_init
     assert args.odds_out == fs.ODDS_DIR / "footystats.csv" and args.mapping == fs.DEFAULT_MAPPING_PATH
     assert endpoints.base_url == "https://api.football-data-api.com" and endpoints.key_env == "FOOTYSTATS_API_KEY"
     assert endpoints.url_league_list() == "https://api.football-data-api.com/league-list"

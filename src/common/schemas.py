@@ -108,7 +108,8 @@ class CompetitionBase(str, Enum):
     :func:`build_girone_enum` derives a concrete enum from a tuple of
     :class:`~src.common.competitions.Competition` records: one member per
     competition, named and valued by its code (``Girone.A.value == 'A'``,
-    ``Girone.SB.value == 'SB'``) in configuration order. Members are plain
+    ``Girone.SB.value == 'SB'``, ``Girone.DA.value == 'DA'`` for Serie D girone
+    A) in configuration order. Members are plain
     strings too (``Girone.A == 'A'``), so frames, JSON payloads and CSV columns
     keep storing the code. The records the enum was built from are reachable
     through :meth:`competitions` and, per member, :attr:`competition`,
@@ -124,11 +125,13 @@ class CompetitionBase(str, Enum):
     def parse(cls, value: "str | CompetitionBase") -> "CompetitionBase":
         """Member for any accepted spelling of a competition.
 
-        The code (``'A'``, ``'SB'``), the labels (``'Girone A'``, ``'Serie B'``,
-        ``'serie_b'``), the FootyStats name (``'Italy Serie B'``) and a code
-        wrapped in filler words (``'Serie C Girone A'``, ``'GIRONE_A'``) are all
-        accepted, case-insensitively; ``'B'`` is always the competition coded
-        ``B`` (Serie C Girone B). A member of another enum built by
+        The code (``'A'``, ``'SB'``, ``'DA'``), the labels (``'Girone A'``,
+        ``'Serie B'``, ``'serie_b'``, ``'Serie D Girone A'``, ``'D-A'``), the
+        FootyStats name (``'Italy Serie B'``, ``'Italy Serie D Group A'``) and a
+        code wrapped in filler words (``'Serie C Girone A'``, ``'GIRONE_A'``) are
+        all accepted, case-insensitively; ``'A'``/``'B'``/``'C'`` are always the
+        Serie C gironi (the competitions with those codes) and ``'D'`` alone is
+        ambiguous and raises. A member of another enum built by
         :func:`build_girone_enum` is matched by its value. ``ValueError`` for an
         unknown spelling.
         """

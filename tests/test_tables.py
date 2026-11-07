@@ -442,3 +442,27 @@ def test_tables_are_fast_on_a_full_league(league: dict) -> None:
     elapsed = time.perf_counter() - started
     assert len(results) == 3480 and results["P esito (%)"].notna().all()
     assert elapsed < 3.0, f"results_table took {elapsed:.2f}s"
+
+
+# ----------------------------------------------------------------------------- competition restriction (dashboard sections)
+def test_tables_restrict_to_a_set_of_competitions(league: dict) -> None:
+    """``gironi`` keeps the fixtures / matches of a set of competitions (the dashboard section); ``None`` keeps every one."""
+    kwargs = dict(params=league["params"], matches=league["current"], opportunities=league["opportunities"], traps=league["traps"])
+    a_and_sb = matchday_table(league["predictions"], gironi=(Girone.A, "SB"), **kwargs)
+    assert len(a_and_sb) == 20 and set(a_and_sb["Competizione"]) == {"Girone A", "Serie B"}
+    assert list(a_and_sb.columns) == list(MATCHDAY_COLUMNS)
+    assert matchday_table(league["predictions"], gironi=None, **kwargs).equals(matchday_table(league["predictions"], **kwargs))
+    only_c = matchday_table(league["predictions"], gironi=["A", "B", "C"], girone=Girone.C, **kwargs)
+    assert len(only_c) == 10 and only_c["Competizione"].eq("Girone C").all(), "girone and gironi both apply"
+    assert matchday_table(league["predictions"], gironi=["SB"], girone=Girone.A, **kwargs).empty, "a competition outside the set has no rows"
+    empty = matchday_table(league["predictions"], gironi=[], **kwargs)
+    assert empty.empty and list(empty.columns) == list(MATCHDAY_COLUMNS)
+    # results: the same restriction on the played matches
+    results = results_table(league["matches"], engine=league["engine"], season="2026/27", gironi=("B", "SB"))
+    assert len(results) == len(league["current"][league["current"]["girone"].isin(["B", "SB"])]) and set(results["Competizione"]) == {"Girone B", "Serie B"}
+    assert results_table(league["matches"], engine=league["engine"], season="2026/27", gironi=None).equals(results_table(league["matches"], engine=league["engine"], season="2026/27"))
+    team = league["sim"].registry.teams(Girone.SB)[0]
+    mine = results_table(league["matches"], season="2026/27", team=team, gironi=["SB"])
+    assert len(mine) == 11 and ((mine["Casa"] == team) | (mine["Ospiti"] == team)).all()
+    assert results_table(league["matches"], season="2026/27", team=team, gironi=["A"]).empty
+    assert list(results_table(league["matches"], gironi=[]).columns) == list(RESULTS_COLUMNS)

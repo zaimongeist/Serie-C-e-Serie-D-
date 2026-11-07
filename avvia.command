@@ -46,8 +46,10 @@ if [ "${1:-}" != "--solo-dashboard" ]; then
     unset FS_KEY
   fi
   if has_footystats_key; then
-    echo ">> Aggiorno i dati reali da FootyStats (Serie C Gironi A/B/C + Serie B, ultime 3 stagioni, quote pre-match)..."
-    HARVEST="python -m src.ingestion.footystats --competitions A B C SB --seasons 3 --odds-out data/odds/footystats.csv"
+    echo ">> Aggiorno i dati reali da FootyStats (Serie C Gironi A/B/C + Serie B + Serie D Gironi A-I, ultime 3 stagioni, quote pre-match)..."
+    echo "   Serie D: alla prima esecuzione le liste squadre dei 9 gironi vengono create in config/teams_2026_27.json dall'API."
+    # Nessun --competitions = tutte le competizioni di config/competitions.toml (13).
+    HARVEST="python -m src.ingestion.footystats --seasons 3 --odds-out data/odds/footystats.csv"
   else
     echo ">> Nessuna chiave FootyStats (FOOTYSTATS_API_KEY o file .env, vedi .env.example): uso SofaScore."
     echo ">> Aggiorno i dati reali (ultime 3 stagioni, Gironi A/B/C). La prima volta serve qualche decina di minuti..."

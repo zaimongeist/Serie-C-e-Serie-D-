@@ -384,7 +384,7 @@ def test_rank_picks_attaches_the_best_book_price() -> None:
 def simulated_predictions() -> tuple[list[MatchPrediction], list[ValueOpportunity]]:
     """Predictions and value rows of the round after 2026-11-06 for the real 2026/27 perimeter (Serie B included)."""
     league = simulate_league(seed=5, as_of=date(2026, 11, 6))
-    assert {f.girone for f in league.fixtures} == set(Girone) and len(league.fixtures) == 40
+    assert {f.girone for f in league.fixtures} == set(league.registry.gironi) == {Girone.A, Girone.B, Girone.C, Girone.SB} and len(league.fixtures) == 40
     engine = DixonColesEngine(DixonColesConfig.with_gaussian_prior(xi=0.0))
     engine.fit(league.matches, registry=league.registry)
     predictions = [engine.predict(f) for f in league.fixtures]
@@ -414,7 +414,7 @@ def test_draw_and_btts_picks_sizes_and_mixed_competitions(simulated_predictions)
     assert [p.p_model for p in draws] == pytest.approx(top_x)
     # a matchday restricts the candidates
     day = next_matchday([p.fixture for p in predictions])
-    assert day is not None and day.n_fixtures == 40 and day.rounds == {g: 12 for g in Girone}
+    assert day is not None and day.n_fixtures == 40 and day.rounds == {g: 12 for g in (Girone.A, Girone.B, Girone.C, Girone.SB)}
     assert draw_picks(predictions, matchday=day) == draw_picks(predictions)
     half = Matchday("x", "x", day.start, day.end, {"A": 12}, frozenset(p.match_id for p in predictions if p.fixture.girone == Girone.A))
     only_a = btts_picks(predictions, n=12, matchday=half)
@@ -584,3 +584,35 @@ def test_pick_example_row_prefers_an_ordinary_value_row() -> None:
     assert pick_example_row([suspicious, longshot]) is suspicious  # every row is flagged: the first one, as shown
     assert pick_example_row([]) is None
     assert pick_example_row(()) is None
+
+
+# ----------------------------------------------------------------------------- competition restriction (dashboard sections)
+def test_gironi_restriction_groups_and_ranks_within_a_set_of_competitions(simulated_predictions) -> None:
+    """``gironi`` restricts matchdays and picks to a set of competitions (the dashboard section), ``None`` means every one."""
+    from src.engine.picks import in_gironi
+
+    predictions, opportunities = simulated_predictions
+    fixtures = [p.fixture for p in predictions]
+    assert in_gironi("A", None) and in_gironi(Girone.A, ["A", "SB"]) and in_gironi("SB", (Girone.SB,)) and not in_gironi(Girone.B, ["A", "SB"])
+    assert not in_gironi(Girone.A, []), "an empty restriction allows nothing"
+    # matchdays of one competition: same key as the whole round, label and rounds of that competition only
+    whole = matchdays(fixtures)
+    only_a = matchdays(fixtures, gironi=[Girone.A])
+    serie_c = matchdays(fixtures, gironi=("A", "B", "C"))
+    assert len(whole) == len(only_a) == len(serie_c) == 1 and only_a[0].key == whole[0].key == serie_c[0].key
+    assert only_a[0].rounds == {Girone.A: 12} and only_a[0].n_fixtures == 10 and only_a[0].label.endswith("· Girone A g.12")
+    assert set(serie_c[0].rounds) == {Girone.A, Girone.B, Girone.C} and serie_c[0].n_fixtures == 30 and "Serie B" not in serie_c[0].label
+    assert matchdays(fixtures, gironi=[]) == [] and matchdays(fixtures, gironi=None) == whole
+    assert next_matchday(fixtures, gironi=["SB"]) is not None and next_matchday(fixtures, gironi=["SB"]).rounds == {Girone.SB: 12}
+    # picks within a set of competitions: the top P(X) of those competitions, never a Serie B match
+    draws_c = draw_picks(predictions, opportunities=opportunities, gironi=["A", "B", "C"])
+    assert len(draws_c) == 5 and {p.girone for p in draws_c} <= {Girone.A, Girone.B, Girone.C}
+    top_x_c = sorted((p.probabilities[Market.MATCH_ODDS]["X"] for p in predictions if p.fixture.girone != Girone.SB), reverse=True)[:5]
+    assert [p.p_model for p in draws_c] == pytest.approx(top_x_c)
+    btts_sb = btts_picks(predictions, n=12, opportunities=opportunities, gironi=[Girone.SB])
+    assert len(btts_sb) == 10 and all(p.girone is Girone.SB and p.book_odds is not None for p in btts_sb)
+    assert rank_picks(predictions, market=Market.MATCH_ODDS, selection="X", n=5, gironi=[]) == []
+    assert rank_picks(predictions, market=Market.MATCH_ODDS, selection="X", n=5, gironi=None) == draw_picks(predictions)
+    # combined with a matchday: both restrictions apply
+    day = next_matchday(fixtures)
+    assert draw_picks(predictions, matchday=day, gironi=["A"]) == draw_picks([p for p in predictions if p.fixture.girone is Girone.A], matchday=day)

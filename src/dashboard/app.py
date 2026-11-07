@@ -36,6 +36,22 @@ defaults instead of crashing the page; should the pipeline itself refuse a
 valid-looking combination (``ValueError``), the page shows the error and falls
 back to the default season, calendar and seed.
 
+Sections
+--------
+The sidebar radio *Sezione* (key ``'section'``) splits the page into the
+sections of :mod:`src.dashboard.state`: *Serie B e Serie C* (default) and
+*Serie D*. The Dixon-Coles fit is one for the whole perimeter; every tab,
+selector, table, pick list, export and the perimeter text are restricted to the
+selected section, the picks (5 X / 12 GG) are ranked within it and the
+matchdays are grouped from its own fixtures. The *Competizione* selector lists
+*Tutti* plus the section's competitions; the matchday, fixture and filter
+widgets have per-section keys (:func:`src.dashboard.state.section_key`), so
+switching section starts from that section's defaults. When Serie D is
+configured but not yet initialised (its gironi are filled by the FootyStats
+harvester from the API, never shipped with the code) every tab shows one notice
+with :attr:`~src.dashboard.state.PipelineState.serie_d_status` and the exact
+command to run.
+
 The heavy work (load/simulate, fit, predict, value) lives in
 :mod:`src.dashboard.state` and is cached with ``st.cache_resource`` keyed on
 the sidebar parameters; this module only composes the widgets. Full-width
@@ -78,24 +94,31 @@ from src.dashboard.legend import (
 from src.dashboard.state import (
     ALL_MATCHDAYS,
     DEFAULT_HISTORY_SEASONS,
+    DEFAULT_SECTION,
     MATCHDAY_TABLE_KEY_PREFIX,
     MAX_HISTORY_SEASONS,
     MIN_SIM_ROUNDS,
+    SECTION_D,
     Matchday,
     PipelineState,
     btts_picks_table,
     build_state,
+    competition_options,
+    coverage_text,
     draw_picks_table,
     export_csv_bytes,
     find_matchday,
     fixture_label,
     fixtures_for,
     heatmap_figure,
+    in_section,
     markets_table,
     matchday_table_for,
     matchday_table_key,
+    matchdays,
     no_odds_message,
     opportunities_table,
+    perimeter_text,
     picks_csv_bytes,
     predictions_table,
     quotes_for,
@@ -103,7 +126,16 @@ from src.dashboard.state import (
     results_table_for,
     results_team_options,
     seasons_available,
+    section_key,
+    section_opportunities,
+    section_options,
+    section_predictions,
+    section_ready,
+    section_slug,
+    section_traps,
     selected_row_match_id,
+    serie_d_gironi,
+    serie_d_harvest_command,
     strength_figure,
     traps_table,
     value_opportunities,
@@ -114,11 +146,18 @@ from src.engine.tables import DEFAULT_FORM_N, DEFAULT_XG_N
 
 log = get_logger(__name__)
 
-#: Competition selector: *Tutti* plus the short label of every configured competition
-#: (``'Girone A'``, ``'Girone B'``, ``'Girone C'``, ``'Serie B'`` with the shipped ``config/competitions.toml``).
-GIRONE_OPTIONS: Final[tuple[str, ...]] = ("Tutti", *(g.short for g in Girone))
-#: Competitions named in the sidebar caption, e.g. ``'Serie C Gironi A/B/C + Serie B'``.
+#: Competition selector of the whole perimeter: *Tutti* plus the short label of every configured competition
+#: (``'Girone A'``, ..., ``'Serie B'``, ``'D-A'``, ..., ``'D-I'`` with the shipped ``config/competitions.toml``). The
+#: sidebar shows the subset of the selected section, :func:`src.dashboard.state.competition_options`.
+GIRONE_OPTIONS: Final[tuple[str, ...]] = competition_options(None)
+#: Competitions named in the sidebar caption, e.g. ``'Serie C Gironi A/B/C + Serie B + Serie D Gironi A-I'``.
 COMPETITIONS_TEXT: Final[str] = describe_competitions()
+#: ``st.session_state`` keys of the sidebar *Sezione* radio and *Competizione* selectbox (shared by the sections:
+#: a competition of another section is not a valid option, so switching section falls back to *Tutti*).
+SECTION_STATE_KEY: Final[str] = "section"
+GIRONE_STATE_KEY: Final[str] = "girone"
+#: Launchers that run the FootyStats harvester with the key in ``.env`` (named in the Serie D notice).
+LAUNCHERS_HINT: Final[str] = "avvia.bat (Windows) / avvia.command (macOS)"
 KELLY_OPTIONS: Final[dict[str, float]] = {"1/8": 0.125, "1/4": 0.25}
 #: Played rounds the dashboard simulated before the calendar-anchored league; kept for compatibility,
 #: the default is now ``None`` (rounds derived from ``SERIEC_AS_OF``/today).
@@ -130,7 +169,9 @@ HEATMAP_MIN_GOALS: Final[int] = 3
 FULL_WIDTH: Final[dict[str, dict[str, object]]] = {
     name: container_width_kwargs(getattr(st, name)) for name in ("button", "download_button", "dataframe", "plotly_chart")
 }
-#: ``st.session_state`` key holding the selected matchday's :attr:`Matchday.key`, shared by the Match, Value and Picks tabs.
+#: ``st.session_state`` key holding the selected matchday's :attr:`Matchday.key`, shared by the Match, Value and Picks
+#: tabs. Like every per-section key below it is the bare name for the default section and gets the section slug
+#: appended for the others (``'matchday_d'``, see :func:`src.dashboard.state.section_key`).
 MATCHDAY_STATE_KEY: Final[str] = "matchday"
 #: ``st.session_state`` key of the value panel's "every matchday" checkbox, read again by the Legenda tab.
 VALUE_ALL_MATCHDAYS_KEY: Final[str] = "value_all_matchdays"
@@ -288,78 +329,161 @@ def selected_girone(label: str) -> Girone | None:
     return None if label == "Tutti" else Girone.parse(label)
 
 
-def selected_matchday(state: PipelineState) -> Matchday | None:
-    """The matchday the three matchday-aware tabs agree on, read from (and written to) ``st.session_state``.
+def selected_matchday(state: PipelineState, section: str | None = None) -> Matchday | None:
+    """The matchday of ``section`` the three matchday-aware tabs agree on, read from (and written to) ``st.session_state``.
 
     The *Selezioni di giornata* tab owns the ``Giornata`` selectbox (key
-    :data:`MATCHDAY_STATE_KEY`), but *Giornata* and *Opportunità di
-    Valore* are rendered before it in the same script run, so the choice is
-    read from the session state here, once, before any tab renders: a missing
-    or stale key (the state was recomputed and that matchday no longer exists)
-    is replaced by the next matchday's key, which also seeds the selectbox
-    without passing it an ``index``. ``None`` when the state has no matchday.
+    :data:`MATCHDAY_STATE_KEY` scoped to the section), but *Giornata* and
+    *Opportunità di Valore* are rendered before it in the same script run, so
+    the choice is read from the session state here, once, before any tab
+    renders: a missing or stale key (the state was recomputed and that matchday
+    no longer exists) is replaced by the next matchday's key, which also seeds
+    the selectbox without passing it an ``index``. The matchdays are the
+    section's own (:func:`src.dashboard.state.matchdays`). ``None`` when the
+    section has no matchday.
     """
-    if not state.matchdays:
-        st.session_state.pop(MATCHDAY_STATE_KEY, None)
+    key = section_key(MATCHDAY_STATE_KEY, section)
+    days = matchdays(state, section)
+    if not days:
+        st.session_state.pop(key, None)
         return None
-    chosen = find_matchday(state, st.session_state.get(MATCHDAY_STATE_KEY))
+    chosen = find_matchday(state, st.session_state.get(key), section)
     if chosen is None:
-        chosen = state.matchdays[0]
-        st.session_state[MATCHDAY_STATE_KEY] = chosen.key
+        chosen = days[0]
+        st.session_state[key] = chosen.key
     return chosen
 
 
 # =============================================================================
 # Sidebar
 # =============================================================================
-def render_sidebar() -> tuple[Girone | None, float, float, float]:
-    """Controls; returns ``(girone, min_ev_fraction, kelly_fraction, bankroll_units)``."""
+def render_sidebar() -> tuple[st.delta_generator.DeltaGenerator, float, float, float]:
+    """Parameter controls; returns ``(section controls container, min_ev_fraction, kelly_fraction, bankroll_units)``.
+
+    The *Sezione* radio and the *Competizione* selectbox need the pipeline state
+    (which sections have teams), which in turn needs the EV / Kelly / bankroll
+    parameters rendered here; so this function only reserves their place at the
+    top of the sidebar (an empty container) and :func:`render_section_controls`
+    fills it once the state is known. Streamlit renders containers where they
+    were created, so the two selectors stay above the sliders.
+    """
     with st.sidebar:
         st.title("⚽ Serie C Quant Lab")
         st.caption(f"Modello Dixon-Coles per {COMPETITIONS_TEXT} e ricerca di valore atteso (+EV) contro le quote dei bookmaker.")
-        girone_label = st.selectbox("Competizione", GIRONE_OPTIONS, index=0, key="girone", help="Filtra classifica, partite e opportunità per competizione (girone di Serie C o Serie B).")
+        controls = st.container()
         ev_pct = st.slider("Soglia EV minima (%)", min_value=0.0, max_value=15.0, value=3.5, step=0.5, key="min_ev_pct", help="Una selezione è di valore quando P_modello × Quota − 1 supera questa soglia.")
         kelly_label = st.radio("Frazione di Kelly", list(KELLY_OPTIONS), index=0, horizontal=True, key="kelly", help="Quota del Kelly pieno da puntare.")
         bankroll = st.number_input("Bankroll (unità)", min_value=1.0, max_value=1_000_000.0, value=100.0, step=10.0, key="bankroll", help="100 unità = ogni unità vale l'1% del bankroll.")
         if st.button("Ricalcola", key="recompute", help="Svuota la cache e riesegue la pipeline.", **FULL_WIDTH["button"]):
             st.cache_resource.clear()
             st.rerun()
-    return selected_girone(girone_label), float(ev_pct) / 100.0, KELLY_OPTIONS[kelly_label], float(bankroll)
+    return controls, float(ev_pct) / 100.0, KELLY_OPTIONS[kelly_label], float(bankroll)
 
 
-def render_source_badge(container: st.delta_generator.DeltaGenerator, state: PipelineState) -> None:
-    """Data-source badge: perimeter (season, teams, current vs historical matches) and fit diagnostics."""
+def render_section_controls(container: st.delta_generator.DeltaGenerator, state: PipelineState) -> tuple[str, Girone | None]:
+    """The *Sezione* radio and the *Competizione* selectbox; returns ``(section, girone)`` (``girone=None`` for *Tutti*).
+
+    The radio (key :data:`SECTION_STATE_KEY`) offers
+    :func:`src.dashboard.state.section_options`: *Serie B e Serie C* first and
+    by default, *Serie D* when it is configured (also before its gironi are
+    initialised, so the page can say how to initialise it). The selectbox (key
+    :data:`GIRONE_STATE_KEY`) lists *Tutti* plus the section's competitions; a
+    stored choice that is not an option any more (another section's
+    competition) is dropped first, so the widget falls back to *Tutti* instead
+    of raising.
+    """
+    options = list(section_options(state))
+    with container:
+        if st.session_state.get(SECTION_STATE_KEY) not in options:
+            st.session_state.pop(SECTION_STATE_KEY, None)
+        section = str(
+            st.radio(
+                "Sezione",
+                options,
+                index=0,
+                key=SECTION_STATE_KEY,
+                horizontal=True,
+                help=(
+                    "Serie B e Serie C (gironi A/B/C) oppure Serie D (gironi A-I): ogni tab, selettore, tabella, lista e "
+                    "export mostra solo la sezione scelta. La stima Dixon-Coles resta unica per tutto il perimetro."
+                ),
+            )
+        )
+        comp_options = list(competition_options(section))
+        if st.session_state.get(GIRONE_STATE_KEY) not in comp_options:
+            st.session_state.pop(GIRONE_STATE_KEY, None)
+        girone_label = str(
+            st.selectbox(
+                "Competizione",
+                comp_options,
+                index=0,
+                key=GIRONE_STATE_KEY,
+                help="Filtra classifica, partite e opportunità per competizione della sezione (girone di Serie C, Serie B o girone di Serie D).",
+            )
+        )
+    return section, selected_girone(girone_label)
+
+
+def render_source_badge(container: st.delta_generator.DeltaGenerator, state: PipelineState, section: str | None = None) -> None:
+    """Data-source badge: the section's perimeter (season, teams, current vs historical matches), fit diagnostics, Serie D status."""
     params = state.params
     body = (
-        f"**{state.perimeter_text}**  \n"
-        f"{state.n_matches} partite nel fit · **{state.n_fixtures}** partite in programma · "
+        f"**{perimeter_text(state, section)}**  \n"
+        f"{state.n_matches} partite nel fit (stima congiunta di tutto il perimetro) · "
+        f"**{len(section_predictions(state, section))}** partite in programma · "
         f"{state.n_historical_teams} squadre storiche escluse  \n"
         f"Fit: {params.method} · LL {params.log_likelihood:.1f}  \n"
         f"Convergenza: {'sì' if params.converged else 'no'} · {params.fit_seconds:.2f} s  \n"
         f"Prior gaussiana: {'attiva' if state.prior_enabled else 'disattivata'}"
     )
-    if state.coverage is not None:
-        body += f"  \nCopertura {state.season_label}: {state.coverage.thinnest:.1f} partite per squadra nella competizione meno coperta"
-        if state.coverage.ignored:
-            body += f" · {state.coverage.describe_ignored()}"
+    coverage = coverage_text(state, section)
+    if coverage:
+        body += f"  \n{coverage}"
+    if serie_d_gironi():
+        body += f"  \nSerie D: {state.serie_d_status}"
     if state.source == "processed":
         container.success(f"**Dati reali** (data/processed)  \n{body}", icon="✅")
     else:
         container.info(f"**Dati simulati** (generatore sintetico)  \n{body}", icon="🧪")
 
 
+def render_section_notice(state: PipelineState, section: str) -> bool:
+    """One ``st.info`` when the section has nothing fitted; returns ``True`` when the tab should stop there.
+
+    For Serie D the notice carries :attr:`~src.dashboard.state.PipelineState.serie_d_status`
+    and the exact command that initialises the gironi and harvests their data
+    (:func:`src.dashboard.state.serie_d_harvest_command`), or the launchers.
+    """
+    if section_ready(state, section):
+        return False
+    if section == SECTION_D:
+        st.info(
+            f"Serie D {state.serie_d_status}. Comando: `{serie_d_harvest_command()}` — oppure {LAUNCHERS_HINT} con la chiave "
+            "FootyStats in .env. La prima raccolta inizializza i nove gironi (18 squadre ciascuno, 34 giornate) in "
+            f"config/teams_{state.season_label.replace('/', '_')}.json dalle liste squadre dell'API; poi la sezione mostra "
+            "classifica, giornate, risultati, valore e selezioni come quella di Serie B e Serie C.",
+            icon="ℹ️",
+        )
+    else:
+        st.info(f"Sezione {section}: nessuna squadra del perimetro {state.season_label} con partite nei dati.", icon="ℹ️")
+    return True
+
+
 # =============================================================================
 # Tabs
 # =============================================================================
-def render_ranking_tab(state: PipelineState, girone: Girone | None) -> None:
-    st.subheader("Classifica di forza (parametri Dixon-Coles)")
+def render_ranking_tab(state: PipelineState, girone: Girone | None, section: str = DEFAULT_SECTION) -> None:
+    """*Classifica Forza*: the strength ranking of the section (one competition with ``girone``) and its α/β charts."""
+    st.subheader(f"Classifica di forza · {section}")
+    if render_section_notice(state, section):
+        return
     st.caption(
-        "α = forza offensiva, β = solidità difensiva (più alto = subisce meno), γ = vantaggio casa della competizione; indici = exp(parametro). "
-        f"Solo le squadre del perimetro {state.season_label} ({state.perimeter_label}) nella competizione del dizionario corrente; "
+        "Parametri Dixon-Coles: α = forza offensiva, β = solidità difensiva (più alto = subisce meno), γ = vantaggio casa della competizione; indici = exp(parametro). "
+        f"Solo le squadre del perimetro {state.season_label} ({perimeter_text(state, section).removeprefix('Perimetro: ').split(' · ')[0]}) nella competizione del dizionario corrente; "
         f"le squadre delle stagioni passate ({state.n_historical_teams}) entrano nella stima solo come avversarie. "
         "α e β sono centrati per competizione: confronta le squadre dentro la stessa competizione."
     )
-    table = ranking_table(state, girone)
+    table = ranking_table(state, girone, section)
     if table.empty:
         st.info("Nessuna squadra stimata per la competizione selezionata.")
         return
@@ -378,10 +502,14 @@ def render_ranking_tab(state: PipelineState, girone: Girone | None) -> None:
         },
     )
     if girone is None:
-        columns = st.columns(len(state.gironi) or 1)
-        for col, g in zip(columns, state.gironi):
-            with col:
-                st.plotly_chart(strength_figure(ranking_table(state, g), title=g.short), **FULL_WIDTH["plotly_chart"], key=f"strength_{g.value}")
+        gironi = [g for g in state.gironi if in_section(g, section)]
+        per_row = len(gironi) if len(gironi) <= 4 else 3  # nine Serie D gironi: three charts per row
+        for start in range(0, len(gironi), max(per_row, 1)):
+            row = gironi[start : start + per_row]
+            columns = st.columns(len(row) or 1)
+            for col, g in zip(columns, row):
+                with col:
+                    st.plotly_chart(strength_figure(ranking_table(state, g), title=g.short), **FULL_WIDTH["plotly_chart"], key=f"strength_{g.value}")
     else:
         st.plotly_chart(strength_figure(table, title=f"{girone.short}: α e β per squadra"), **FULL_WIDTH["plotly_chart"], key=f"strength_{girone.value}")
 
@@ -480,16 +608,17 @@ def results_column_config() -> dict[str, object]:
     }
 
 
-def render_match_tab(state: PipelineState, girone: Girone | None, matchday: Matchday | None) -> None:
-    """*Giornata*: the whole matchday as one table, then the detail of the selected fixture.
+def render_match_tab(state: PipelineState, girone: Girone | None, matchday: Matchday | None, section: str = DEFAULT_SECTION) -> None:
+    """*Giornata*: the whole matchday of the section as one table, then the detail of the selected fixture.
 
     The table (:func:`matchday_table_for`) has one row per fixture of the
     selected matchday and sidebar competition. Clicking a row
     (``selection_mode='single-row'``, ``on_select='rerun'``) selects that fixture:
     the *Partita* selectbox (key :data:`FIXTURE_STATE_KEY`) follows the click and
     stays available as the fallback; a choice made in the selectbox afterwards
-    is kept until the next click (:data:`APPLIED_ROW_STATE_KEY`). The widget key
-    is scoped to the matchday and competition (:func:`matchday_table_key`):
+    is kept until the next click (:data:`APPLIED_ROW_STATE_KEY`); both keys are
+    scoped to the section (:func:`src.dashboard.state.section_key`). The widget
+    key is scoped to the matchday, competition and section (:func:`matchday_table_key`):
     Streamlit keeps a selection per widget key regardless of the data, so a
     fixed key would carry the clicked row position onto the table of another
     competition or matchday and silently open a fixture never clicked; a new
@@ -497,8 +626,12 @@ def render_match_tab(state: PipelineState, girone: Girone | None, matchday: Matc
     the first fixture. Below the table: the metrics row, the score-matrix
     heatmap and the markets table of the selected fixture, as before.
     """
-    st.subheader("Giornata: tutte le partite in tabella")
-    preds = fixtures_for(state, girone, matchday=matchday)
+    st.subheader(f"Giornata: tutte le partite in tabella · {section}")
+    if render_section_notice(state, section):
+        return
+    fixture_key = section_key(FIXTURE_STATE_KEY, section)
+    applied_key = section_key(APPLIED_ROW_STATE_KEY, section)
+    preds = fixtures_for(state, girone, matchday=matchday, section=section)
     if not preds:
         message = "Nessuna partita in programma per la competizione selezionata"
         message += "." if matchday is None else f" nella {matchday.label}."
@@ -509,16 +642,17 @@ def render_match_tab(state: PipelineState, girone: Girone | None, matchday: Matc
             )
         st.info(message)
         return
-    table = matchday_table_for(state, matchday, girone)
-    scope = "tutte le competizioni" if girone is None else girone.short
+    table = matchday_table_for(state, matchday, girone, section)
+    scope = f"tutte le competizioni di {section}" if girone is None else girone.short
+    n_matchdays = len(matchdays(state, section))
     st.caption(
         (f"{matchday.label} · " if matchday is not None else "")
         + f"{len(table)} partite ({scope}) · una riga per partita: forza (α/β), forma delle ultime {DEFAULT_FORM_N} gare, "
-        f"xG delle ultime {DEFAULT_XG_N}, gol attesi, probabilità, quote fair, miglior quota book, EV massimo e flag. "
-        "Clicca una riga per aprire la partita qui sotto"
-        + (f"; la giornata si cambia nel tab *Selezioni di giornata* ({len(state.matchdays)} in programma)." if matchday is not None else ".")
+        f"xG delle ultime {DEFAULT_XG_N}" + (" ('-' quando il dato manca: in Serie D gli xG sono spesso assenti)" if section == SECTION_D else "")
+        + ", gol attesi, probabilità, quote fair, miglior quota book, EV massimo e flag. Clicca una riga per aprire la partita qui sotto"
+        + (f"; la giornata si cambia nel tab *Selezioni di giornata* ({n_matchdays} in programma)." if matchday is not None else ".")
     )
-    table_key = matchday_table_key(matchday, girone)
+    table_key = matchday_table_key(matchday, girone, section)
     event = st.dataframe(
         table,
         hide_index=True,
@@ -534,7 +668,7 @@ def render_match_tab(state: PipelineState, girone: Girone | None, matchday: Matc
     st.download_button(
         "Scarica tabella giornata (CSV)",
         data=export_csv_bytes(table),
-        file_name=f"giornata_{stem}{'' if girone is None else '_' + girone.value}.csv",
+        file_name=f"giornata_{section_slug(section)}_{stem}{'' if girone is None else '_' + girone.value}.csv",
         mime="text/csv",
         key="dl_matchday",
         help="Tutte le colonne della tabella più match_id.",
@@ -545,18 +679,18 @@ def render_match_tab(state: PipelineState, girone: Girone | None, matchday: Matc
     clicked = selected_row_match_id(event, table)
     applied = (table_key, clicked)  # the scope travels with the applied row: a selection of another table is never reused
     if clicked is None:
-        st.session_state.pop(APPLIED_ROW_STATE_KEY, None)
-    elif clicked in label_by_id and st.session_state.get(APPLIED_ROW_STATE_KEY) != applied:
+        st.session_state.pop(applied_key, None)
+    elif clicked in label_by_id and st.session_state.get(applied_key) != applied:
         # a new click: the selectbox follows the table (a later manual choice in the selectbox is then respected)
-        st.session_state[APPLIED_ROW_STATE_KEY] = applied
-        st.session_state[FIXTURE_STATE_KEY] = label_by_id[clicked]
-    if st.session_state.get(FIXTURE_STATE_KEY) not in labels:
-        st.session_state.pop(FIXTURE_STATE_KEY, None)  # stale choice (another competition or matchday): back to the first fixture
+        st.session_state[applied_key] = applied
+        st.session_state[fixture_key] = label_by_id[clicked]
+    if st.session_state.get(fixture_key) not in labels:
+        st.session_state.pop(fixture_key, None)  # stale choice (another competition or matchday): back to the first fixture
     st.markdown("**Dettaglio partita**")
     choice = st.selectbox(
         "Partita",
         labels,
-        key=FIXTURE_STATE_KEY,
+        key=fixture_key,
         help="La partita aperta qui sotto: segue la riga cliccata nella tabella, oppure si sceglie da questo menù.",
     )
     pred: MatchPrediction = preds[labels.index(choice)]
@@ -596,41 +730,46 @@ def render_match_tab(state: PipelineState, girone: Girone | None, matchday: Matc
         st.caption("Nessuna quota del bookmaker per questa partita: le colonne Quota Book ed EV restano vuote.")
 
 
-def render_results_tab(state: PipelineState, girone: Girone | None) -> None:
-    """*Risultati*: the played matches of one season, competition (sidebar) and team, with the model's reading of each.
+def render_results_tab(state: PipelineState, girone: Girone | None, section: str = DEFAULT_SECTION) -> None:
+    """*Risultati*: the played matches of one season, section, competition (sidebar) and team, with the model's reading of each.
 
-    The season selectbox (key :data:`RESULTS_SEASON_KEY`) offers the registry
-    season first and the history seasons after it; the team selectbox (key
-    :data:`RESULTS_TEAM_KEY`) offers *Tutte* plus the teams of the sidebar
-    competition in that season (:func:`results_team_options`). The table is
-    :func:`results_table_for`, sortable by clicking a header, with a CSV download.
+    The season selectbox (key :data:`RESULTS_SEASON_KEY`, scoped to the section)
+    offers the registry season first and the history seasons after it; the team
+    selectbox (key :data:`RESULTS_TEAM_KEY`, scoped likewise) offers *Tutte*
+    plus the teams of the sidebar competition in that season
+    (:func:`results_team_options`). The table is :func:`results_table_for`,
+    sortable by clicking a header, with a CSV download.
     """
-    st.subheader("Risultati: partite giocate")
-    seasons = seasons_available(state)
+    st.subheader(f"Risultati: partite giocate · {section}")
+    if render_section_notice(state, section):
+        return
+    season_key = section_key(RESULTS_SEASON_KEY, section)
+    team_key = section_key(RESULTS_TEAM_KEY, section)
+    seasons = seasons_available(state, section)
     if not seasons or state.matches.empty:
         st.info("Nessuna partita giocata nei dati.")
         return
     c_team, c_season = st.columns([3, 1])
     with c_season:
-        if st.session_state.get(RESULTS_SEASON_KEY) not in seasons:
-            st.session_state.pop(RESULTS_SEASON_KEY, None)
+        if st.session_state.get(season_key) not in seasons:
+            st.session_state.pop(season_key, None)
         season = str(
             st.selectbox(
                 "Stagione",
                 seasons,
-                key=RESULTS_SEASON_KEY,
+                key=season_key,
                 help="La stagione corrente per prima; le precedenti sono lo storico su cui il modello è stimato.",
             )
         )
-    team_options = [ALL_TEAMS_LABEL, *results_team_options(state, girone, season)]
+    team_options = [ALL_TEAMS_LABEL, *results_team_options(state, girone, season, section)]
     with c_team:
-        if st.session_state.get(RESULTS_TEAM_KEY) not in team_options:
-            st.session_state.pop(RESULTS_TEAM_KEY, None)
+        if st.session_state.get(team_key) not in team_options:
+            st.session_state.pop(team_key, None)
         team_label = str(
             st.selectbox(
                 "Squadra",
                 team_options,
-                key=RESULTS_TEAM_KEY,
+                key=team_key,
                 help=(
                     "Le squadre che hanno giocato la stagione scelta nella competizione della sidebar (Tutte = ogni partita): "
                     "nelle stagioni passate anche quelle non più nel perimetro, e non le attuali che allora giocavano altrove."
@@ -638,8 +777,8 @@ def render_results_tab(state: PipelineState, girone: Girone | None) -> None:
             )
         )
     team = None if team_label == ALL_TEAMS_LABEL else team_label
-    table = results_table_for(state, girone=girone, team=team, season=season)
-    scope = ", ".join(part for part in (season, "tutte le competizioni" if girone is None else girone.short, team or "") if part)
+    table = results_table_for(state, girone=girone, team=team, season=season, section=section)
+    scope = ", ".join(part for part in (season, f"tutte le competizioni di {section}" if girone is None else girone.short, team or "") if part)
     if table.empty:
         st.info(f"Nessuna partita giocata per {scope}.")
         return
@@ -661,7 +800,7 @@ def render_results_tab(state: PipelineState, girone: Girone | None) -> None:
     st.download_button(
         "Scarica risultati (CSV)",
         data=export_csv_bytes(table),
-        file_name=f"risultati_{season.replace('/', '_')}{'' if girone is None else '_' + girone.value}{'' if team is None else '_' + team.replace(' ', '_')}.csv",
+        file_name=f"risultati_{section_slug(section)}_{season.replace('/', '_')}{'' if girone is None else '_' + girone.value}{'' if team is None else '_' + team.replace(' ', '_')}.csv",
         mime="text/csv",
         key="dl_results",
         help="Tutte le colonne della tabella più match_id.",
@@ -669,25 +808,33 @@ def render_results_tab(state: PipelineState, girone: Girone | None) -> None:
     )
 
 
-def render_value_tab(state: PipelineState, girone: Girone | None, min_ev: float, matchday: Matchday | None) -> None:
-    st.subheader("Opportunità di valore")
+def render_value_tab(state: PipelineState, girone: Girone | None, min_ev: float, matchday: Matchday | None, section: str = DEFAULT_SECTION) -> None:
+    """*Opportunità di Valore*: the value selections of the section's matchday and its REGRESSION_TRAP alerts."""
+    st.subheader(f"Opportunità di valore · {section}")
+    if render_section_notice(state, section):
+        return
     if not state.quotes:
         st.info(no_odds_message(state))
+    elif not section_opportunities(state, section):
+        st.info(
+            f"Nessuna quota bookmaker per le partite di {section}: il pannello EV resta vuoto per questa sezione"
+            + (" (su FootyStats la copertura delle quote di Serie D è parziale: molte partite non sono quotate)." if section == SECTION_D else ".")
+        )
     show_all = False
     if matchday is not None:
         show_all = bool(
             st.checkbox(
                 "Mostra tutte le giornate",
                 value=False,
-                key=VALUE_ALL_MATCHDAYS_KEY,
+                key=section_key(VALUE_ALL_MATCHDAYS_KEY, section),
                 help="Di default il pannello mostra solo la giornata selezionata nel tab Selezioni di giornata.",
             )
         )
         scope = "Tutte le partite in programma" if show_all else matchday.label
-        st.caption(f"{scope} · la giornata si cambia nel tab *Selezioni di giornata* ({len(state.matchdays)} in programma).")
-    table = value_table(state, min_ev, girone, matchday=ALL_MATCHDAYS if show_all else matchday)
+        st.caption(f"{scope} · la giornata si cambia nel tab *Selezioni di giornata* ({len(matchdays(state, section))} in programma).")
+    table = value_table(state, min_ev, girone, matchday=ALL_MATCHDAYS if show_all else matchday, section=section)
     if table.empty:
-        if state.quotes:
+        if section_opportunities(state, section):
             st.info(f"Nessuna selezione con EV ≥ {min_ev:.1%} per il filtro corrente.")
     else:
         ev_max = float(max(table["EV (%)"].max(), min_ev * 100.0, 1.0))
@@ -711,13 +858,17 @@ def render_value_tab(state: PipelineState, girone: Girone | None, min_ev: float,
     st.caption("EV = P_modello × Quota − 1; stake = Kelly frazionario")
 
     st.markdown("---")
-    st.subheader("Alert REGRESSION_TRAP")
-    st.caption("Squadre con pochi gol subiti nelle ultime 3 gare ma xGA elevato: la difesa è in sovra-rendimento e il mercato sottoprezza i gol contro di loro.")
-    if state.traps:
-        for trap in state.traps:
+    st.subheader(f"Alert REGRESSION_TRAP · {section}")
+    st.caption(
+        "Squadre con pochi gol subiti nelle ultime 3 gare ma xGA elevato: la difesa è in sovra-rendimento e il mercato sottoprezza i gol contro di loro."
+        + (" In Serie D gli xG mancano spesso: senza xG il filtro non può scattare e l'alert resta vuoto." if section == SECTION_D else "")
+    )
+    traps = section_traps(state, section)
+    if traps:
+        for trap in traps:
             st.warning(trap.description(), icon="⚠️")
         st.dataframe(
-            traps_table(state),
+            traps_table(state, section),
             hide_index=True,
             **FULL_WIDTH["dataframe"],
             column_config={
@@ -727,41 +878,47 @@ def render_value_tab(state: PipelineState, girone: Girone | None, min_ev: float,
                 "Ultima Gara": st.column_config.DateColumn("Ultima Gara", format="DD/MM/YYYY"),
             },
         )
-        flagged = sum(1 for o in state.opportunities if o.is_trap)
+        flagged = sum(1 for o in section_opportunities(state, section) if o.is_trap)
         st.caption(f"Selezioni Over/GG segnalate dal filtro: {flagged}")
     else:
         st.success("Nessuna squadra in trappola di regressione nella finestra corrente.", icon="✅")
 
 
-def render_picks_tab(state: PipelineState, matchday: Matchday | None) -> None:
-    """*Selezioni di giornata*: the matchday selector and the top-N draw / both-teams-to-score lists."""
-    st.subheader("Selezioni di giornata")
-    if matchday is None or not state.matchdays:
+def render_picks_tab(state: PipelineState, matchday: Matchday | None, section: str = DEFAULT_SECTION) -> None:
+    """*Selezioni di giornata*: the section's matchday selector and its top-N draw / both-teams-to-score lists."""
+    st.subheader(f"Selezioni di giornata · {section}")
+    if render_section_notice(state, section):
+        return
+    days = matchdays(state, section)
+    if matchday is None or not days:
         message = "Nessuna partita in programma: nessuna giornata da selezionare."
         if state.skipped_fixtures:
             message += f" {len(state.skipped_fixtures)} partite caricate sono state saltate (dettagli in *Dettagli pipeline*)."
         st.info(message)
         return
-    keys = [m.key for m in state.matchdays]
-    labels = {m.key: m.label for m in state.matchdays}
+    keys = [m.key for m in days]
+    labels = {m.key: m.label for m in days}
     c_day, c_draws, c_btts = st.columns([3, 1, 1])
     with c_day:
         chosen_key = st.selectbox(
             "Giornata",
             keys,
             format_func=lambda k: labels.get(k, k),
-            key=MATCHDAY_STATE_KEY,
-            help="I turni delle competizioni giocati nello stesso blocco della settimana (fine settimana ven-lun o infrasettimanale mar-gio), con i recuperi aggregati alla giornata più vicina; vale anche per Giornata e Opportunità di Valore.",
+            key=section_key(MATCHDAY_STATE_KEY, section),
+            help=(
+                f"I turni delle competizioni di {section} giocati nello stesso blocco della settimana (fine settimana ven-lun o "
+                "infrasettimanale mar-gio), con i recuperi aggregati alla giornata più vicina; vale anche per Giornata e Opportunità di Valore."
+            ),
         )
     with c_draws:
         n_draws = int(st.number_input("N risultati X", min_value=1, max_value=MAX_PICKS, value=DEFAULT_N_DRAWS, step=1, key="n_draws"))
     with c_btts:
         n_btts = int(st.number_input("N partite GG", min_value=1, max_value=MAX_PICKS, value=DEFAULT_N_BTTS, step=1, key="n_btts"))
-    chosen = find_matchday(state, str(chosen_key)) or matchday
+    chosen = find_matchday(state, str(chosen_key), section) or matchday
     st.caption(
         f"{chosen.label} · {chosen.n_fixtures} partite · {chosen.start.strftime('%d/%m/%Y')}"
         + (f" - {chosen.end.strftime('%d/%m/%Y')}" if chosen.end != chosen.start else "")
-        + ". Le liste considerano tutte le competizioni, qualunque sia il filtro della sidebar."
+        + f". Le liste considerano tutte le competizioni di {section}, qualunque sia il filtro Competizione della sidebar."
     )
     column_config = {
         "#": st.column_config.NumberColumn("#", width="small", format="%d"),
@@ -774,10 +931,10 @@ def render_picks_tab(state: PipelineState, matchday: Matchday | None) -> None:
         "Flag": st.column_config.TextColumn("Flag", help="VALUE = EV sopra soglia; REGRESSION_TRAP = GG contro una difesa in sovra-rendimento; LONGSHOT = quota > 6; SUSPICIOUS_EDGE = EV > 25%."),
         "Nota": st.column_config.TextColumn("Nota", help="Indizio del modello: gol attesi vicini / pochi gol attesi per la X, xG attese alte / entrambi gli attacchi sopra 1.2 per il GG."),
     }
-    draws = draw_picks_table(state, chosen, n=n_draws)
-    btts = btts_picks_table(state, chosen, n=n_btts)
+    draws = draw_picks_table(state, chosen, n=n_draws, section=section)
+    btts = btts_picks_table(state, chosen, n=n_btts, section=section)
 
-    st.markdown(f"**Le {len(draws)} partite più probabili da X (tutte le competizioni)**")
+    st.markdown(f"**Le {len(draws)} partite più probabili da X (tutte le competizioni di {section})**")
     if draws.empty:
         st.info("Nessuna partita prevista nella giornata selezionata.")
     else:
@@ -787,7 +944,7 @@ def render_picks_tab(state: PipelineState, matchday: Matchday | None) -> None:
         "dicono se il prezzo del bookmaker vale la puntata (EV > 0 = quota sopra la fair). Vuote quando nessun book quota la X."
     )
 
-    st.markdown(f"**Le {len(btts)} partite più probabili da GG (tutte le competizioni)**")
+    st.markdown(f"**Le {len(btts)} partite più probabili da GG (tutte le competizioni di {section})**")
     if btts.empty:
         st.info("Nessuna partita prevista nella giornata selezionata.")
     else:
@@ -800,7 +957,7 @@ def render_picks_tab(state: PipelineState, matchday: Matchday | None) -> None:
     st.download_button(
         "Scarica le due liste (CSV)",
         data=picks_csv_bytes(draws, btts, chosen),
-        file_name=f"selezioni_{chosen.key.replace('#', '_')}.csv",
+        file_name=f"selezioni_{section_slug(section)}_{chosen.key.replace('#', '_')}.csv",
         mime="text/csv",
         key="dl_picks",
         help="Un solo CSV: colonna Lista = X oppure GG, poi le colonne delle tabelle.",
@@ -808,10 +965,14 @@ def render_picks_tab(state: PipelineState, matchday: Matchday | None) -> None:
     )
 
 
-def value_scope_text(girone: Girone | None, matchday: Matchday | None, show_all: bool) -> str:
-    """``'Giornata del 7-9 nov 2026 · ..., Girone A'``: the value panel's current scope, for captions."""
+def value_scope_text(girone: Girone | None, matchday: Matchday | None, show_all: bool, section: str | None = None) -> str:
+    """``'Giornata del 7-9 nov 2026 · ..., Girone A'``: the value panel's current scope, for captions (the section when no competition is chosen)."""
     days = "tutte le partite in programma" if show_all or matchday is None else matchday.label
-    return f"{days}, {'tutte le competizioni' if girone is None else girone.short}"
+    if girone is not None:
+        competitions = girone.short
+    else:
+        competitions = "tutte le competizioni" if section is None else f"tutte le competizioni di {section}"
+    return f"{days}, {competitions}"
 
 
 def render_legend_tab(
@@ -821,6 +982,7 @@ def render_legend_tab(
     matchday: Matchday | None,
     kelly_fraction: float,
     bankroll: float,
+    section: str = DEFAULT_SECTION,
 ) -> None:
     """*Legenda*: the glossary (``legend_markdown``) plus a worked example on a row of the value panel as shown.
 
@@ -832,10 +994,12 @@ def render_legend_tab(
     row with the current filters).
     """
     st.markdown(legend_markdown())
-    show_all = bool(st.session_state.get(VALUE_ALL_MATCHDAYS_KEY, False))
-    rows = value_opportunities(state, min_ev, girone, matchday=ALL_MATCHDAYS if show_all else matchday)
+    if section == SECTION_D:
+        st.info(f"Sezione Serie D: {state.serie_d_status}.", icon="ℹ️")
+    show_all = bool(st.session_state.get(section_key(VALUE_ALL_MATCHDAYS_KEY, section), False))
+    rows = value_opportunities(state, min_ev, girone, matchday=ALL_MATCHDAYS if show_all else matchday, section=section)
     chosen = pick_example_row(rows)
-    scope = value_scope_text(girone, matchday, show_all)
+    scope = value_scope_text(girone, matchday, show_all, section)
     with st.expander("Come leggere una riga del pannello valore", expanded=False):
         if chosen is None:
             reason = SYNTHETIC_REASON_NO_QUOTES if not state.quotes else f"{SYNTHETIC_REASON_NO_VALUE} ({scope}, soglia EV {min_ev:.1%})"
@@ -854,28 +1018,32 @@ def render_legend_tab(
         st.markdown(worked_example_markdown(example))
 
 
-def render_export_tab(state: PipelineState) -> None:
-    st.subheader("Export CSV")
+def render_export_tab(state: PipelineState, section: str = DEFAULT_SECTION) -> None:
+    """*Export*: the value report and the full predictions of the section as CSV."""
+    st.subheader(f"Export CSV · {section}")
+    if render_section_notice(state, section):
+        return
     today = datetime.now(UTC).astimezone().date().isoformat()
-    value_frame = opportunities_table(state)
-    preds_frame = predictions_table(state)
+    slug = section_slug(section)
+    value_frame = opportunities_table(state, section)
+    preds_frame = predictions_table(state, section)
     c1, c2 = st.columns(2)
     with c1:
-        st.markdown(f"**Report valore** · {len(value_frame)} selezioni valutate (EV, edge, Kelly, flag)")
+        st.markdown(f"**Report valore** · {len(value_frame)} selezioni valutate (EV, edge, Kelly, flag) · {section}")
         st.download_button(
             "Scarica report valore (CSV)",
             data=export_csv_bytes(value_frame),
-            file_name=f"serie_c_value_report_{today}.csv",
+            file_name=f"report_valore_{slug}_{today}.csv",
             mime="text/csv",
             key="dl_value",
             **FULL_WIDTH["download_button"],
         )
     with c2:
-        st.markdown(f"**Previsioni complete** · {len(preds_frame)} partite (λ, μ, probabilità e quote fair di ogni mercato)")
+        st.markdown(f"**Previsioni complete** · {len(preds_frame)} partite (λ, μ, probabilità e quote fair di ogni mercato) · {section}")
         st.download_button(
             "Scarica previsioni (CSV)",
             data=export_csv_bytes(preds_frame),
-            file_name=f"serie_c_previsioni_{today}.csv",
+            file_name=f"previsioni_{slug}_{today}.csv",
             mime="text/csv",
             key="dl_predictions",
             **FULL_WIDTH["download_button"],
@@ -889,8 +1057,8 @@ def render_export_tab(state: PipelineState) -> None:
 # Page
 # =============================================================================
 def main() -> None:
-    """Compose the page."""
-    girone, min_ev, kelly_fraction, bankroll = render_sidebar()
+    """Compose the page: sidebar parameters, cached state, section controls, badge, subtitle, tabs of the section."""
+    controls, min_ev, kelly_fraction, bankroll = render_sidebar()
     badge = st.sidebar.empty()
 
     simulate: bool | None = True if env_flag("SERIEC_FORCE_SIMULATE") else None
@@ -935,34 +1103,39 @@ def main() -> None:
             history_seasons=DEFAULT_HISTORY_SEASONS,
             as_of=as_of,
         )
-    render_source_badge(badge, state)
+    section, girone = render_section_controls(controls, state)
+    render_source_badge(badge, state, section)
 
     st.title("⚽ Serie C Quant Lab")
-    scope = "tutte le competizioni" if girone is None else girone.short
+    scope = f"tutte le competizioni di {section}" if girone is None else girone.short
     st.caption(
-        f"{state.perimeter_text} · Dixon-Coles su {state.n_matches} partite · {len(state.predictions)} previsioni · "
-        f"soglia EV {min_ev:.1%} · Kelly x{kelly_fraction:g} · bankroll {bankroll:g} unità · vista: {scope}"
+        f"{perimeter_text(state, section)} · Dixon-Coles su {state.n_matches} partite (stima congiunta di tutto il perimetro) · "
+        f"{len(section_predictions(state, section))} previsioni · soglia EV {min_ev:.1%} · Kelly x{kelly_fraction:g} · "
+        f"bankroll {bankroll:g} unità · sezione: {section} · vista: {scope}"
     )
     with st.expander("Dettagli pipeline", expanded=False):
-        st.markdown("\n".join(f"- {note}" for note in state.notes))
+        notes = list(state.notes)
+        if serie_d_gironi():
+            notes.append(f"Sezione Serie D: {state.serie_d_status}.")
+        st.markdown("\n".join(f"- {note}" for note in notes))
         st.caption(f"Stato calcolato alle {state.built_at.astimezone().strftime('%d/%m/%Y %H:%M:%S')} (fonte: {state.source}).")
 
-    matchday = selected_matchday(state)  # before any tab renders, so the three matchday-aware tabs agree
+    matchday = selected_matchday(state, section)  # before any tab renders, so the three matchday-aware tabs agree
     tab_rank, tab_match, tab_results, tab_value, tab_picks, tab_export, tab_legend = st.tabs(list(TAB_LABELS))
     with tab_rank:
-        render_ranking_tab(state, girone)
+        render_ranking_tab(state, girone, section)
     with tab_match:
-        render_match_tab(state, girone, matchday)
+        render_match_tab(state, girone, matchday, section)
     with tab_results:
-        render_results_tab(state, girone)
+        render_results_tab(state, girone, section)
     with tab_value:
-        render_value_tab(state, girone, min_ev, matchday)
+        render_value_tab(state, girone, min_ev, matchday, section)
     with tab_picks:
-        render_picks_tab(state, matchday)
+        render_picks_tab(state, matchday, section)
     with tab_export:
-        render_export_tab(state)
+        render_export_tab(state, section)
     with tab_legend:
-        render_legend_tab(state, girone, min_ev, matchday, kelly_fraction, bankroll)
+        render_legend_tab(state, girone, min_ev, matchday, kelly_fraction, bankroll, section)
 
 
 main()

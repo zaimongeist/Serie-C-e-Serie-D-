@@ -32,6 +32,12 @@ assignment and the cross-division identification through the movers are
 exercised offline. One :class:`TrueParams` drives every season, with a home
 advantage per competition (:data:`DEFAULT_HOME_ADVANTAGE`); the strengths of
 the historical clubs are drawn from the same distribution as the current ones.
+
+Only the competitions that **have teams** in the registry are simulated: the
+Serie D gironi ship empty (their composition is initialised from FootyStats),
+so the default fallback league stays Serie C + Serie B until then.
+:func:`simulate_serie_d_registry` builds a synthetic nine-girone Serie D
+registry (``'Squadra DA 01'`` ...) for tests and demos of the Serie D section.
 """
 from __future__ import annotations
 
@@ -67,6 +73,7 @@ __all__ = [
     "HISTORY_SEASONS",
     "MINI_TEAMS",
     "SEASON_2026_27_START",
+    "SERIE_D_TEAM_PREFIX",
     "SYNTHETIC_HISTORICAL_PREFIX",
     "SimulatedLeague",
     "TrueParams",
@@ -83,6 +90,7 @@ __all__ = [
     "simulate_history",
     "simulate_league",
     "simulate_mini_dataset",
+    "simulate_serie_d_registry",
 ]
 
 log = get_logger(__name__)
@@ -100,8 +108,19 @@ HISTORY_SEASONS: Final[tuple[str, ...]] = ("2024/25", "2025/26")
 #: ``'Storica 1'`` and ``'Storica 2'`` would both normalise to ``'storica'`` and the registry rejects spellings
 #: shared by two clubs.
 SYNTHETIC_HISTORICAL_PREFIX: Final[str] = "Storica"
-#: True home advantage per competition code used by :func:`sample_true_params` (Serie B lower than Serie C).
-DEFAULT_HOME_ADVANTAGE: Final[dict[str, float]] = {"A": 0.30, "B": 0.22, "C": 0.38, "SB": 0.25}
+#: Name prefix of the synthetic Serie D clubs of :func:`simulate_serie_d_registry` (``'Squadra DA 01'``). The code is
+#: written without the dash of the short label because :func:`src.common.teams.normalize_name` drops single-character
+#: tokens: ``'Squadra D-A 01'`` and ``'Squadra D-B 01'`` would both normalise to ``'squadra 01'`` and collide.
+SERIE_D_TEAM_PREFIX: Final[str] = "Squadra"
+#: True home advantage per competition code used by :func:`sample_true_params` (Serie B lower than Serie C,
+#: the nine Serie D gironi share one value).
+DEFAULT_HOME_ADVANTAGE: Final[dict[str, float]] = {
+    "A": 0.30,
+    "B": 0.22,
+    "C": 0.38,
+    "SB": 0.25,
+    **{f"D{letter}": 0.25 for letter in "ABCDEFGHI"},
+}
 #: Home advantage of a competition that :data:`DEFAULT_HOME_ADVANTAGE` does not list (a league added later).
 FALLBACK_HOME_ADVANTAGE: Final[float] = 0.28
 #: Real former Serie C and Serie B clubs (relegated, promoted or excluded) used as historical opponents.
@@ -333,10 +352,8 @@ def sample_true_params(
 ) -> TrueParams:
     alpha: dict[str, float] = {}
     beta: dict[str, float] = {}
-    for g in Girone:
-        teams = registry.teams_by_girone.get(g, ())
-        if not teams:
-            continue
+    for g in registry.gironi:  # only the competitions that have teams (empty Serie D gironi contribute nothing)
+        teams = registry.teams_by_girone[g]
         a = rng.normal(0.0, sigma_alpha, len(teams))
         a -= a.mean()  # identifiability: sum alpha = 0 per girone
         b = rng.normal(0.0, sigma_beta, len(teams))
@@ -469,7 +486,11 @@ def simulate_league(
     if start_date is None:
         start_date = _registry_start_date(registry)
 
-    schedules = {g: round_robin(registry.teams_by_girone[g]) for g in Girone if g in registry.teams_by_girone}
+    # only the competitions that have teams are simulated: the empty Serie D gironi of the shipped
+    # registry (filled by the FootyStats auto-init) keep the default fallback league at Serie C + Serie B
+    schedules = {g: round_robin(registry.teams_by_girone[g]) for g in registry.gironi}
+    if not schedules:
+        raise ValueError(f"registry {registry.season!r} has no teams in any competition: nothing to simulate")
     total_rounds = max(len(s) for s in schedules.values())
     if n_rounds is not None:
         played_rounds = max(0, min(int(n_rounds), total_rounds))
@@ -558,7 +579,7 @@ def _season_composition(
     those run out synthetic clubs ``'Storica 01'``, ``'Storica 02'``, ... fill the
     gaps with a warning instead of raising, so every registry can be simulated.
     """
-    comp: dict[Girone, list[str]] = {g: list(teams) for g, teams in registry.teams_by_girone.items()}
+    comp: dict[Girone, list[str]] = {g: list(registry.teams_by_girone[g]) for g in registry.gironi}
     sizes = {g: len(teams) for g, teams in comp.items()}
     moved: set[str] = set()
     for team, target in HISTORICAL_MOVES.get(label, {}).items():
@@ -819,3 +840,30 @@ def simulate_mini_dataset(seed: int = 42, n_matches: int = 20, *, season: str = 
     )
     mini.odds = simulate_bookmaker_odds(mini, np.random.default_rng(seed))
     return mini
+
+
+def simulate_serie_d_registry(seed: int = 7, n_teams: int = 18, *, season: str = DEFAULT_SEASON) -> TeamRegistry:
+    """Synthetic Serie D registry: ``n_teams`` clubs in each of the configured Serie D gironi (``DA`` .. ``DI``).
+
+    The real Serie D compositions are not known offline (the FootyStats harvester
+    initialises them), so tests and demos of the Serie D section use this
+    registry: clubs are named ``'Squadra DA 01'`` .. ``'Squadra DI 18'``
+    (:data:`SERIE_D_TEAM_PREFIX` + competition code + zero-padded number, unique
+    once normalised), with no aliases. ``seed`` shuffles the order of the clubs
+    inside each girone, which is the order :func:`round_robin` pairs them in, so
+    different seeds give different calendars; the names themselves are fixed.
+    ``season`` is the registry label (``'2026_27'`` or ``'2026/27'``), which sets
+    the simulated calendar of :func:`simulate_league`. ``ValueError`` when
+    ``n_teams < 2`` or when no competition of the ``'Serie D'`` family is configured.
+    """
+    if int(n_teams) < 2:
+        raise ValueError("n_teams must be >= 2")
+    gironi = [g for g in Girone if g.family == "Serie D"]
+    if not gironi:
+        raise ValueError("no competition of family 'Serie D' in config/competitions.toml")
+    rng = np.random.default_rng(seed)
+    teams_by_code: dict[str, tuple[str, ...]] = {}
+    for g in gironi:
+        names = [f"{SERIE_D_TEAM_PREFIX} {g.value} {i:02d}" for i in range(1, int(n_teams) + 1)]
+        teams_by_code[g.value] = tuple(str(name) for name in rng.permutation(np.array(names, dtype=object)))
+    return TeamRegistry.from_teams(str(season).replace("_", "/"), teams_by_code)

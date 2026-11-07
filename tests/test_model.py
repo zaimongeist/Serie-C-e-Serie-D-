@@ -349,7 +349,8 @@ def test_parameter_recovery_full_season(full_league, full_fit):
     assert params.effective_n == pytest.approx(params.n_matches)  # xi = 0
     assert params.penalty == 0.0
 
-    for g in Girone:
+    assert set(params.teams_by_girone) == set(full_league.registry.gironi) and len(params.teams_by_girone) == 4
+    for g in params.teams_by_girone:  # the four competitions with teams; the empty Serie D gironi are not fitted
         a_hat, a_true, b_hat, b_true = _true_vectors(params, tp, g)
         assert len(a_hat) == 20
         # 20 teams x 38 matches: a correlation estimate has sd ~0.05 around the ~0.9 the model recovers, so one
@@ -396,8 +397,8 @@ def test_parameter_recovery_multi_season_meets_spec_thresholds(full_league, full
     assert params.n_matches == len(multi_season) == 3 * single.n_matches
     assert params.converged, params.message
     assert params.fit_seconds < 60
-    assert params.teams_by_girone == single.teams_by_girone
-    for g in Girone:
+    assert params.teams_by_girone == single.teams_by_girone and len(params.teams_by_girone) == 4
+    for g in params.teams_by_girone:
         a_hat, a_true, b_hat, b_true = _true_vectors(params, tp, g)
         assert _corr(a_hat, a_true) > 0.85, (g, _corr(a_hat, a_true))
         assert _corr(b_hat, b_true) > 0.80, (g, _corr(b_hat, b_true))
@@ -661,7 +662,7 @@ def test_four_competition_league_is_fitted_with_one_gamma_and_one_constraint_gro
 
     teams = {code: tuple(f"{code}{i}" for i in range(6)) for code in ("A", "B", "C", "SB")}
     registry = TeamRegistry.from_teams("2026/27", teams)
-    assert registry.gironi == tuple(Girone) and registry.perimeter_label == "Serie C 2026/27 Gironi A/B/C + Serie B (24 squadre)"
+    assert registry.gironi == (Girone.A, Girone.B, Girone.C, Girone.SB) and registry.perimeter_label == "Serie C 2026/27 Gironi A/B/C + Serie B (24 squadre)"
     true_params = sample_true_params(registry, np.random.default_rng(5), gamma=default_home_advantage())
     assert true_params.gamma[Girone.SB] == 0.25
     last_season = TeamRegistry.from_teams(
@@ -675,13 +676,13 @@ def test_four_competition_league_is_fitted_with_one_gamma_and_one_constraint_gro
     frame = pd.concat([past.matches, current.matches], ignore_index=True)
     assert sorted(set(frame["girone"])) == ["A", "B", "C", "SB"]
     index = build_team_index(frame, registry=registry)
-    assert index.gironi == tuple(Girone) and index.n_gammas == 4 and index.historical == () and index.constraint_girone == {}
+    assert index.gironi == registry.gironi and index.n_gammas == 4 and index.historical == () and index.constraint_girone == {}
     assert index.girone_of("SB0") is Girone.SB and index.girone_of("C0") is Girone.C  # registry girone, not where they played
     assert len(index.alpha_groups()) == 4 and sorted(len(g) for g in index.alpha_groups()) == [6, 6, 6, 6]
 
     params = DixonColesEngine(DixonColesConfig(xi=0.0, l2_penalty=0.02)).fit(frame, registry=registry)
     assert params.converged, params.message
-    assert set(params.gamma) == set(Girone) and set(params.teams_by_girone) == set(Girone) and params.historical_teams == ()
+    assert set(params.gamma) == set(registry.gironi) and set(params.teams_by_girone) == set(registry.gironi) and params.historical_teams == ()
     for g, members in params.teams_by_girone.items():
         assert set(members) == set(teams[g.value]) and sum(params.alpha[t] for t in members) == pytest.approx(0.0, abs=1e-6), g
     assert params.is_current("SB0") and params.is_current("C0")

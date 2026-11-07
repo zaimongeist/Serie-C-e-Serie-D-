@@ -85,6 +85,7 @@ __all__ = [
     "draw_picks",
     "fixtures_of",
     "format_date_span",
+    "in_gironi",
     "matchdays",
     "next_matchday",
     "picks_frame",
@@ -150,6 +151,22 @@ _BTTS_BOTH_ATTACKS_MIN: Final[float] = 1.2
 def _girone_order(g: Girone) -> int:
     """Position of a competition in configuration order (``config/competitions.toml``)."""
     return list(Girone).index(Girone.parse(g))
+
+
+def in_gironi(girone: Girone | str, gironi: Iterable[Girone | str] | None) -> bool:
+    """Whether ``girone`` belongs to the restriction ``gironi`` (``None`` means no restriction).
+
+    The shared competition filter of :func:`matchdays`, :func:`rank_picks` and
+    the tables: the dashboard restricts every view to the competitions of the
+    selected *section* (Serie B and Serie C, or Serie D) by passing their
+    :class:`Girone` members (or codes) here. An empty iterable restricts to
+    nothing, so a section without competitions yields empty views, never a
+    silent fallback to the whole perimeter.
+    """
+    if gironi is None:
+        return True
+    wanted = {Girone.parse(g) for g in gironi}
+    return Girone.parse(girone) in wanted
 
 
 def _del(day: int) -> str:
@@ -335,20 +352,30 @@ class _Draft:
         return self.regular + self.attached
 
 
-def matchdays(fixtures: Iterable[Fixture], *, as_of: date | None = None, max_days: int = 7) -> list[Matchday]:
+def matchdays(
+    fixtures: Iterable[Fixture],
+    *,
+    as_of: date | None = None,
+    max_days: int = 7,
+    gironi: Iterable[Girone | str] | None = None,
+) -> list[Matchday]:
     """Group the not-yet-played fixtures into :class:`Matchday` objects (see the module docstring for the rule).
 
     ``as_of`` drops the fixtures dated before it (already played or stale);
     ``None`` keeps every fixture given, which is the right call when the list is
     already the upcoming schedule. ``max_days`` (>= 0) is how far from its
     round's anchor date a fixture may be and still belong to the round; farther
-    away it is a straggler attached to the nearest matchday. The result is
-    ordered by football-week block (the next matchday first) and empty for no
-    fixtures.
+    away it is a straggler attached to the nearest matchday. ``gironi`` keeps
+    only the fixtures of those competitions (:func:`in_gironi`; ``None`` = every
+    competition): the matchdays of one section of the dashboard (Serie D alone)
+    are grouped from its own fixtures, so their keys, labels and rounds never
+    mention another section. The result is ordered by football-week block (the
+    next matchday first) and empty for no fixtures.
     """
     if int(max_days) < 0:
         raise ValueError(f"max_days must be >= 0, got {max_days}")
-    pending = [fx for fx in fixtures if as_of is None or fx.date >= as_of]
+    wanted = None if gironi is None else {Girone.parse(g) for g in gironi}
+    pending = [fx for fx in fixtures if (as_of is None or fx.date >= as_of) and (wanted is None or Girone.parse(fx.girone) in wanted)]
     if not pending:
         return []
     by_competition: dict[Girone, list[Fixture]] = defaultdict(list)
@@ -414,9 +441,14 @@ def matchdays(fixtures: Iterable[Fixture], *, as_of: date | None = None, max_day
     return out
 
 
-def next_matchday(fixtures: Iterable[Fixture], *, as_of: date | None = None) -> Matchday | None:
+def next_matchday(
+    fixtures: Iterable[Fixture],
+    *,
+    as_of: date | None = None,
+    gironi: Iterable[Girone | str] | None = None,
+) -> Matchday | None:
     """The first matchday of :func:`matchdays` (the next block with a regular round), ``None`` without fixtures."""
-    groups = matchdays(fixtures, as_of=as_of)
+    groups = matchdays(fixtures, as_of=as_of, gironi=gironi)
     return groups[0] if groups else None
 
 
@@ -513,27 +545,33 @@ def rank_picks(
     matchday: Matchday | None = None,
     opportunities: Iterable[ValueOpportunity] = (),
     min_probability: float = 0.0,
+    gironi: Iterable[Girone | str] | None = None,
 ) -> list[Pick]:
     """The ``n`` predictions with the highest model probability of ``selection`` in ``market``.
 
     Only the fixtures of ``matchday`` are considered (every prediction when
-    ``None``) and those with ``p_model < min_probability`` are dropped. The
-    order is probability descending, then fair odds ascending, then date,
-    competition order, label and ``match_id`` (a total order, so ties resolve
-    the same way every time). When ``opportunities`` quote the selection, the
-    best (highest) book price is attached with its bookmaker, EV and flags.
-    ``n <= 0`` yields an empty list; ``n`` above the available predictions
-    yields them all.
+    ``None``), only those of the competitions in ``gironi`` when given (the
+    picks of one dashboard section are ranked within that section, see
+    :func:`in_gironi`), and those with ``p_model < min_probability`` are
+    dropped. The order is probability descending, then fair odds ascending,
+    then date, competition order, label and ``match_id`` (a total order, so
+    ties resolve the same way every time). When ``opportunities`` quote the
+    selection, the best (highest) book price is attached with its bookmaker, EV
+    and flags. ``n <= 0`` yields an empty list; ``n`` above the available
+    predictions yields them all.
     """
     market = Market(market)
     if selection not in SELECTIONS[market]:
         raise ValueError(f"{selection!r} is not a selection of {market.value} (expected one of {SELECTIONS[market]})")
     if n <= 0:
         return []
+    wanted = None if gironi is None else {Girone.parse(g) for g in gironi}
     candidates = [
         p
         for p in predictions
-        if (matchday is None or matchday.contains(p)) and float(p.probabilities[market][selection]) >= float(min_probability)
+        if (matchday is None or matchday.contains(p))
+        and (wanted is None or Girone.parse(p.fixture.girone) in wanted)
+        and float(p.probabilities[market][selection]) >= float(min_probability)
     ]
     candidates.sort(
         key=lambda p: (
@@ -578,6 +616,7 @@ def rank_picks(
             "n_candidates": len(candidates),
             "n_picks": len(picks),
             "matchday": None if matchday is None else matchday.key,
+            "gironi": None if wanted is None else sorted(g.value for g in wanted),
             "n_quoted": sum(1 for p in picks if p.book_odds is not None),
         },
     )
@@ -590,9 +629,10 @@ def draw_picks(
     n: int = DEFAULT_N_DRAWS,
     matchday: Matchday | None = None,
     opportunities: Iterable[ValueOpportunity] = (),
+    gironi: Iterable[Girone | str] | None = None,
 ) -> list[Pick]:
-    """The ``n`` most probable draws (``X`` of the 1X2 market), see :func:`rank_picks`."""
-    return rank_picks(predictions, market=Market.MATCH_ODDS, selection="X", n=n, matchday=matchday, opportunities=opportunities)
+    """The ``n`` most probable draws (``X`` of the 1X2 market), see :func:`rank_picks` (``gironi`` = one section's competitions)."""
+    return rank_picks(predictions, market=Market.MATCH_ODDS, selection="X", n=n, matchday=matchday, opportunities=opportunities, gironi=gironi)
 
 
 def btts_picks(
@@ -601,9 +641,10 @@ def btts_picks(
     n: int = DEFAULT_N_BTTS,
     matchday: Matchday | None = None,
     opportunities: Iterable[ValueOpportunity] = (),
+    gironi: Iterable[Girone | str] | None = None,
 ) -> list[Pick]:
-    """The ``n`` most probable both-teams-to-score matches (``GG``), see :func:`rank_picks`."""
-    return rank_picks(predictions, market=Market.BTTS, selection="GG", n=n, matchday=matchday, opportunities=opportunities)
+    """The ``n`` most probable both-teams-to-score matches (``GG``), see :func:`rank_picks` (``gironi`` = one section's competitions)."""
+    return rank_picks(predictions, market=Market.BTTS, selection="GG", n=n, matchday=matchday, opportunities=opportunities, gironi=gironi)
 
 
 def picks_frame(picks: Iterable[Pick]) -> pd.DataFrame:

@@ -184,8 +184,8 @@ def test_girone_column_accepts_every_configured_competition(mini: pd.DataFrame) 
     frame.loc[frame.index[3], "girone"] = "Girone C"
     out = validate_matches_df(frame)
     assert sorted(out["girone"].tolist()) == ["C", "SB", "SB", "SB"]
-    assert str(out["girone"].dtype) == "string" and [g.value for g in Girone] == ["A", "B", "C", "SB"]
-    with pytest.raises(ValueError, match=r"expected one of \['A', 'B', 'C', 'SB'\]"):
+    assert str(out["girone"].dtype) == "string" and [g.value for g in Girone][:4] == ["A", "B", "C", "SB"]
+    with pytest.raises(ValueError, match=r"expected one of \['A', 'B', 'C', 'SB', 'DA'"):
         validate_matches_df(frame.assign(girone="Serie A"))
     record = MatchRecord("SB-1", date(2026, 8, 22), 1, "Serie B", "Palermo", "Sampdoria", 2, 1)
     assert record.girone is Girone.SB and record.to_dict()["girone"] == "SB"

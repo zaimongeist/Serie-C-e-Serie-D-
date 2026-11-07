@@ -742,10 +742,16 @@ def build_team_index(
     (Serie B not harvested yet), those teams keep their registry competition but
     join, for the ``sum(alpha) == 0`` constraint only, the group of the
     competition they played in (``TeamIndex.constraint_girone``, logged as a
-    warning); no home advantage is estimated for that competition. Teams with
-    fewer than ``min_matches_per_team`` matches are still estimated but
-    reported in the log. Only teams that appear in ``matches`` are indexed: a
-    registry team without any match has no identifiable strength.
+    warning); no home advantage is estimated for that competition. The
+    opposite case -- a competition with matches whose registry entry has no
+    current team yet (a Serie D girone before its auto-init) -- is handled
+    without error: its teams are historical, fitted in that competition's own
+    group with its own home advantage, and a warning is logged. A configured
+    competition with neither teams nor matches is simply absent from the index
+    (no gamma, no group). Teams with fewer than ``min_matches_per_team`` matches
+    are still estimated but reported in the log. Only teams that appear in
+    ``matches`` are indexed: a registry team without any match has no
+    identifiable strength.
     """
     long = pd.concat(
         [
@@ -808,6 +814,21 @@ def build_team_index(
             teams_by_girone[g] = members
     teams = tuple(t for g in Girone for t in teams_by_girone.get(g, ()))
     gironi = tuple(g for g in Girone if g.value in set(matches["girone"].astype(str)))
+    if registry is not None:
+        # A competition with matches but no current team in the registry (a Serie D girone whose
+        # auto-init has not run yet, or raced with the harvest): nothing crashes, its teams are
+        # simply all historical -- fitted, grouped and given a home advantage, but outside the
+        # perimeter -- until the dictionary is filled. Loud, because rankings will skip them.
+        uninitialised = [g for g in gironi if not registry.teams(g)]
+        if uninitialised:
+            log.warning(
+                "competitions with matches but no current teams in the registry: their teams are fitted as historical",
+                extra={
+                    "season": registry.season_label,
+                    "gironi": [g.value for g in uninitialised],
+                    "teams": {g.value: len(teams_by_girone.get(g, ())) for g in uninitialised},
+                },
+            )
     constraint_girone: dict[str, Girone] = {}
     missing = [g for g in teams_by_girone if g not in gironi]
     if missing:
