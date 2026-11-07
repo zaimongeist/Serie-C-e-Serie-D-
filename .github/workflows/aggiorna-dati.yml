@@ -7,8 +7,13 @@
 #     account footystats.org, salvata come SEGRETO di repository FOOTYSTATS_API_KEY
 #     (Settings → Secrets and variables → Actions → New repository secret). Sul sito aggiungi al tuo
 #     account le leghe: Italy Serie C Group A / B / C, Italy Serie B e Italy Serie D Group A .. I
-#     ("Choose leagues"); una lega non scelta ripiega sui season id configurati in
-#     config/competitions.toml. La chiave non compare mai nei log, nella cache né nei file committati.
+#     ("Choose leagues"): OGNI competizione da raccogliere deve essere fra le leghe scelte, perché l'API
+#     rifiuta i dati di una lega non scelta ("League is not chosen by the user"). Una competizione la
+#     cui lega non è scelta viene saltata con un avviso (riga `skipped DA: ...`, elencata nel riepilogo)
+#     e le altre vengono raccolte e committate normalmente; i season id di config/competitions.toml
+#     servono solo se /league-list non risponde. I piani FootyStats limitano il numero di leghe scelte:
+#     se non puoi aggiungerle tutte, restringi l'input `competitions` (es. "A B C SB").
+#     La chiave non compare mai nei log, nella cache né nei file committati.
 #     Per default il job raccoglie TUTTE le 13 competizioni configurate (input `competitions` vuoto).
 #     Serie D: la prima esecuzione inizializza le liste squadre dei 9 gironi in
 #     config/teams_2026_27.json dall'endpoint league-teams (auto-init) e il commit le include.
@@ -125,6 +130,13 @@ jobs:
           initialised = re.search(r"^registry initialised: (.+)$", log_text, flags=re.MULTILINE)
           if initialised:
               lines += [f"Gironi inizializzati in config/teams_2026_27.json (Serie D, liste squadre da FootyStats): {initialised.group(1)}", ""]
+          # competizioni saltate: la CLI stampa "skipped DA: 'Italy Serie D Group A' is not among the account's chosen leagues: ..."
+          skipped = re.findall(r"^skipped (\S+): (.+)$", log_text, flags=re.MULTILINE)
+          if skipped:
+              lines.append(f"**Competizioni saltate ({len(skipped)})**, non raccolte perché la lega non è scelta nell'account FootyStats "
+                           "(o non è supportata): aggiungile su footystats.org (Choose leagues) oppure restringi l'input `competitions`.")
+              lines += [f"- `{code}`: {reason}" for code, reason in skipped]
+              lines.append("")
           matches = Path("data/processed/matches.csv")
           if matches.exists():
               df = pd.read_csv(matches, parse_dates=["date"])
@@ -156,13 +168,16 @@ jobs:
             echo "## Raccolta dati non riuscita"
             if grep -qiE "API key (not configured|missing)|footystats: FootyStats API key" harvest.log; then
               echo "Manca la chiave FootyStats: aggiungi il segreto di repository **FOOTYSTATS_API_KEY** (Settings → Secrets and variables → Actions)."
-            elif grep -qE "chosen leagues" harvest.log; then
-              echo "Una competizione non è fra le leghe del tuo account FootyStats e non ha season id configurati: su footystats.org aggiungi *Italy Serie C Group A/B/C*, *Italy Serie B* e *Italy Serie D Group A..I* (Choose leagues)."
+            elif grep -qE "status=429|HTTP 429" harvest.log; then
+              echo "FootyStats ha risposto **429**: superato il limite orario di richieste (~1800/h). Il job riproverà alla prossima esecuzione."
             elif grep -qE "status=403|HTTP 403|Forbidden" harvest.log; then
               echo "SofaScore ha risposto **403 Forbidden**: l'IP del runner è bloccato."
               echo "Soluzione: configura il segreto FOOTYSTATS_API_KEY (API ufficiale), oppure esegui il job da un self-hosted runner sul tuo PC (variabile HARVEST_RUNNER=self-hosted) o lancia \`avvia.command\` / \`avvia.bat\` in locale."
-            elif grep -qE "status=429|HTTP 429" harvest.log; then
-              echo "FootyStats ha risposto **429**: superato il limite orario di richieste (~1800/h). Il job riproverà alla prossima esecuzione."
+            elif grep -qiE "not chosen by the user|API refused the request|footystats failed: competitions not among the account's chosen leagues" harvest.log; then
+              # il testo dell'errore vero (rifiuto dell'API), non l'avviso "skipped" che compare anche nelle esecuzioni riuscite
+              echo "FootyStats ha rifiutato una competizione perché la sua lega non è fra quelle scelte nel tuo account: su footystats.org aggiungi *Italy Serie C Group A/B/C*, *Italy Serie B* e *Italy Serie D Group A..I* (Choose leagues), oppure restringi l'input \`competitions\` alle leghe che hai."
+            elif grep -q "no matches harvested" harvest.log && grep -q "^skipped " harvest.log; then
+              echo "Nessuna partita raccolta: tutte le competizioni richieste sono state saltate (righe \`skipped\`: leghe non scelte nell'account FootyStats). Aggiungile su footystats.org (Choose leagues) oppure restringi l'input \`competitions\`."
             else
               echo "Vedi il log del passo *Raccolta dati*."
             fi

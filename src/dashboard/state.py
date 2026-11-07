@@ -82,7 +82,7 @@ from src.common.schemas import (
     season_of,
     validate_matches_df,
 )
-from src.common.teams import DEFAULT_SEASON, TeamRegistry, load_registry
+from src.common.teams import DEFAULT_SEASON, TeamRegistry, load_registry, season_file_stem
 from src.engine.model import DixonColesConfig, DixonColesEngine, FittedParams
 from src.engine.picks import (
     DEFAULT_N_BTTS,
@@ -184,6 +184,7 @@ __all__ = [
     "no_odds_message",
     "opportunities_table",
     "other_season_reason",
+    "outside_section",
     "perimeter_matches",
     "perimeter_text",
     "picks_csv_bytes",
@@ -677,20 +678,44 @@ def in_section(girone: Girone | str, section: str | None) -> bool:
     return section is None or Girone.parse(girone).family in section_families(section)
 
 
+def outside_section(girone: Girone | str | None, section: str | None) -> bool:
+    """Whether a *requested* competition lies outside the requested section: the shared guard of the table helpers.
+
+    ``False`` for ``girone=None`` (no competition requested) or ``section=None``
+    (every section); otherwise the negation of :func:`in_section`. A helper asked
+    for ``Girone.A`` within :data:`SECTION_D` returns its empty frame or list
+    instead of Serie C data, exactly like :func:`fixtures_for` or
+    :func:`results_table_for` already did through their row filters.
+    """
+    return girone is not None and not in_section(girone, section)
+
+
 def serie_d_gironi() -> tuple[Girone, ...]:
     """The configured Serie D competitions (family :data:`SERIE_D_FAMILY`), ``()`` when the configuration has none."""
     return tuple(g for g in Girone if g.family == SERIE_D_FAMILY)
 
 
-def serie_d_harvest_command(gironi: Iterable[Girone] | None = None) -> str:
+def serie_d_harvest_command(gironi: Iterable[Girone] | None = None, *, season: str | None = None) -> str:
     """The exact console command that initialises and harvests Serie D with the user's FootyStats key.
 
     ``'python -m src.ingestion.footystats --competitions DA DB DC DD DE DF DG DH DI --seasons 3'``
     with the shipped configuration (the launchers ``avvia.bat`` / ``avvia.command``
     run the harvester for every configured competition as well).
+
+    ``season`` is the registry season the command has to initialise
+    (``'2025/26'`` or ``'2025_26'``, whatever the caller holds): the harvester
+    CLI writes ``config/teams_<--season>.json`` and its ``--season`` defaults to
+    :data:`~src.common.teams.DEFAULT_SEASON`, so ``--season 2025_26`` is
+    appended whenever the perimeter season differs from that default. A notice
+    that names ``config/teams_2025_26.json`` thus prints a command that fills
+    that very file; ``None`` (or the default season) keeps the short command.
     """
     codes = [g.value for g in (serie_d_gironi() if gironi is None else gironi)]
-    return f"python -m src.ingestion.footystats --competitions {' '.join(codes)} --seasons {SERIE_D_HARVEST_SEASONS}"
+    command = f"python -m src.ingestion.footystats --competitions {' '.join(codes)} --seasons {SERIE_D_HARVEST_SEASONS}"
+    stem = season_file_stem(season) if season else ""
+    if stem and stem != season_file_stem(DEFAULT_SEASON):
+        command += f" --season {stem}"
+    return command
 
 
 def serie_d_status_text(n_teams: int, n_matches: int, n_fixtures: int | None = None, *, season_label: str = "") -> str:
@@ -1349,6 +1374,11 @@ def _as_girone(girone: Girone | str | None) -> Girone | None:
     return None if girone is None else Girone.parse(girone)
 
 
+def _empty_ranking() -> pd.DataFrame:
+    """An empty strength ranking with the :data:`RANKING_COLUMNS` and their dtypes."""
+    return pd.DataFrame({c: pd.Series(dtype="string" if c in ("Squadra", "Competizione") else "float64") for c in RANKING_COLUMNS})
+
+
 def competition_label(girone: Girone | str) -> str:
     """Short label shown in the tables for a competition code: ``'A'`` -> ``'Girone A'``, ``'SB'`` -> ``'Serie B'``."""
     return Girone.parse(girone).short
@@ -1523,12 +1553,13 @@ def ranking_table(state: PipelineState, girone: Girone | None, section: str | No
     Only the current teams of the perimeter are listed and ``Competizione`` is
     the short label of their registry competition (historical opponents never
     appear). ``girone=None`` returns every current team of ``section`` (every
-    section when ``None``); a competition with no fitted teams yields an empty
-    frame with the same columns instead of raising.
+    section when ``None``); a competition with no fitted teams, or one outside
+    ``section`` (:func:`outside_section`), yields an empty frame with the same
+    columns instead of raising.
     """
     g = _as_girone(girone)
-    if g is not None and g not in state.params.teams_by_girone:
-        return pd.DataFrame({c: pd.Series(dtype="string" if c in ("Squadra", "Competizione") else "float64") for c in RANKING_COLUMNS})
+    if g is not None and (g not in state.params.teams_by_girone or outside_section(g, section)):
+        return _empty_ranking()
     ranking = state.engine.ranking(g)
     if g is None and section is not None:
         codes = {x.value for x in configured_gironi(section)}
@@ -1734,9 +1765,11 @@ def current_teams(state: PipelineState, girone: Girone | None = None, section: s
     From the registry when the state has one (every team of the dictionary,
     with or without matches), otherwise the fitted current teams. A competition
     the registry lists without teams (an uninitialised Serie D girone) yields
-    ``[]``.
+    ``[]``, and so does a competition outside ``section`` (:func:`outside_section`).
     """
     g = _as_girone(girone)
+    if outside_section(g, section):
+        return []
     gironi = (g,) if g is not None else configured_gironi(section)
     if state.registry is not None:
         names = [t for x in gironi for t in state.registry.teams_by_girone.get(x, ())]
@@ -1763,9 +1796,12 @@ def results_team_options(
     played yet, or when the season has no match at all. A current team that
     played a past season elsewhere (promoted or relegated since) is therefore
     *not* offered under its present competition for that season, where it would
-    have an empty table. Sorted, without duplicates.
+    have an empty table. Sorted, without duplicates; ``[]`` for a competition
+    outside ``section`` (:func:`outside_section`), whose table is empty too.
     """
     g = _as_girone(girone)
+    if outside_section(g, section):
+        return []
     label = str(state.season_label if season is None else season).replace("_", "/")
     current_label = str(state.season_label).replace("_", "/")
     names: set[str] = set()

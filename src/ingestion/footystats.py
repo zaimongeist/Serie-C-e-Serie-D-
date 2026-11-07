@@ -37,9 +37,24 @@ and xG are often not collected (reported as ``0``/``-1`` and read as missing by
 :func:`parse_stats`) and pre-match odds exist for fewer matches
 (:func:`parse_odds` simply skips the markets without a complete book). The
 season ids of every configured competition (``[competition.season_ids]`` in
-``config/competitions.toml``) are the fallback when ``/league-list`` cannot be
-reached or does not list the league among the account's chosen ones
-(:func:`competition_season_ids`, :meth:`FootyStatsClient.resolve_seasons`).
+``config/competitions.toml``) are the fallback **only** when ``/league-list``
+itself cannot be reached (:func:`competition_season_ids`,
+:meth:`FootyStatsClient.season_resolution`).
+
+Chosen leagues
+--------------
+Every competition to harvest must be among the account's *chosen* leagues on
+footystats.org: the API refuses ``/league-teams`` and ``/league-matches`` of a
+league the account has not chosen (``success: false``, *"League is not chosen by
+the user"*, verified live on 2026-11-07), so no configured season id can stand
+in for it. A requested competition whose league is not chosen is therefore
+**skipped** with a warning naming the league to add
+(:attr:`FootyStatsHarvest.not_chosen`, mirrored in
+:attr:`FootyStatsHarvest.skipped` and printed by the CLI as ``skipped DA: ...``)
+while the other competitions are harvested and written as usual; it is never a
+failure that blocks the CSVs or the exit code. FootyStats plans cap the number
+of chosen leagues, so an account that cannot hold all 13 narrows
+``--competitions`` instead.
 
 Competition codes
 -----------------
@@ -125,6 +140,7 @@ __all__ = [
     "ParseReport",
     "RegistryDiff",
     "SeasonRef",
+    "SeasonResolution",
     "TeamInfo",
     "competition_label",
     "competition_season_ids",
@@ -132,9 +148,11 @@ __all__ = [
     "find_api_key",
     "footystats_league_name",
     "init_registry",
+    "is_not_chosen_refusal",
     "main",
     "mask_key",
     "normalize_code",
+    "not_chosen_reason",
     "parse_match",
     "parse_odds",
     "parse_stats",
@@ -231,6 +249,30 @@ def _utc_now() -> datetime:
 class FootyStatsError(HarvestError):
     """The API answered but refused the request or returned an unusable envelope
     (``success: false``, no ``data`` list, a competition missing from the account)."""
+
+
+#: ``message`` FootyStats puts in the ``success: false`` envelope of ``/league-teams`` and ``/league-matches``
+#: for a league the account has not chosen (verified live on 2026-11-07 with the public example key:
+#: "League is not chosen by the user ... League may not exist, or is not available to this user.").
+_NOT_CHOSEN_RE: Final[re.Pattern[str]] = re.compile(r"(?i)\bnot chosen by the user\b|\bleague is not chosen\b")
+
+
+def not_chosen_reason(league_name: str) -> str:
+    """Why a competition is skipped when ``league_name`` is not among the account's chosen leagues (the advice the CLI prints)."""
+    return (
+        f"{league_name!r} is not among the account's chosen leagues: add it on footystats.org "
+        "(your account -> Choose leagues) or leave it out of --competitions"
+    )
+
+
+def is_not_chosen_refusal(exc: BaseException) -> bool:
+    """Whether ``exc`` is FootyStats refusing a league the account has not chosen.
+
+    True for a :class:`FootyStatsError` raised on a ``success: false`` envelope whose
+    message says *League is not chosen by the user* (what ``/league-teams`` and
+    ``/league-matches`` answer for such a league, whatever season id is passed).
+    """
+    return isinstance(exc, FootyStatsError) and _NOT_CHOSEN_RE.search(str(exc)) is not None
 
 
 class MissingApiKeyError(HarvestError):
@@ -494,7 +536,9 @@ def competition_season_ids(code: "Girone | str", endpoints: FootyStatsEndpoints 
     (``[competition.season_ids]`` in ``config/competitions.toml``) come first;
     ``[footystats.season_ids]`` of ``endpoints.toml`` adds the labels the record
     does not list. These ids are the fallback of
-    :meth:`FootyStatsClient.resolve_seasons`; the live ``/league-list`` always wins.
+    :meth:`FootyStatsClient.season_resolution` **only when** ``/league-list`` itself
+    cannot be reached; they never stand in for a league the account has not chosen
+    (the API refuses its data, so such a competition is skipped instead).
     """
     normalized = normalize_code(code)
     ids: dict[str, int] = {}
@@ -627,6 +671,36 @@ class LeagueInfo:
             country=str(entry.get("country") or "").strip(),
             seasons=seasons,
         )
+
+
+@dataclass(frozen=True)
+class SeasonResolution:
+    """Outcome of :meth:`FootyStatsClient.season_resolution` for a set of competition codes.
+
+    ``seasons`` maps every *resolvable* code to its newest seasons (newest first);
+    ``not_chosen`` the codes whose league ``/league-list`` did not list among the
+    account's chosen leagues (code -> FootyStats league name): the API refuses
+    their data, so they carry no seasons and the caller skips them.
+    ``chosen_leagues`` are the league names the account holds (empty when the list
+    could not be read) and ``from_configured_ids`` says that ``/league-list`` was
+    unreachable and every season came from the configured ids
+    (``[competition.season_ids]`` of ``config/competitions.toml``).
+    """
+
+    seasons: dict[str, list[SeasonRef]]
+    not_chosen: dict[str, str] = field(default_factory=dict)
+    chosen_leagues: tuple[str, ...] = ()
+    from_configured_ids: bool = False
+
+    @property
+    def codes(self) -> tuple[str, ...]:
+        """The competition codes that resolved, in request order."""
+        return tuple(self.seasons)
+
+    def reason(self, code: "Girone | str") -> str | None:
+        """The skip reason of a not-chosen competition (``None`` when it resolved)."""
+        name = self.not_chosen.get(normalize_code(code))
+        return not_chosen_reason(name) if name is not None else None
 
 
 @dataclass(frozen=True, slots=True)
@@ -895,73 +969,88 @@ class FootyStatsClient:
         leagues = [LeagueInfo.from_payload(entry) for entry in entries if isinstance(entry, Mapping)]
         return [league for league in leagues if league is not None]
 
-    async def resolve_seasons(self, competition_codes: Iterable["Girone | str"], seasons: int = 3) -> dict[str, list[SeasonRef]]:
-        """Newest ``seasons`` seasons (label + id) of every competition code, newest first.
+    async def season_resolution(self, competition_codes: Iterable["Girone | str"], seasons: int = 3) -> SeasonResolution:
+        """Newest ``seasons`` seasons (label + id) of every competition code, plus the leagues the account lacks.
 
         Competitions are looked up by :func:`footystats_league_name` among the
-        account's *chosen* leagues. A competition that is **not chosen** falls
-        back to its configured season ids (:func:`competition_season_ids`:
-        ``[competition.season_ids]`` of ``config/competitions.toml``, then
-        ``[footystats.season_ids]`` of ``endpoints.toml``) with a warning naming
-        the league the user should add on footystats.org; only a competition with
-        no configured ids raises :class:`FootyStatsError` with the same advice.
-        When ``/league-list`` itself cannot be reached the configured ids are
-        used for every requested competition (logged as a warning) and the error
-        propagates when one of them has none.
+        account's *chosen* leagues (``/league-list?chosen_leagues_only=true``). A
+        competition whose league is **not chosen** is returned in
+        :attr:`SeasonResolution.not_chosen` instead of being resolved: FootyStats
+        refuses ``/league-teams`` and ``/league-matches`` of such a league (*League
+        is not chosen by the user*), so no configured season id can stand in for
+        it; a warning names the league to add on footystats.org. Only when
+        ``/league-list`` itself cannot be reached are the configured season ids
+        (:func:`competition_season_ids`: ``[competition.season_ids]`` of
+        ``config/competitions.toml``, then ``[footystats.season_ids]`` of
+        ``endpoints.toml``) used for every requested competition, with a warning
+        (``from_configured_ids``); the error propagates when one of them has none.
+        A chosen league that lists no season raises :class:`FootyStatsError`.
         """
         if int(seasons) < 1:
             raise ValueError("seasons must be >= 1")
         codes = list(dict.fromkeys(normalize_code(code) for code in competition_codes))
         names = {code: footystats_league_name(code, self.endpoints) for code in codes}
         list_url = self.endpoints.url_league_list()
-        fallback = {code: competition_season_ids(code, self.endpoints) for code in codes}
-
-        def from_configured(code: str) -> list[SeasonRef]:
-            return LeagueInfo(names[code], names[code], "", fallback[code]).newest_seasons(seasons)
-
         try:
             leagues = await self.league_list(chosen_only=True)
         except HarvestError as exc:
+            fallback = {code: competition_season_ids(code, self.endpoints) for code in codes}
             if codes and all(fallback.values()):
                 log.warning(
                     "league-list unavailable, using configured season ids",
                     extra={"error": self.mask(exc), "competitions": codes},
                 )
-                return {code: from_configured(code) for code in codes}
+                return SeasonResolution(
+                    seasons={code: LeagueInfo(names[code], names[code], "", fallback[code]).newest_seasons(seasons) for code in codes},
+                    from_configured_ids=True,
+                )
             raise
         by_name = {league.name.casefold(): league for league in leagues}
+        chosen = tuple(sorted(league.name for league in leagues))
         out: dict[str, list[SeasonRef]] = {}
-        missing: list[str] = []
+        not_chosen: dict[str, str] = {}
         for code in codes:
             league = by_name.get(names[code].casefold())
             if league is None:
-                if fallback[code]:
-                    out[code] = from_configured(code)
-                    log.warning(
-                        "league not among the account's chosen leagues, using configured season ids",
-                        extra={
-                            "competition": code,
-                            "league": names[code],
-                            "seasons": [ref.label for ref in out[code]],
-                            "advice": f"add {names[code]!r} on footystats.org (your account -> Choose leagues)",
-                        },
-                    )
-                    continue
-                missing.append(names[code])
+                not_chosen[code] = names[code]
+                log.warning(
+                    "league not among the account's chosen leagues, competition skipped",
+                    extra={
+                        "competition": code,
+                        "league": names[code],
+                        "advice": not_chosen_reason(names[code]),
+                        "chosen_leagues": list(chosen),
+                    },
+                )
                 continue
             refs = league.newest_seasons(seasons)
             if not refs:
                 raise FootyStatsError(f"no season listed for {names[code]!r}", url=list_url)
             out[code] = refs
-        if missing:
+        return SeasonResolution(seasons=out, not_chosen=not_chosen, chosen_leagues=chosen)
+
+    async def resolve_seasons(self, competition_codes: Iterable["Girone | str"], seasons: int = 3) -> dict[str, list[SeasonRef]]:
+        """Newest ``seasons`` seasons (label + id) of every competition code, newest first.
+
+        The strict form of :meth:`season_resolution`: a competition whose league is
+        not among the account's chosen leagues raises :class:`FootyStatsError`
+        naming the leagues to add on footystats.org (and the ones chosen now), so
+        callers that need *every* requested competition (``--init-registry``) stop
+        with a clear message. :meth:`FootyStatsProvider.harvest` uses
+        :meth:`season_resolution` and skips such competitions instead. When
+        ``/league-list`` is unreachable the configured season ids are used, as in
+        :meth:`season_resolution`.
+        """
+        resolution = await self.season_resolution(competition_codes, seasons=seasons)
+        if resolution.not_chosen:
             raise FootyStatsError(
-                "competitions not among the account's chosen leagues and without configured season ids: "
-                + ", ".join(repr(name) for name in missing)
-                + " -- add them on footystats.org (your account -> Choose leagues) and retry; chosen now: "
-                + ", ".join(sorted(league.name for league in leagues)),
-                url=list_url,
+                "competitions not among the account's chosen leagues: "
+                + ", ".join(repr(name) for name in resolution.not_chosen.values())
+                + " -- add them on footystats.org (your account -> Choose leagues) and retry, or leave them out; chosen now: "
+                + (", ".join(resolution.chosen_leagues) or "none"),
+                url=self.endpoints.url_league_list(),
             )
-        return {code: out[code] for code in codes if code in out}
+        return resolution.seasons
 
     async def league_teams(self, season_id: int, *, stable: bool = False) -> list[TeamInfo]:
         """``/league-teams`` of one season (``stable`` for a completed season: long cache TTL)."""
@@ -1355,7 +1444,12 @@ class FootyStatsHarvest:
     ``n_matches_by_competition`` the completed matches per code and season and
     ``n_matches_by_season`` the same totals per season. ``failures`` records a
     season that could not be fetched (``"<code>:<season>"``), ``skipped`` a
-    competition the schema cannot store yet (code -> reason).
+    competition that was not harvested at all (code -> reason): one the schema
+    cannot store yet, or one whose league the FootyStats account has **not
+    chosen** (the API refuses its data; such codes are also listed in
+    ``not_chosen`` as code -> league name, so the caller can print what to add on
+    footystats.org). Skipped competitions are not failures: the CSVs of the other
+    competitions are written and the CLI exit code stays 0.
     ``initialised_competitions`` lists the competitions whose team dictionary was
     empty and was filled from ``/league-teams`` during this harvest (the Serie D
     gironi on the first run; see ``FootyStatsProvider.harvest(auto_init_registry=...)``),
@@ -1377,6 +1471,7 @@ class FootyStatsHarvest:
     provider: str = "footystats"
     initialised_competitions: tuple[str, ...] = ()
     registry_path: Path | None = None
+    not_chosen: dict[str, str] = field(default_factory=dict)
 
     def problem_for(self, code: "Girone | str") -> str | None:
         """Why competition ``code`` delivered nothing (``None`` when it delivered)."""
@@ -1417,7 +1512,8 @@ class FootyStatsHarvest:
             f"requests={self.stats.get('requests', 0)} cache_hits={self.stats.get('cache_hits', 0)} "
             f"retries={self.stats.get('retries', 0)} errors={self.stats.get('errors', 0)} "
             f"failures={len(self.failures)} skipped={len(self.skipped)} "
-            f"initialised={','.join(self.initialised_competitions) or '-'}"
+            f"initialised={','.join(self.initialised_competitions) or '-'} "
+            f"not_chosen={','.join(self.not_chosen) or '-'}"
         )
 
 
@@ -1483,7 +1579,10 @@ class FootyStatsProvider:
         request order) and the team listings fetched, so the harvest of the current
         season reuses them instead of calling ``/league-teams`` twice. Nothing is
         written when every competition already has teams; a registry whose season is
-        not a season label (synthetic leagues) is never touched.
+        not a season label (synthetic leagues) is never touched. A competition whose
+        ``/league-teams`` fails (the API refusing a league the account has not chosen,
+        a transient error) is left without teams with a warning and the others are
+        still initialised: the harvest of its seasons then reports the problem.
         """
         registry = self.registry
         empty = [code for code in codes if not registry.teams(code) and season_refs.get(code)]
@@ -1498,6 +1597,7 @@ class FootyStatsProvider:
             )
             return (), {}
         listings: dict[str, list[TeamInfo]] = {}
+        unavailable: dict[str, str] = {}
         for code in empty:
             refs = season_refs[code]
             chosen = next((ref for ref in refs if ref.label == registry.season_label), refs[0])
@@ -1506,7 +1606,28 @@ class FootyStatsProvider:
                     "registry auto-init: the registry season is not listed for the competition, using its newest season",
                     extra={"competition": code, "registry_season": registry.season_label, "season": chosen.label},
                 )
-            listings[code] = await self.client.league_teams(chosen.season_id, stable=season_completed(chosen.label, now.date()))
+            try:
+                listings[code] = await self.client.league_teams(chosen.season_id, stable=season_completed(chosen.label, now.date()))
+            except HarvestError as exc:
+                unavailable[code] = self.client.mask(exc)
+                refused = is_not_chosen_refusal(exc)
+                log.warning(
+                    "registry auto-init: league-teams unavailable, competition left without teams",
+                    extra={
+                        "competition": code,
+                        "season": chosen.label,
+                        "season_id": chosen.season_id,
+                        "status": exc.status,
+                        "error": unavailable[code],
+                        "advice": (
+                            not_chosen_reason(footystats_league_name(code, self.endpoints))
+                            if refused
+                            else "the harvest of its seasons retries and reports the failure"
+                        ),
+                    },
+                )
+        if not listings:
+            return (), {}
         diff = write_registry_update(self.registry_path, registry.season_label, listings, matcher=self.mapper.matcher)
         self._reload_registry()
         initialised = tuple(code for code in empty if self.registry.teams(code))
@@ -1521,11 +1642,11 @@ class FootyStatsProvider:
                 "conflicts": len(diff.conflicts),
             },
         )
-        not_filled = [code for code in empty if code not in initialised]
+        not_filled = [code for code in empty if code not in initialised and code not in unavailable]
         if not_filled:
             log.warning(
                 "registry auto-init left competitions without teams",
-                extra={"competitions": not_filled, "listed_by_footystats": {code: len(listings[code]) for code in not_filled}},
+                extra={"competitions": not_filled, "listed_by_footystats": {code: len(listings.get(code, ())) for code in not_filled}},
             )
         return initialised, listings
 
@@ -1603,6 +1724,13 @@ class FootyStatsProvider:
         newest season of each competition only. A season that fails is recorded
         in :attr:`FootyStatsHarvest.failures` and the rest is kept; a competition
         the schema cannot store yet is recorded in :attr:`FootyStatsHarvest.skipped`.
+        A competition whose league is **not among the account's chosen leagues**
+        is skipped too (:attr:`FootyStatsHarvest.not_chosen` and ``skipped``, with
+        the advice to add it on footystats.org) and nothing of it is fetched: the
+        API would refuse it, and a skipped competition is not a failure, so the
+        other competitions are still written. The same happens when
+        ``/league-list`` was unreachable, the configured season ids stood in and
+        the API then refuses a league as not chosen (:func:`is_not_chosen_refusal`).
         With ``auto_init_registry`` (the default) every requested competition that
         has **no current team** in the registry (the Serie D gironi on the first
         run, or a new season's file) is initialised first: its ``/league-teams``
@@ -1638,11 +1766,22 @@ class FootyStatsProvider:
         last_error: HarvestError | None = None
         initialised: tuple[str, ...] = ()
         prefetched: dict[str, list[TeamInfo]] = {}
+        not_chosen: dict[str, str] = {}
+        resolved: list[str] = []
+
+        def skip_not_chosen(code: str, league: str) -> None:
+            not_chosen[code] = league
+            skipped[code] = not_chosen_reason(league)
+
         if supported:
-            season_refs = await self.client.resolve_seasons(supported, seasons=seasons)
-            if auto_init_registry:
-                initialised, prefetched = await self._auto_init_registry(supported, season_refs, now=now)
-            for code in supported:
+            resolution = await self.client.season_resolution(supported, seasons=seasons)
+            season_refs = resolution.seasons
+            for code, league in resolution.not_chosen.items():
+                skip_not_chosen(code, league)
+            resolved = [code for code in supported if code in season_refs]
+            if auto_init_registry and resolved:
+                initialised, prefetched = await self._auto_init_registry(resolved, season_refs, now=now)
+            for code in resolved:
                 refs = season_refs.get(code, [])
                 labels[code] = [ref.label for ref in refs]
                 counts[code] = {}
@@ -1653,6 +1792,20 @@ class FootyStatsProvider:
                             code, ref, current=index == 0, with_odds=with_odds, now=now, teams=listing
                         )
                     except HarvestError as exc:
+                        if is_not_chosen_refusal(exc):
+                            # /league-list was unreachable and the configured ids stood in: the account has not
+                            # chosen this league, so every season of it is refused -> a skip, not a failure
+                            league = footystats_league_name(code, self.endpoints)
+                            skip_not_chosen(code, league)
+                            labels.pop(code, None)
+                            counts.pop(code, None)
+                            for key in [k for k in failures if k.split(":", 1)[0] == code]:
+                                failures.pop(key)
+                            log.warning(
+                                "competition skipped: FootyStats refused the league as not chosen by the account",
+                                extra={"competition": code, "league": league, "season": ref.label, "season_id": ref.season_id, "advice": skipped[code]},
+                            )
+                            break
                         last_error = exc
                         failures[f"{code}:{ref.label}"] = self.client.mask(exc)
                         log.error(
@@ -1668,7 +1821,12 @@ class FootyStatsProvider:
                 self.mapper.save()
             except OSError as exc:
                 log.warning("team mapping not saved", extra={"path": str(self.mapper.mapping_path), "error": str(exc)})
-        if supported and not records and not fixtures and last_error is not None:
+        if not_chosen:
+            log.warning(
+                "competitions skipped: leagues not among the account's chosen leagues",
+                extra={"competitions": list(not_chosen), "leagues": list(not_chosen.values()), "advice": "add them on footystats.org (Choose leagues) or narrow --competitions"},
+            )
+        if resolved and not records and not fixtures and last_error is not None:
             raise last_error
         seen: set[str] = set()
         fixtures_unique = [f for f in fixtures if not (f.match_id in seen or seen.add(f.match_id))]
@@ -1696,6 +1854,7 @@ class FootyStatsProvider:
             skipped=skipped,
             initialised_competitions=initialised,
             registry_path=self.registry_path if initialised else None,
+            not_chosen=not_chosen,
         )
         log.info("footystats harvest complete", extra={"summary": result.summary()})
         return result
@@ -1743,7 +1902,11 @@ class RegistryDiff:
     ``keep_existing_aliases=False``. ``skipped_aliases`` (canonical -> spellings)
     are FootyStats spellings that were **not** written because another club of
     the file already answers to them (one normalised spelling must resolve to
-    one club, or the dictionary would not load).
+    one club, or the dictionary would not load). ``suggestions`` (written clean
+    name -> dictionary name it resembles) are teams written with their FootyStats
+    ``cleanName`` although a *fuzzy* match pointed at a name the dictionaries
+    know: the resemblance is never adopted (``'Trestina'``, Serie D, is not
+    ``'Triestina'``, a former Serie C club), only reported for a manual check.
     """
 
     path: Path
@@ -1757,6 +1920,7 @@ class RegistryDiff:
     unlisted_teams: dict[str, list[str]] = field(default_factory=dict)
     removed_aliases: dict[str, list[str]] = field(default_factory=dict)
     skipped_aliases: dict[str, list[str]] = field(default_factory=dict)
+    suggestions: dict[str, str] = field(default_factory=dict)
 
     def describe(self) -> str:
         lines = [f"{'created' if self.created else 'updated'} {self.path} (season {self.season})"]
@@ -1770,6 +1934,11 @@ class RegistryDiff:
             lines.append(
                 f"  aliases not written for {len(self.skipped_aliases)} teams (spelling already used by another club): "
                 + "; ".join(f"{c}: {', '.join(a)}" for c, a in self.skipped_aliases.items())
+            )
+        if self.suggestions:
+            lines.append(
+                f"  {len(self.suggestions)} teams written with their FootyStats clean name although they resemble a dictionary name "
+                "(not adopted; check by hand): " + "; ".join(f"{written} ~ {known}" for written, known in self.suggestions.items())
             )
         lines.append(f"  unchanged teams: {self.unchanged_teams}")
         for code, teams in self.unlisted_teams.items():
@@ -1796,8 +1965,13 @@ def write_registry_update(
 
     For every team of every competition the schema supports: the canonical name
     is the dictionary's when ``matcher`` (ideally built on the previous season
-    with historical aliases) recognises one of the FootyStats spellings, else
-    ``cleanName``; the aliases are the existing ones plus ``name``,
+    with historical aliases) recognises one of the FootyStats *identity*
+    spellings (``cleanName``, ``name``, ``english_name``) through an **exact or
+    alias** hit, else ``cleanName``. A fuzzy hit is never adopted: a Serie D club
+    whose name merely resembles a former Serie C club (``'Trestina'`` vs
+    ``'Triestina'``) keeps its own name and the resemblance is reported in
+    ``suggestions``; cross-division continuity works through the aliases of the
+    previous season's file. The aliases are the existing ones plus ``name``,
     ``english_name`` and ``alt_names``. With ``keep_existing_aliases=False`` the
     existing aliases are *replaced* by the FootyStats spellings and what was
     dropped is reported in ``removed_aliases``. Teams already in the file are
@@ -1833,6 +2007,7 @@ def write_registry_update(
     new_aliases: dict[str, list[str]] = {}
     removed_aliases: dict[str, list[str]] = {}
     skipped_aliases: dict[str, list[str]] = {}
+    suggestions: dict[str, str] = {}
     conflicts: dict[str, str] = {}
     skipped: dict[str, str] = {}
     listed_by_code: dict[str, set[str]] = {}
@@ -1858,7 +2033,7 @@ def write_registry_update(
         owners = spelling_owners()
         for team in teams:
             canonical: str | None = None
-            fuzzy: str | None = None
+            resembles: str | None = None
             if matcher is not None:
                 for spelling in team.identity_spellings:
                     result = matcher.match(spelling, None)
@@ -1867,20 +2042,24 @@ def write_registry_update(
                     if result.method in {"exact", "alias"}:
                         canonical = result.canonical
                         break
-                    if fuzzy is None:
-                        fuzzy = result.canonical
+                    if resembles is None:
+                        resembles = result.canonical
             if canonical is None:
                 for spelling in team.identity_spellings:
                     canonical = owners.get(normalize_name(spelling))
                     if canonical is not None:
                         break
-            if canonical is None and fuzzy is not None:
-                # a fuzzy guess is trusted only when it does not clash with a club the file already
-                # places elsewhere: 'Pro Sesto' must not land on 'Pro Patria' and vanish as a conflict
-                if not any(g != code and fuzzy in members for g, members in gironi.items()):
-                    canonical = fuzzy
             if canonical is None:
+                # never adopt a fuzzy hit: the pool of historical names grows every season and a Serie D
+                # club whose name resembles a former Serie C club ('Trestina' / 'Triestina', score 94)
+                # would silently become that club in the dictionary and in the joint fit
                 canonical = team.clean_name or team.name
+                if resembles is not None and normalize_name(resembles) != normalize_name(canonical):
+                    suggestions[canonical] = resembles
+                    log.warning(
+                        "FootyStats team written with its clean name although it resembles a dictionary name (check by hand)",
+                        extra={"path": str(path), "competition": code, "team": canonical, "resembles": resembles, "spellings": list(team.identity_spellings)},
+                    )
             elsewhere = [g for g, members in gironi.items() if g != code and canonical in members]
             if elsewhere:
                 conflicts[canonical] = f"FootyStats lists it in {code}, the file in {elsewhere[0]}; left unchanged"
@@ -1951,6 +2130,7 @@ def write_registry_update(
         unlisted_teams=unlisted,
         removed_aliases=removed_aliases,
         skipped_aliases=skipped_aliases,
+        suggestions=suggestions,
     )
     log.info(
         "team dictionary written",
@@ -1961,6 +2141,7 @@ def write_registry_update(
             "new_aliases": len(new_aliases),
             "removed_aliases": len(removed_aliases),
             "skipped_aliases": len(skipped_aliases),
+            "suggestions": suggestions,
             "unlisted": {c: len(t) for c, t in unlisted.items()},
         },
     )
@@ -1986,7 +2167,8 @@ def _build_parser() -> argparse.ArgumentParser:
         metavar="CODE",
         help="competition codes of config/competitions.toml: "
         + ", ".join(f"{member.value} = {member.label}" for member in Girone)
-        + "; default: every configured competition (%(default)s)",
+        + "; default: every configured competition (%(default)s). Every league must be chosen on the FootyStats account: "
+        "a competition whose league is not chosen is skipped with a warning (the others are still written)",
     )
     parser.add_argument(
         "--no-auto-init",
@@ -2017,7 +2199,13 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cache-dir", type=Path, default=RAW_DIR, help="raw JSON cache directory")
     parser.add_argument("--mapping", type=Path, default=DEFAULT_MAPPING_PATH, help="persisted team-id mapping JSON")
     parser.add_argument("--endpoints", type=Path, default=CONFIG_DIR / "endpoints.toml", help="endpoints TOML file")
-    parser.add_argument("--config-dir", type=Path, default=CONFIG_DIR, help="directory of the team dictionaries")
+    parser.add_argument(
+        "--config-dir",
+        type=Path,
+        default=CONFIG_DIR,
+        help="directory of the team dictionaries: the perimeter is read from, and the auto-init writes to, "
+        "<config-dir>/teams_<season>.json (default: %(default)s)",
+    )
     return parser
 
 
@@ -2091,7 +2279,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     cache = RawCache(Path(args.cache_dir), ttl=endpoints.http.cache_ttl, stable_ttl=endpoints.http.history_cache_ttl)
     client = FootyStatsClient(api_key=key, endpoints=endpoints.footystats, http=endpoints.http, cache=cache)
     mapper = FootyStatsTeamMapper(registry, matcher, mapping_path=args.mapping)
-    provider = FootyStatsProvider(client, mapper, endpoints.footystats)
+    # the auto-init writes the dictionary it was read from: --config-dir, never the repository's config/
+    registry_path = Path(args.config_dir) / f"teams_{season_file_stem(args.season)}.json"
+    provider = FootyStatsProvider(client, mapper, endpoints.footystats, config_dir=Path(args.config_dir), registry_path=registry_path)
 
     async def run_list() -> int:
         async with client:
@@ -2144,6 +2334,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"failure {name}: {mask_key(message, key)}", file=sys.stderr)
         for code, reason in result.skipped.items():
             print(f"skipped {code}: {reason}", file=sys.stderr)
+        if result.not_chosen:
+            print(
+                "leagues not chosen on the FootyStats account (competitions skipped, not failures): "
+                + ", ".join(f"{code} = {league}" for code, league in result.not_chosen.items())
+                + " -- add them on footystats.org (Choose leagues) or narrow --competitions",
+                file=sys.stderr,
+            )
         if not complete:
             print("harvest incomplete: " + ("no matches harvested" if result.matches.empty else f"{len(result.failures)} failures"), file=sys.stderr)
         return 0 if complete else 1

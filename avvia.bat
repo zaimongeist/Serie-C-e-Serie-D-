@@ -51,6 +51,7 @@ if not defined USE_FOOTYSTATS if not exist ".env" (
 if defined USE_FOOTYSTATS (
   echo ^>^> Aggiorno i dati reali da FootyStats ^(Serie C Gironi A/B/C + Serie B + Serie D Gironi A-I, ultime 3 stagioni, quote pre-match^)...
   echo    Serie D: alla prima esecuzione le liste squadre dei 9 gironi vengono create in config\teams_2026_27.json dall'API.
+  echo    Le competizioni la cui lega non e' fra quelle scelte nel tuo account FootyStats vengono saltate ^(le altre sono aggiornate comunque^).
   REM Nessun --competitions = tutte le competizioni di config\competitions.toml ^(13^).
   python -m src.ingestion.footystats --seasons 3 --odds-out data\odds\footystats.csv
 ) else (

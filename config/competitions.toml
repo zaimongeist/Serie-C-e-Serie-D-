@@ -20,8 +20,13 @@
 # the competition is then not served by that provider (Serie D). FootyStats
 # resolves its own season ids from /league-list; the optional
 # [competition.season_ids] sub-table (season label -> FootyStats season id,
-# verified live on 2026-11-06) is the fallback used when /league-list cannot be
-# reached or the league is not among the account's chosen leagues.
+# verified live on 2026-11-06) is a fallback that the FootyStats harvester uses
+# only when /league-list itself cannot be reached. It cannot stand in for a
+# league the account has not chosen:
+# the API refuses the data of such a league ("League is not chosen by the user"),
+# so every competition to harvest must be among the account's chosen leagues and
+# a competition whose league is not chosen is skipped by the harvester with a
+# warning (the others are harvested as usual).
 #
 # Serie D (tier 4) has nine gironi of 18 teams (34 rounds), codes DA..DI, family
 # "Serie D". Their team lists are NOT known offline: the FootyStats harvester

@@ -74,9 +74,15 @@ history_cache_ttl_hours = 8760
 # (the `footystats_name` of every [[competition]] in config/competitions.toml):
 #   Italy Serie C Group A, Italy Serie C Group B, Italy Serie C Group C, Italy Serie B,
 #   Italy Serie D Group A .. Italy Serie D Group I (nine leagues)
-# A league that is not chosen falls back to its configured season ids
+# EVERY competition to harvest MUST be among the account's chosen leagues: the API
+# refuses /league-teams and /league-matches of a league that is not chosen
+# ("League is not chosen by the user", verified 2026-11-07), whatever season id is
+# passed. A requested competition whose league is not chosen is therefore skipped
+# with a warning naming the league to add (the others are harvested and written as
+# usual). FootyStats plans cap the number of chosen leagues: narrow --competitions
+# when the account cannot hold all 13. The configured season ids
 # ([competition.season_ids] in competitions.toml, then [footystats.season_ids] below)
-# with a warning; the live /league-list always wins when it answers.
+# are a fallback used only when /league-list itself cannot be reached.
 base_url = "https://api.football-data-api.com"
 league_list = "/league-list"
 league_matches = "/league-matches"

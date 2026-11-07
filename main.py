@@ -1228,8 +1228,9 @@ def main(argv: Sequence[str] | None = None) -> PipelineOutput:
         if sec == SECTION_D and serie_d_gironi():
             status = registry_serie_d_status(registry, current)
             print(f"Serie D {status}.")
+            # the command carries --season when the perimeter season is not the harvester default, so it fills the file named here
             print(
-                f"Comando: {serie_d_harvest_command()} (oppure avvia.bat / avvia.command con la chiave FootyStats in .env): "
+                f"Comando: {serie_d_harvest_command(season=registry.season)} (oppure avvia.bat / avvia.command con la chiave FootyStats in .env): "
                 f"la prima raccolta inizializza i {len(serie_d_gironi())} gironi in config/teams_{season_label.replace('/', '_')}.json dalle liste squadre dell'API."
             )
         elif sec == SECTION_D:

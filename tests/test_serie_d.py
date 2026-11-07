@@ -3,7 +3,10 @@ simulator and engine behaviour, FootyStats auto-init of the team lists, automati
 
 The FootyStats side runs offline on ``httpx.MockTransport``: the router serves a league list with the Serie D
 league, a synthetic 18-team ``/league-teams`` listing and ``/league-matches`` rows with the thin statistics
-FootyStats publishes for Serie D (shots and xG at ``0``, no odds fields at all).
+FootyStats publishes for Serie D (shots and xG at ``0``, no odds fields at all). Like the live API (verified
+2026-11-07) it refuses ``/league-teams`` and ``/league-matches`` of a league the account has not chosen with the
+``success: false`` envelope *League is not chosen by the user*, and it always lists ``Italy Serie C Group A``
+(served with the shipped girone A teams) so the tests can check that Serie C is still written when Serie D is not.
 """
 from __future__ import annotations
 
@@ -41,7 +44,7 @@ from src.common.schemas import Girone, validate_matches_df
 from src.common.teams import PerimeterLabel, TeamRegistry, load_registry, normalize_name
 from src.engine.model import DixonColesConfig, DixonColesEngine, build_team_index
 from src.ingestion import footystats as fs
-from src.ingestion.harvester import Harvester, HttpConfig, load_endpoints
+from src.ingestion.harvester import Harvester, HttpConfig, _write_decision, load_endpoints
 from src.ingestion.team_matcher import TeamMatcher
 from src.simulation.generator import (
     DEFAULT_HOME_ADVANTAGE,
@@ -66,6 +69,13 @@ SEASON_IDS = {
     "DH": {"2024/25": 13477, "2025/26": 15693, "2026/27": 17674},
     "DI": {"2024/25": 13472, "2025/26": 15705, "2026/27": 17675},
 }
+#: ``Italy Serie C Group A``: always among the chosen leagues of the mock account (ids of config/competitions.toml).
+SERIE_C_A_IDS = {"2024/25": 12659, "2025/26": 15535, "2026/27": 17487}
+#: ``message`` of the ``success: false`` envelope the live API answers for a league the account has not chosen.
+NOT_CHOSEN_MESSAGE = (
+    "League is not chosen by the user. Please contact support or check your account settings. "
+    "League may not exist, or is not available to this user."
+)
 KEY = "serie-d-test-key-0123456789"
 HOST = "api.football-data-api.com"
 NOW = datetime(2026, 11, 7, 12, 0, tzinfo=timezone.utc)
@@ -322,6 +332,16 @@ SERIE_D_TEAMS: tuple[tuple[int, str, str, str, list[str]], ...] = tuple(
 SHARED_NICKNAME = "I Biancazzurri"
 
 
+#: The shipped Serie C girone A clubs as FootyStats would list them (ids 8001..): already in the dictionary, so no auto-init.
+SERIE_C_A_TEAMS: tuple[tuple[int, str, str, str, list[str]], ...] = tuple(
+    (8000 + i, f"{name} Calcio", name, name, []) for i, name in enumerate(load_registry().teams("A"), start=1)
+)
+
+
+def _teams_payload(teams: tuple[tuple[int, str, str, str, list[str]], ...]) -> list[dict[str, Any]]:
+    return [{"id": team_id, "name": name, "cleanName": clean, "english_name": english, "alt_names": list(alt)} for team_id, name, clean, english, alt in teams]
+
+
 def _serie_d_teams_payload() -> list[dict[str, Any]]:
     rows = []
     for team_id, name, clean, english, alt in SERIE_D_TEAMS:
@@ -332,17 +352,16 @@ def _serie_d_teams_payload() -> list[dict[str, Any]]:
 
 def _season_shift(season_id: int) -> int:
     """Seconds to subtract from the 2026/27 kick-offs so that a past season's matches fall in their own season."""
-    for ids in SEASON_IDS.values():
+    for ids in (*SEASON_IDS.values(), SERIE_C_A_IDS):
         for label, candidate in ids.items():
             if candidate == season_id:
                 return (2026 - int(label[:4])) * 365 * 86400
     return 0
 
 
-def _serie_d_matches_payload(season_id: int) -> list[dict[str, Any]]:
+def _serie_d_matches_payload(season_id: int, teams: tuple[tuple[int, str, str, str, list[str]], ...] = SERIE_D_TEAMS) -> list[dict[str, Any]]:
     """Three complete matches with the thin Serie D statistics (no shots, no xG, no odds fields) and one fixture."""
     rows: list[dict[str, Any]] = []
-    teams = SERIE_D_TEAMS
     shift = _season_shift(season_id)
     for k, kickoff in enumerate(unix - shift for unix in PLAYED_UNIX):
         home, away = teams[2 * k], teams[2 * k + 1]
@@ -389,24 +408,44 @@ def _serie_d_matches_payload(season_id: int) -> list[dict[str, Any]]:
     return rows
 
 
-def make_router(*, chosen: tuple[str, ...] = ("DA",), teams_payload: list[dict[str, Any]] | None = None) -> Callable[[httpx.Request], httpx.Response]:
-    """Serve the Serie D leagues in ``chosen``; every Serie D season id answers with the synthetic teams and matches."""
-    all_ids = {season_id for ids in SEASON_IDS.values() for season_id in ids.values()}
+def make_router(
+    *,
+    chosen: tuple[str, ...] = ("DA",),
+    teams_payload: list[dict[str, Any]] | None = None,
+    league_list_status: int | None = None,
+) -> Callable[[httpx.Request], httpx.Response]:
+    """A mock FootyStats account holding ``Italy Serie C Group A`` plus the Serie D leagues in ``chosen``.
+
+    Every known season id answers with synthetic teams and matches (the shipped girone A clubs for Serie C, the
+    ``SERIE_D_TEAMS`` for Serie D) **when its league is chosen**; the season ids of a Serie D league that is not
+    chosen get the live refusal envelope (``success: false``, :data:`NOT_CHOSEN_MESSAGE`), exactly like the real
+    API. ``league_list_status`` makes ``/league-list`` fail with that HTTP status (the only case where the
+    configured season ids may stand in).
+    """
+    serie_d_ids = {season_id: code for code, ids in SEASON_IDS.items() for season_id in ids.values()}
+    serie_c_ids = set(SERIE_C_A_IDS.values())
 
     def router(request: httpx.Request) -> httpx.Response:
         assert request.url.host == HOST and request.url.params.get("key") == KEY
         path = request.url.path
         if path == "/league-list":
+            if league_list_status is not None:
+                return httpx.Response(league_list_status, json={"error": "down"})
             entries = [_league_entry(f"Italy Serie D Group {code[1]}", f"Serie D Group {code[1]}", SEASON_IDS[code]) for code in chosen]
-            entries.append(_league_entry("Italy Serie C Group A", "Serie C Group A", {"2026/27": 17487, "2025/26": 15535, "2024/25": 12659}))
+            entries.append(_league_entry("Italy Serie C Group A", "Serie C Group A", SERIE_C_A_IDS))
             return _envelope(entries)
         season_id = int(request.url.params.get("season_id", "0"))
-        if season_id not in all_ids:
+        if season_id not in serie_d_ids and season_id not in serie_c_ids:
             return httpx.Response(200, json={"success": False, "message": "unknown season"})
+        if season_id in serie_d_ids and serie_d_ids[season_id] not in chosen:
+            return httpx.Response(200, json={"success": False, "message": NOT_CHOSEN_MESSAGE})
+        teams = SERIE_C_A_TEAMS if season_id in serie_c_ids else SERIE_D_TEAMS
         if path == "/league-teams":
+            if season_id in serie_c_ids:
+                return _envelope(_teams_payload(SERIE_C_A_TEAMS))
             return _envelope(teams_payload if teams_payload is not None else _serie_d_teams_payload())
         if path == "/league-matches":
-            return _envelope(_serie_d_matches_payload(season_id))
+            return _envelope(_serie_d_matches_payload(season_id, teams))
         return httpx.Response(404, json={"success": False, "message": "not found"})
 
     return router
@@ -514,18 +553,35 @@ async def test_harvest_without_auto_init_keeps_serie_d_teams_historical(http_cfg
 
 
 @pytest.mark.asyncio
-async def test_resolve_seasons_falls_back_to_the_configured_serie_d_ids(http_cfg: HttpConfig, config_copy: Path, tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
-    """``Italy Serie D Group B`` is not among the chosen leagues: its ids come from competitions.toml, with a warning."""
-    provider, _ = make_provider(http_cfg, config_copy, tmp_path / "map.json", router=make_router(chosen=("DA",)))
+async def test_season_resolution_skips_a_serie_d_league_the_account_has_not_chosen(http_cfg: HttpConfig, config_copy: Path, tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    """``Italy Serie D Group B`` is not among the chosen leagues: it is reported as not chosen (the API refuses its data),
+    never resolved from the configured ids; those ids stand in only when ``/league-list`` itself is unreachable."""
+    provider, transport = make_provider(http_cfg, config_copy, tmp_path / "map.json", router=make_router(chosen=("DA",)))
     with caplog.at_level(logging.WARNING):
         async with provider.client:
-            resolved = await provider.client.resolve_seasons(["DA", "DB"], seasons=3)
-    assert [r.season_id for r in resolved["DA"]] == [17664, 15710, 13475] and [r.season_id for r in resolved["DB"]] == [17667, 15706, 13232]
-    warning = next(r for r in caplog.records if r.getMessage() == "league not among the account's chosen leagues, using configured season ids")
+            resolution = await provider.client.season_resolution(["DA", "DB"], seasons=3)
+            with pytest.raises(fs.FootyStatsError, match="'Italy Serie D Group B'") as caught:
+                await provider.client.resolve_seasons(["DA", "DB"], seasons=3)
+    assert [r.season_id for r in resolution.seasons["DA"]] == [17664, 15710, 13475] and resolution.codes == ("DA",)
+    assert resolution.not_chosen == {"DB": "Italy Serie D Group B"} and not resolution.from_configured_ids
+    assert resolution.chosen_leagues == ("Italy Serie C Group A", "Italy Serie D Group A")
+    assert resolution.reason("DB") == fs.not_chosen_reason("Italy Serie D Group B") and "footystats.org" in resolution.reason("DB")
+    assert "Italy Serie D Group A" in str(caught.value) and "Choose leagues" in str(caught.value)
+    warning = next(r for r in caplog.records if r.getMessage() == "league not among the account's chosen leagues, competition skipped")
     assert warning.competition == "DB" and warning.league == "Italy Serie D Group B" and "footystats.org" in warning.advice
+    assert all(r.url.path == "/league-list" for r in transport.requests), "nothing of an unchosen league is ever requested"
+    # the configured ids exist for every competition ...
     assert fs.competition_season_ids("DB") == SEASON_IDS["DB"] and fs.competition_season_ids(Girone.DI) == SEASON_IDS["DI"]
-    assert fs.competition_season_ids("A", load_endpoints().footystats) == {"2024/25": 12659, "2025/26": 15535, "2026/27": 17487}
+    assert fs.competition_season_ids("A", load_endpoints().footystats) == SERIE_C_A_IDS
     assert fs.competition_season_ids("ZZ") == {} and fs.competition_season_ids("ZZ", load_endpoints().footystats) == {}
+    # ... and are used only when /league-list cannot be reached (then for every requested competition, with a warning)
+    down, _ = make_provider(http_cfg, config_copy, tmp_path / "map2.json", router=make_router(chosen=("DA",), league_list_status=503))
+    with caplog.at_level(logging.WARNING):
+        async with down.client:
+            offline = await down.client.season_resolution(["DA", "DB"], seasons=3)
+    assert offline.from_configured_ids and offline.not_chosen == {} and offline.chosen_leagues == ()
+    assert [r.season_id for r in offline.seasons["DB"]] == [17667, 15706, 13232] and [r.season_id for r in offline.seasons["DA"]] == [17664, 15710, 13475]
+    assert any(r.getMessage() == "league-list unavailable, using configured season ids" for r in caplog.records)
 
 
 def test_write_registry_update_never_writes_a_dictionary_that_would_not_load(tmp_path: Path) -> None:
@@ -624,3 +680,206 @@ def test_launchers_harvest_every_competition_with_footystats() -> None:
         assert "--competitions A B C SB" not in footy_line, "FootyStats runs for every configured competition (Serie D included)"
         assert "Serie D" in text
         assert re.search(r"src\.ingestion\.harvester --gironi A B C --seasons 3", text), "the SofaScore path stays A B C"
+
+
+# ============================================================================ review findings: unchosen leagues, fuzzy names, --config-dir
+def _patch_cli_client(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, router: Callable[[httpx.Request], httpx.Response]) -> CountingTransport:
+    """Make ``fs.main`` talk to ``router``: no key in the environment, the mock transport injected into every client."""
+    monkeypatch.delenv("FOOTYSTATS_API_KEY", raising=False)
+    monkeypatch.setattr(fs, "DEFAULT_ENV_FILE", tmp_path / "absent.env")
+    monkeypatch.setattr(fs, "_utc_now", lambda: NOW)
+    transport = CountingTransport(router)
+    real_client = fs.FootyStatsClient
+
+    def with_transport(**kwargs: Any) -> fs.FootyStatsClient:
+        kwargs.setdefault("transport", transport)
+        kwargs.setdefault("sleeper", RecordingSleeper())
+        return real_client(**kwargs)
+
+    monkeypatch.setattr(fs, "FootyStatsClient", with_transport)
+    return transport
+
+
+def _cli_args(config_copy: Path, tmp_path: Path, *competitions: str) -> list[str]:
+    return [
+        "--competitions", *competitions, "--seasons", "1", "--key", KEY, "--config-dir", str(config_copy),
+        "--out", str(tmp_path / "p" / "matches.csv"), "--fixtures-out", str(tmp_path / "p" / "fixtures.csv"),
+        "--odds-out", str(tmp_path / "o" / "footystats.csv"), "--cache-dir", str(tmp_path / "raw"), "--mapping", str(tmp_path / "map.json"),
+    ]  # fmt: skip
+
+
+@pytest.mark.asyncio
+async def test_harvest_skips_serie_d_leagues_the_account_has_not_chosen_and_still_delivers_serie_c(
+    http_cfg: HttpConfig, config_copy: Path, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Finding 1: an account holding Serie C Group A but no Serie D league must still get Serie C, with the Serie D gironi
+    reported as skipped (not chosen), never as failures that block the CSVs, and nothing of them requested."""
+    before = _digest(config_copy / "teams_2026_27.json")
+    provider, transport = make_provider(http_cfg, config_copy, tmp_path / "map.json", router=make_router(chosen=()))
+    with caplog.at_level(logging.WARNING):
+        async with provider.client:
+            result = await provider.harvest(["A", "DA", "DB"], seasons=1)
+    assert len(result.matches) == 3 and set(result.matches["girone"]) == {"A"} and result.seasons == {"A": ["2026/27"]}
+    assert result.matches["home_team"].isin(provider.registry.teams("A")).all() and result.unmapped_teams == {}
+    assert result.failures == {} and result.initialised_competitions == () and result.registry_path is None
+    assert result.not_chosen == {"DA": "Italy Serie D Group A", "DB": "Italy Serie D Group B"}
+    assert result.skipped == {"DA": fs.not_chosen_reason("Italy Serie D Group A"), "DB": fs.not_chosen_reason("Italy Serie D Group B")}
+    assert result.problem_for("DA") == result.skipped["DA"] and result.problem_for("A") is None
+    assert "not_chosen=DA,DB" in result.summary() and "  DA: skipped (" in "\n".join(result.season_lines())
+    assert "footystats.org" in result.skipped["DA"] and "Choose leagues" in result.skipped["DA"]
+    # nothing of the unchosen leagues was requested (the API would refuse it) and the dictionary was not touched
+    serie_d_ids = {season_id for ids in SEASON_IDS.values() for season_id in ids.values()}
+    assert not any(int(r.url.params.get("season_id", "0")) in serie_d_ids for r in transport.requests)
+    assert [r.url.path for r in transport.requests] == ["/league-list", "/league-teams", "/league-matches"]
+    assert _digest(config_copy / "teams_2026_27.json") == before
+    # a skipped competition is not a partial harvest: the CLI writes the CSVs without --allow-partial
+    assert _write_decision(result, tmp_path / "absent.csv", allow_partial=False) == (True, None)
+    summary = next(r for r in caplog.records if r.getMessage() == "competitions skipped: leagues not among the account's chosen leagues")
+    assert summary.competitions == ["DA", "DB"] and summary.leagues == ["Italy Serie D Group A", "Italy Serie D Group B"]
+
+
+@pytest.mark.asyncio
+async def test_refusal_of_an_unchosen_league_during_auto_init_and_harvest_is_a_skip(
+    http_cfg: HttpConfig, config_copy: Path, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Finding 1, league-list unreachable: the configured ids stand in, FootyStats then refuses the unchosen Serie D league
+    (live envelope) both in the auto-init and in the harvest -- a warning and a skip each time, Serie C still delivered."""
+    before = _digest(config_copy / "teams_2026_27.json")
+    provider, transport = make_provider(http_cfg, config_copy, tmp_path / "map.json", router=make_router(chosen=(), league_list_status=503))
+    with caplog.at_level(logging.WARNING):
+        async with provider.client:
+            result = await provider.harvest(["A", "DA"], seasons=1)
+    assert len(result.matches) == 3 and result.seasons == {"A": ["2026/27"]} and result.failures == {}
+    assert result.not_chosen == {"DA": "Italy Serie D Group A"} and result.skipped == {"DA": fs.not_chosen_reason("Italy Serie D Group A")}
+    assert result.initialised_competitions == () and result.registry_path is None and provider.registry.teams("DA") == ()
+    assert _digest(config_copy / "teams_2026_27.json") == before
+    init_warning = next(r for r in caplog.records if r.getMessage() == "registry auto-init: league-teams unavailable, competition left without teams")
+    assert init_warning.competition == "DA" and init_warning.season_id == 17664 and "footystats.org" in init_warning.advice and KEY not in init_warning.error
+    refused = next(r for r in caplog.records if r.getMessage() == "competition skipped: FootyStats refused the league as not chosen by the account")
+    assert refused.competition == "DA" and refused.league == "Italy Serie D Group A"
+    assert not any(r.getMessage() == "footystats season failed" for r in caplog.records), "a refusal is a skip, not a failure"
+    refusals = [r for r in transport.requests if int(r.url.params.get("season_id", "0")) == 17664]
+    assert [r.url.path for r in refusals] == ["/league-teams", "/league-teams"], "auto-init and harvest each asked once; no league-matches after the refusal"
+    assert _write_decision(result, tmp_path / "absent.csv", allow_partial=False) == (True, None)
+    assert fs.is_not_chosen_refusal(fs.FootyStatsError(f"API refused the request: {NOT_CHOSEN_MESSAGE}", url="u"))
+    assert not fs.is_not_chosen_refusal(fs.FootyStatsError("API refused the request: Invalid API key", url="u"))
+    assert not fs.is_not_chosen_refusal(RuntimeError(NOT_CHOSEN_MESSAGE))
+
+
+def test_cli_writes_serie_c_and_exits_0_when_the_serie_d_leagues_are_not_chosen(
+    monkeypatch: pytest.MonkeyPatch, config_copy: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Finding 1, end to end: the default run on an account without the Serie D leagues writes Serie C and exits 0."""
+    shipped_before = _digest(CONFIG_DIR / "teams_2026_27.json")
+    _patch_cli_client(monkeypatch, tmp_path, make_router(chosen=()))
+    code = fs.main(_cli_args(config_copy, tmp_path, "A", "DA", "DB", "DC"))
+    captured = capsys.readouterr()
+    assert code == 0, captured.err
+    assert "matches=3 fixtures=1" in captured.out and "  A: 2026/27: 3 matches" in captured.out and "  DA: skipped (" in captured.out
+    assert "skipped DA: 'Italy Serie D Group A' is not among the account's chosen leagues" in captured.err
+    assert "leagues not chosen on the FootyStats account (competitions skipped, not failures): DA = Italy Serie D Group A, DB = Italy Serie D Group B, DC = Italy Serie D Group C" in captured.err
+    assert "harvest incomplete" not in captured.err and "failure " not in captured.err and KEY not in captured.out + captured.err
+    frame = pd.read_csv(tmp_path / "p" / "matches.csv")
+    assert len(frame) == 3 and set(frame["girone"]) == {"A"} and (tmp_path / "p" / "fixtures.csv").exists()
+    assert _digest(CONFIG_DIR / "teams_2026_27.json") == shipped_before
+    assert json.loads((config_copy / "teams_2026_27.json").read_text(encoding="utf-8"))["gironi"]["DA"] == {}
+
+
+def test_cli_auto_init_writes_the_dictionary_of_config_dir_not_the_repository(
+    monkeypatch: pytest.MonkeyPatch, config_copy: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Finding 3: with --config-dir the auto-init fills <config-dir>/teams_2026_27.json; the shipped file is untouched."""
+    shipped_before = _digest(CONFIG_DIR / "teams_2026_27.json")
+    _patch_cli_client(monkeypatch, tmp_path, make_router(chosen=("DA",)))
+    code = fs.main(_cli_args(config_copy, tmp_path, "DA"))
+    captured = capsys.readouterr()
+    assert code == 0, captured.err
+    assert f"registry initialised: DA (18 teams) -> {config_copy / 'teams_2026_27.json'}" in captured.out
+    assert "perimeter: season 2026/27 (98 current teams)" in captured.out
+    saved = json.loads((config_copy / "teams_2026_27.json").read_text(encoding="utf-8"))
+    assert len(saved["gironi"]["DA"]) == 18 and saved["gironi"]["DB"] == {}
+    assert _digest(CONFIG_DIR / "teams_2026_27.json") == shipped_before, "the repository's dictionary must not change behind the user's back"
+    assert json.loads((CONFIG_DIR / "teams_2026_27.json").read_text(encoding="utf-8"))["gironi"]["DA"] == {}
+    frame = pd.read_csv(tmp_path / "p" / "matches.csv")
+    assert len(frame) == 3 and set(frame["girone"]) == {"DA"} and set(frame["home_team"]) <= set(saved["gironi"]["DA"])
+
+
+def test_write_registry_update_never_adopts_a_fuzzy_match_as_canonical(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    """Finding 2: 'Trestina' (Serie D) resembles 'Triestina' (Serie C 2025/26, historical): the clean name is written and
+    the resemblance only reported; a club the dictionaries really know (exact / alias hit) keeps its dictionary name."""
+    registry = load_registry("2026_27", CONFIG_DIR)
+    matcher = TeamMatcher(Harvester.registry_with_history(registry, CONFIG_DIR))
+    probe = matcher.match("Trestina", None)
+    assert probe.canonical == "Triestina" and probe.method == "fuzzy" and matcher.is_historical("Triestina"), "precondition: the fuzzy trap exists"
+    path = tmp_path / "teams_2026_27.json"
+    shutil.copy(CONFIG_DIR / "teams_2026_27.json", path)
+    trestina = fs.TeamInfo(id=7001, name="Sporting Club Trestina", clean_name="Trestina")
+    triestina = fs.TeamInfo(id=7002, name="US Triestina", clean_name="Triestina")  # alias hit in teams_2025_26.json
+    with caplog.at_level(logging.WARNING):
+        diff = fs.write_registry_update(path, "2026/27", {"DE": [trestina], "DA": [triestina]}, matcher=matcher)
+    saved = json.loads(path.read_text(encoding="utf-8"))
+    assert saved["gironi"]["DE"] == {"Trestina": ["Sporting Club Trestina"]} and "Triestina" not in saved["gironi"]["DE"]
+    assert saved["gironi"]["DA"] == {"Triestina": []}, "cross-division continuity still works through the previous season's aliases ('US Triestina' normalises like the canonical: no new alias)"
+    assert diff.added_teams == {"DE": ["Trestina"], "DA": ["Triestina"]} and diff.suggestions == {"Trestina": "Triestina"}
+    assert "Trestina ~ Triestina" in diff.describe() and "check by hand" in diff.describe()
+    record = next(r for r in caplog.records if r.getMessage().startswith("FootyStats team written with its clean name"))
+    assert record.team == "Trestina" and record.resembles == "Triestina" and record.competition == "DE"
+    reloaded = TeamRegistry.from_json(path)
+    assert reloaded.exact("Trestina") == "Trestina" and reloaded.exact("Sporting Club Trestina") == "Trestina"
+    assert reloaded.exact("US Triestina") == "Triestina" and reloaded.is_current_team("Trestina") and reloaded.is_current_team("Triestina")
+    # a second pass is idempotent and reports nothing new
+    again = fs.write_registry_update(path, "2026/27", {"DE": [trestina]}, matcher=matcher)
+    assert again.added_teams == {} and again.suggestions == {} and again.unchanged_teams == 1
+
+
+def test_publish_launchers_also_push_the_dictionaries_filled_by_the_auto_init() -> None:
+    """Finding 5: pubblica_dati.* must stage config/teams_2026_27.json and config/footystats_teams.json with the CSVs."""
+    for name, sep in (("pubblica_dati.command", "/"), ("pubblica_dati.bat", "\\")):
+        text = (ROOT / name).read_text(encoding="utf-8")
+        for file in ("teams_2026_27.json", "footystats_teams.json"):
+            assert f"config{sep}{file}" in text, f"{name} must git add config{sep}{file}"
+        assert re.search(r"(?m)^(if exist|\[ -f) .*footystats_teams\.json", text), f"{name}: the git add of the dictionaries is guarded by their existence"
+        assert "data" in text and "matches.csv" in text
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    assert "pubblica_dati" in readme and "config/footystats_teams.json" in readme
+
+
+def test_env_example_lists_every_configured_footystats_league() -> None:
+    """Finding 7: the .env template names the nine Serie D leagues (every footystats_name of competitions.toml)."""
+    text = (ROOT / ".env.example").read_text(encoding="utf-8")
+    for comp in COMPETITIONS:
+        assert comp.footystats_name in text, f".env.example must list {comp.footystats_name!r}"
+    assert "FOOTYSTATS_API_KEY=" in text and "Choose leagues" in text
+
+
+def test_docs_say_that_every_league_must_be_chosen_and_that_ids_stand_in_only_for_a_league_list_outage() -> None:
+    """Finding 4: README, workflow comment, endpoints.toml and competitions.toml agree with the live API."""
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    workflow = (ROOT / ".github" / "workflows" / "aggiorna-dati.yml").read_text(encoding="utf-8")
+    endpoints = (ROOT / "config" / "endpoints.toml").read_text(encoding="utf-8")
+    competitions = (ROOT / "config" / "competitions.toml").read_text(encoding="utf-8")
+    module_doc = fs.__doc__ or ""
+    for text, name in ((readme, "README"), (workflow, "workflow"), (endpoints, "endpoints.toml"), (competitions, "competitions.toml"), (module_doc, "module docstring")):
+        assert not re.search(r"(?i)non scelta ripiega|lega non scelta ripiega|not chosen falls back|non è fra quelle scelte nell'account \(la lista live", text), name
+        assert "not chosen by the user" in text or "League is not chosen" in text or "non scelta" in text, f"{name} must say what the API does with an unchosen league"
+    assert "League is not chosen by the user" in readme and "saltata" in readme and "Choose leagues" in readme
+    assert re.search(r"(?i)limitano il numero di leghe|limite .*leghe", readme), "the README mentions the per-plan cap on chosen leagues"
+    assert "only when /league-list itself cannot be reached" in endpoints and "only when /league-list itself cannot be reached" in competitions
+    assert "saltata" in workflow and "ripiega" not in workflow
+
+
+def test_workflow_error_summary_checks_429_and_403_before_the_unchosen_league_clause_and_lists_skipped_gironi() -> None:
+    """Finding 6 (and 1): the error summary greps the real refusal text after the 429/403 checks, never claims that
+    season ids are missing, and the success summary lists the competitions skipped because their league is not chosen."""
+    path = ROOT / ".github" / "workflows" / "aggiorna-dati.yml"
+    workflow = yaml.safe_load(path.read_text(encoding="utf-8"))
+    steps = {step["name"]: step for step in workflow["jobs"]["harvest"]["steps"]}
+    error = steps["Riepilogo in caso di errore"]["run"]
+    assert "non ha season id configurati" not in error
+    clauses = [line for line in error.splitlines() if re.match(r"\s*(if|elif) grep", line)]
+    position = {key: next(i for i, line in enumerate(clauses) if key in line) for key in ("API key", "429", "403", "not chosen by the user")}
+    assert position["API key"] < position["429"] < position["not chosen by the user"] and position["403"] < position["not chosen by the user"]
+    assert "API refused the request" in error and "Choose leagues" in error
+    assert not any("chosen leagues" in line and "not chosen by the user" not in line for line in clauses), "the WARNING text alone is not an error"
+    summary = steps["Riepilogo (partite per competizione e stagione)"]["run"]
+    assert "^skipped " in summary and "non è scelta nell'account FootyStats" in summary and "registry initialised" in summary

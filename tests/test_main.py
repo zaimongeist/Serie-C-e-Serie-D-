@@ -449,6 +449,19 @@ def test_section_d_without_initialised_serie_d_prints_the_status_and_the_command
 
 
 @needs_serie_d
+def test_section_d_command_carries_the_season_of_a_non_default_perimeter(capsys: pytest.CaptureFixture[str]) -> None:
+    """Regression: the banner says the harvest initialises ``config/teams_<season>.json`` for the perimeter season, but the
+    printed command had no ``--season`` and the harvester CLI defaults to 2026/27, so a user running it on ``--season
+    2025_26`` initialised the wrong dictionary. The command now carries the perimeter season when it is not the default."""
+    out = pipeline.main(["--mode", "mini", "--no-export", "--log-level", "ERROR", "--season", "2025_26", "--section", "d"])
+    console = capsys.readouterr().out
+    assert out.registry.season_label == "2025/26" and "SEZIONE SERIE D -- non disponibile" in console
+    command = "Comando: python -m src.ingestion.footystats --competitions DA DB DC DD DE DF DG DH DI --seasons 3 --season 2025_26 (oppure avvia.bat"
+    assert command in console and "inizializza i 9 gironi in config/teams_2025_26.json" in console
+    assert "--seasons 3 (oppure" not in console, "the short command (harvester default season) would fill teams_2026_27.json"
+
+
+@needs_serie_d
 def test_serie_d_demo_requires_the_simulated_full_mode(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     with pytest.raises(SystemExit) as exc:
         pipeline.main(["--mode", "mini", "--no-export", "--serie-d-demo"])

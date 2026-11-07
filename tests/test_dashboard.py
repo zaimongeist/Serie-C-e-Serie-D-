@@ -66,6 +66,7 @@ from src.dashboard.state import (
     fixtures_for,
     heatmap_figure,
     in_section,
+    outside_section,
     load_odds_quotes,
     markets_table,
     matchday_csv_bytes,
@@ -111,7 +112,7 @@ from src.dashboard.state import (
     value_opportunities,
     value_table,
 )
-from src.common.teams import TeamRegistry, load_registry
+from src.common.teams import DEFAULT_SEASON, TeamRegistry, load_registry
 from src.engine.picks import PICKS_COLUMNS
 from src.engine.tables import team_form
 from src.ingestion.harvester import save_fixtures, save_processed
@@ -1278,6 +1279,14 @@ def test_app_non_default_season_renders_on_its_own_calendar(monkeypatch: pytest.
     assert len(options) == 40 and all("2025-11-09" in o for o in options)
     assert any("Calendario simulato al 2025-11-06" in m.value for m in at.markdown)
     assert any("Storica 01" in m.value or "Caldiero Terme" in m.value for m in at.markdown), "the padded history is reported"
+    if SERIE_D:
+        # regression: the 2025/26 dictionary has no Serie D teams and the notice names config/teams_2025_26.json,
+        # so the command it prints must carry --season 2025_26 (the harvester default would fill another file)
+        at.radio(key="section").set_value("Serie D").run()
+        assert not at.exception, [e.value for e in at.exception]
+        command = "python -m src.ingestion.footystats --competitions DA DB DC DD DE DF DG DH DI --seasons 3 --season 2025_26"
+        notices = [i.value for i in at.info if "Serie D non inizializzata" in i.value]
+        assert len(notices) == 6 and all(f"`{command}`" in n and "config/teams_2025_26.json" in n for n in notices), notices
 
 
 def test_app_resolves_today_on_every_run_and_survives_a_pipeline_error(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1353,6 +1362,8 @@ def test_section_helpers_are_configuration_driven() -> None:
     assert configured_gironi(SECTION_D) == SERIE_D and all(g.family == "Serie D" for g in SERIE_D)
     assert all(in_section(g, None) for g in Girone) and in_section("A", SECTION_BC) and in_section(Girone.SB, SECTION_BC)
     assert not in_section(Girone.A, SECTION_D) and (not SERIE_D or in_section(SERIE_D[0], SECTION_D) and not in_section(SERIE_D[0], SECTION_BC))
+    assert not outside_section(None, SECTION_D) and not outside_section(Girone.A, None) and not outside_section("A", SECTION_BC)
+    assert outside_section(Girone.A, SECTION_D) and (not SERIE_D or outside_section(SERIE_D[0], SECTION_BC) and not outside_section(SERIE_D[0], SECTION_D))
     assert competition_options(SECTION_BC) == ("Tutti", "Girone A", "Girone B", "Girone C", "Serie B")
     assert competition_options(None) == ("Tutti", *(g.short for g in Girone))
     assert all_sections() == ((SECTION_BC, SECTION_D) if SERIE_D else (SECTION_BC,)) and sections_for([Girone.SB]) == (SECTION_BC,)
@@ -1363,6 +1374,13 @@ def test_section_helpers_are_configuration_driven() -> None:
         assert sections_for(SERIE_D[:1]) == (SECTION_D,) and sections_for([Girone.A, SERIE_D[0]]) == (SECTION_BC, SECTION_D)
         assert serie_d_harvest_command() == "python -m src.ingestion.footystats --competitions DA DB DC DD DE DF DG DH DI --seasons 3"
         assert serie_d_harvest_command(SERIE_D[:2]) == "python -m src.ingestion.footystats --competitions DA DB --seasons 3"
+        # regression: the command initialises config/teams_<--season>.json, so a non-default perimeter season is passed on
+        assert serie_d_harvest_command(season=DEFAULT_SEASON) == serie_d_harvest_command(season=DEFAULT_SEASON.replace("_", "/")) == serie_d_harvest_command()
+        assert serie_d_harvest_command(season="") == serie_d_harvest_command(season=None) == serie_d_harvest_command()
+        other = next(s for s in ("2025_26", "2027_28") if s != DEFAULT_SEASON)
+        expected = f"python -m src.ingestion.footystats --competitions DA DB DC DD DE DF DG DH DI --seasons 3 --season {other}"
+        assert serie_d_harvest_command(season=other) == serie_d_harvest_command(season=other.replace("_", "/")) == expected
+        assert serie_d_harvest_command(SERIE_D[:1], season=other) == f"python -m src.ingestion.footystats --competitions DA --seasons 3 --season {other}"
         # the status texts, by counts
         assert serie_d_status_text(0, 0) == SERIE_D_STATUS_NOT_INITIALISED == "non inizializzata: esegui la raccolta FootyStats con la chiave"
         assert serie_d_status_text(162, 0) == "inizializzata: 162 squadre, 0 partite nei dati: esegui la raccolta FootyStats con la chiave"
@@ -1469,6 +1487,14 @@ def test_serie_d_state_splits_every_view_by_section(serie_d_state: PipelineState
     assert len(results_table_for(state, girone=SERIE_D[0], section=SECTION_D)) == 36 and results_table_for(state, girone=Girone.A, section=SECTION_D).empty
     assert len(current_teams(state, section=SECTION_D)) == 162 == len(results_team_options(state, section=SECTION_D)) and len(current_teams(state, SERIE_D[0])) == 18
     assert len(current_teams(state, section=SECTION_BC)) == 80 and len(current_teams(state)) == 242
+    # regression: a competition outside the section yields nothing from every helper, not the other section's data
+    cross_ranking = ranking_table(state, Girone.A, SECTION_D)
+    assert cross_ranking.empty and list(cross_ranking.columns) == list(RANKING_COLUMNS) and ranking_table(state, SERIE_D[0], SECTION_BC).empty
+    assert len(ranking_table(state, Girone.A, SECTION_BC)) == 20 and len(ranking_table(state, SERIE_D[2], SECTION_D)) == 18 == len(ranking_table(state, SERIE_D[2]))
+    assert current_teams(state, Girone.A, SECTION_D) == [] and current_teams(state, SERIE_D[0], SECTION_BC) == []
+    assert len(current_teams(state, Girone.A, SECTION_BC)) == 20 and len(current_teams(state, SERIE_D[0], SECTION_D)) == 18
+    assert results_team_options(state, Girone.A, None, SECTION_D) == [] and results_team_options(state, SERIE_D[0], "2026/27", SECTION_BC) == []
+    assert len(results_team_options(state, Girone.A, None, SECTION_BC)) == 20 and len(results_team_options(state, SERIE_D[0], None, SECTION_D)) == 18
     assert seasons_available(state, SECTION_D) == ["2026/27"] and len(section_matches(state.current_matches, SECTION_D)) == 324
     assert coverage_text(state, SECTION_D) == "Copertura 2026/27: 4.0 partite per squadra nella competizione meno coperta"
     # the Serie D fixture labels carry the code, the widget keys the section slug

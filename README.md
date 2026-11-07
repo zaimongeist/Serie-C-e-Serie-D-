@@ -74,7 +74,10 @@ serve qualche decina di minuti, poi è veloce grazie alla cache).
 Per aprire solo la dashboard senza aggiornare i dati: `avvia.bat --solo-dashboard`.
 Le quote dei bookmaker vanno in `data/odds/*.csv` (formato più sotto).
 Per pubblicare i CSV raccolti sul repository (così li vede anche la dashboard in cloud):
-`pubblica_dati.bat` / `pubblica_dati.command` (serve git e una copia clonata, non lo ZIP).
+`pubblica_dati.bat` / `pubblica_dati.command` (serve git e una copia clonata, non lo ZIP). Oltre ai CSV caricano anche i
+dizionari che la raccolta FootyStats aggiorna in locale, `config/teams_2026_27.json` (liste dei gironi di Serie D create
+dall'auto-init) e `config/footystats_teams.json` (mappa id FootyStats → nome canonico): senza di loro la dashboard in
+cloud vedrebbe le partite di Serie D ma gironi «non inizializzati».
 
 ## ⏱️ Aggiornamento automatico dopo ogni giornata (GitHub Actions)
 
@@ -82,7 +85,8 @@ Il workflow `.github/workflows/aggiorna-dati.yml` gira lunedì e giovedì alle 0
 *Actions → Aggiorna dati Serie C, Serie B e Serie D → Run workflow*), raccoglie le ultime tre stagioni di **tutte le
 13 competizioni configurate** e committa `data/processed/matches.csv`, `fixtures.csv`, `data/odds/footystats.csv`,
 `config/footystats_teams.json` e `config/teams_2026_27.json` (quando l'auto-init della Serie D lo modifica) solo se
-sono cambiati. Il riepilogo del job mostra le partite per competizione e stagione e i gironi di Serie D inizializzati.
+sono cambiati. Il riepilogo del job mostra le partite per competizione e stagione, i gironi di Serie D inizializzati e le
+competizioni saltate perché la loro lega non è fra quelle scelte nell'account FootyStats.
 
 - **Con FootyStats (consigliato, funziona sui runner GitHub)**: salva la chiave API come *segreto* di repository
   `FOOTYSTATS_API_KEY` (Settings → Secrets and variables → Actions → New repository secret). Il job esegue
@@ -98,7 +102,8 @@ sono cambiati. Il riepilogo del job mostra le partite per competizione e stagion
   runner, segui i comandi mostrati) e imposta la variabile di repository `HARVEST_RUNNER = self-hosted`
   (Settings → Secrets and variables → Actions → Variables). Lo stesso job partirà sul tuo PC, con il tuo IP,
   quando è acceso e il runner è in esecuzione. È la via affidabile.
-- **A mano**: `avvia.bat` / `avvia.command` raccolgono i dati, poi `pubblica_dati.*` li carica sul repository.
+- **A mano**: `avvia.bat` / `avvia.command` raccolgono i dati, poi `pubblica_dati.*` carica sul repository i CSV e i
+  due dizionari aggiornati dalla raccolta (`config/teams_2026_27.json`, `config/footystats_teams.json`).
 
 I CSV in `data/processed/` e `data/odds/` sono versionati; la cache grezza `data/raw/` no.
 
@@ -158,8 +163,8 @@ footystats_name = "Italy Serie B"    # campo `name` di /league-list su FootyStat
 sofascore_tournament_id = 53         # id SofaScore (legacy); 0 se sconosciuto
 tier = 2                             # livello della piramide (2 = Serie B, 3 = Serie C)
 family = "Serie B"                   # lega di appartenenza: i tre gironi condividono "Serie C", i nove di Serie D "Serie D"
-[competition.season_ids]             # opzionale: season id FootyStats per stagione = fallback quando /league-list non
-"2024/25" = 12621                    # risponde o la lega non è fra quelle scelte nell'account (la lista live vince sempre)
+[competition.season_ids]             # opzionale: season id FootyStats per stagione = fallback usato SOLO se /league-list
+"2024/25" = 12621                    # non risponde (una lega non scelta nell'account viene saltata: l'API la rifiuta)
 "2025/26" = 15632
 "2026/27" = 17404
 ```
@@ -207,9 +212,14 @@ dell'interfaccia (selettore *Sezione* della dashboard, `--section d` a console),
 Serie C: le squadre promosse e retrocesse collegano le divisioni, il fattore campo per competizione e il vincolo
 Σα = 0 per girone tengono i gironi confrontabili. Come arrivano i dati:
 
-- **Solo FootyStats**: SofaScore non copre la Serie D. Servono nel tuo account footystats.org le nove leghe
-  *Italy Serie D Group A* … *Italy Serie D Group I* (*Choose leagues*); una lega non scelta ripiega sui season id di
-  `config/competitions.toml` con un avviso.
+- **Solo FootyStats**: SofaScore non copre la Serie D. Le nove leghe *Italy Serie D Group A* … *Italy Serie D Group I*
+  **devono** essere fra le leghe scelte del tuo account footystats.org (*Choose leagues*): l'API rifiuta i dati di una
+  lega non scelta (`League is not chosen by the user`, verificato il 7 novembre 2026), qualunque season id si passi,
+  quindi i season id di `config/competitions.toml` non possono sostituirla. Una competizione la cui lega non è scelta
+  viene **saltata** con un avviso che nomina la lega da aggiungere (riga `skipped DA: …` in console,
+  `FootyStatsHarvest.not_chosen`), senza fermare né invalidare la raccolta di Serie B e Serie C, che vengono scritte
+  normalmente (exit code 0). I piani FootyStats limitano il numero di leghe scelte: se non puoi aggiungerle tutte,
+  restringi `--competitions` (o l'input `competitions` del workflow) alle leghe che hai.
 - **Liste squadre inizializzate dall'API (auto-init)**: le composizioni dei nove gironi **non sono nel codice**. In
   `config/teams_2026_27.json` le chiavi `DA` … `DI` sono oggetti vuoti; la prima raccolta FootyStats con la chiave
   (`python -m src.ingestion.footystats`, `avvia.*`, il job GitHub Actions) chiama `/league-teams` della stagione
@@ -258,10 +268,13 @@ fallback (sezione successiva).
    in log, cache (`data/raw/`), messaggi d'errore né nei file prodotti.
 2. **Leghe dell'account**: su footystats.org aggiungi al tuo account (*Choose leagues*) **Italy Serie C Group A**,
    **Italy Serie C Group B**, **Italy Serie C Group C**, **Italy Serie B** e le nove leghe **Italy Serie D Group A** …
-   **Italy Serie D Group I**. L'API elenca solo le leghe scelte (`/league-list?chosen_leagues_only=true`): una lega
-   non scelta ripiega sui season id configurati in `config/competitions.toml` (`[competition.season_ids]`) con un
-   avviso che nomina la lega da aggiungere; solo una competizione senza id configurati ferma l'harvester.
-   Verifica con `python -m src.ingestion.footystats --list-leagues`.
+   **Italy Serie D Group I**. **Ogni competizione da raccogliere deve essere fra le leghe scelte**: l'API elenca solo
+   quelle (`/league-list?chosen_leagues_only=true`) e rifiuta `/league-teams` e `/league-matches` di una lega non
+   scelta (`League is not chosen by the user`), quindi una competizione la cui lega manca viene saltata con un avviso
+   che nomina la lega da aggiungere (`skipped DA: …`) mentre le altre vengono scritte normalmente. I piani FootyStats
+   limitano il numero di leghe scelte: se non puoi aggiungerle tutte, restringi `--competitions` (es. `A B C SB`). I
+   season id di `config/competitions.toml` (`[competition.season_ids]`) sono un fallback usato solo se `/league-list`
+   non risponde. Verifica con `python -m src.ingestion.footystats --list-leagues`.
 3. **Raccolta**:
 
 ```bash
@@ -291,7 +304,8 @@ python main.py --processed data/processed/matches.csv --fixtures data/processed/
   (le istruzioni stampate quando manca la chiave elencano i `footystats_name` di tutte le competizioni configurate).
 - Storico: per ogni competizione vengono scaricate le ultime `--seasons` stagioni elencate dall'API (season id
   risolti a runtime da `/league-list`; `[competition.season_ids]` di `competitions.toml`, poi
-  `[footystats.season_ids]` di `endpoints.toml`, sono il fallback se la lista non risponde o non elenca la lega).
+  `[footystats.season_ids]` di `endpoints.toml`, sono il fallback solo se la lista non risponde; una lega che la lista
+  non elenca non è scelta nell'account e viene saltata, vedi sopra).
   Tutte le squadre che vi hanno partecipato restano nello storico, anche quelle poi retrocesse, promosse o
   fallite: mantengono la loro grafia canonica (*historical teams*) e servono a valutare le avversarie, ma non
   entrano in classifica/previsioni. Le partite `suspended`/`canceled` sono scartate; le `incomplete` future della
@@ -442,7 +456,9 @@ scp data/processed/matches.csv data/processed/fixtures.csv utente@server:/percor
   la chiave le inizializza da `/league-teams` in `config/teams_<stagione>.json`; finché la sezione non è inizializzata
   ogni tab mostra un solo avviso con lo stato (`Serie D non inizializzata: esegui la raccolta FootyStats con la chiave`)
   e il comando esatto (`python -m src.ingestion.footystats --competitions DA DB DC DD DE DF DG DH DI --seasons 3`,
-  oppure `avvia.bat` / `avvia.command`); il badge della sidebar e *Dettagli pipeline* riportano sempre lo stato
+  seguito da `--season <stagione>` quando la stagione del perimetro — `SERIEC_SEASON` — non è quella di default del
+  raccoglitore, così inizializza proprio quel dizionario; oppure `avvia.bat` / `avvia.command`); il badge della
+  sidebar e *Dettagli pipeline* riportano sempre lo stato
   (`inizializzata: 162 squadre, N partite della stagione …`). Le statistiche di Serie D su FootyStats sono più povere e
   tutto degrada senza errori: xG e tiri spesso mancano (colonne `-`, λ e μ stimati dai gol), senza xG il filtro
   REGRESSION_TRAP non scatta (l'alert lo dice), le quote coprono meno partite (pannello valore in parte vuoto, con una
@@ -504,8 +520,11 @@ scp data/processed/matches.csv data/processed/fixtures.csv utente@server:/percor
   perimetro; le fasi 3-8 (ranking per competizione, tabella giornata, valore, alert, selezioni 5 X / 12 GG calcolate
   dentro la sezione) sono stampate **una volta per sezione**, ognuna con il proprio banner (`SEZIONE SERIE D --
   Perimetro: Serie D 2026/27 Gironi A-I (162 squadre) · …`). Corrono solo le sezioni con squadre: finché la Serie D non
-  è inizializzata l'output si chiude con `SEZIONE SERIE D -- non disponibile`, lo stato e il comando di raccolta
-  (`--section d` stampa solo quello). Con più sezioni i CSV portano il suffisso della sezione
+  è inizializzata, dopo le sezioni disponibili compare `SEZIONE SERIE D -- non disponibile` con lo stato e il comando
+  di raccolta (con `--season <stagione>` quando la stagione del perimetro non è quella di default, così il comando
+  inizializza proprio il `config/teams_<stagione>.json` nominato); le fasi 1-2 e, in `--mode full`, la verifica dei
+  parametri vengono comunque stampate; `--section d` non stampa alcuna sezione e con `--export` scrive solo il report
+  valore di tutto il perimetro. Con più sezioni i CSV portano il suffisso della sezione
   (`<export>_bc_giornata.csv`, `<export>_d_giornata.csv`, `_d_selezioni.csv`, `_d_risultati.csv`), il report valore
   in `--export` copre sempre tutto il perimetro; con una sola sezione i nomi restano quelli di sempre.
   `--serie-d-demo` (solo `--mode full` simulato) aggiunge al perimetro un dizionario sintetico di Serie D (9 gironi ×

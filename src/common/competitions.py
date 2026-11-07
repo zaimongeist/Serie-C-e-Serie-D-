@@ -101,7 +101,9 @@ class Competition:
     ``family`` the league the competition belongs to (the three Serie C gironi
     share ``'Serie C'``, the nine Serie D gironi ``'Serie D'``). ``season_ids``
     maps a season label (``'2026/27'``) to the FootyStats ``season_id`` and is the
-    fallback used when ``/league-list`` cannot answer for the competition.
+    fallback used only when ``/league-list`` itself cannot be reached: it cannot
+    stand in for a league the account has not chosen, whose data the API refuses
+    (the harvester skips such a competition with a warning).
     """
 
     code: str

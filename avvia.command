@@ -48,6 +48,7 @@ if [ "${1:-}" != "--solo-dashboard" ]; then
   if has_footystats_key; then
     echo ">> Aggiorno i dati reali da FootyStats (Serie C Gironi A/B/C + Serie B + Serie D Gironi A-I, ultime 3 stagioni, quote pre-match)..."
     echo "   Serie D: alla prima esecuzione le liste squadre dei 9 gironi vengono create in config/teams_2026_27.json dall'API."
+    echo "   Le competizioni la cui lega non è fra quelle scelte nel tuo account FootyStats vengono saltate (le altre sono aggiornate comunque)."
     # Nessun --competitions = tutte le competizioni di config/competitions.toml (13).
     HARVEST="python -m src.ingestion.footystats --seasons 3 --odds-out data/odds/footystats.csv"
   else

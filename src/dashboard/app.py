@@ -452,13 +452,15 @@ def render_section_notice(state: PipelineState, section: str) -> bool:
 
     For Serie D the notice carries :attr:`~src.dashboard.state.PipelineState.serie_d_status`
     and the exact command that initialises the gironi and harvests their data
-    (:func:`src.dashboard.state.serie_d_harvest_command`), or the launchers.
+    (:func:`src.dashboard.state.serie_d_harvest_command` for the perimeter
+    season, so that it fills the ``config/teams_<season>.json`` the notice
+    names), or the launchers.
     """
     if section_ready(state, section):
         return False
     if section == SECTION_D:
         st.info(
-            f"Serie D {state.serie_d_status}. Comando: `{serie_d_harvest_command()}` — oppure {LAUNCHERS_HINT} con la chiave "
+            f"Serie D {state.serie_d_status}. Comando: `{serie_d_harvest_command(season=state.season_label)}` — oppure {LAUNCHERS_HINT} con la chiave "
             "FootyStats in .env. La prima raccolta inizializza i nove gironi (18 squadre ciascuno, 34 giornate) in "
             f"config/teams_{state.season_label.replace('/', '_')}.json dalle liste squadre dell'API; poi la sezione mostra "
             "classifica, giornate, risultati, valore e selezioni come quella di Serie B e Serie C.",

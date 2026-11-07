@@ -399,7 +399,7 @@ async def test_league_list_parses_italian_entries(http_cfg: HttpConfig) -> None:
 
 
 @pytest.mark.asyncio
-async def test_resolve_seasons_newest_three_and_missing_competition(http_cfg: HttpConfig, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_resolve_seasons_newest_three_and_missing_competition(http_cfg: HttpConfig, caplog: pytest.LogCaptureFixture) -> None:
     client, _ = make_client(http_cfg)
     async with client:
         resolved = await client.resolve_seasons(["A", Girone.SB, "a"], seasons=3)
@@ -413,22 +413,24 @@ async def test_resolve_seasons_newest_three_and_missing_competition(http_cfg: Ht
         with pytest.raises(ValueError, match="unknown competition code"):
             await client.resolve_seasons(["ZZ"])
 
-    # a league that is not among the chosen ones falls back to the configured season ids (competitions.toml) with a warning
+    # a league that is not among the chosen ones cannot be resolved: FootyStats refuses its data whatever season id is
+    # passed, so season_resolution reports it in not_chosen (with a warning naming it) instead of using the configured
+    # ids, and the strict resolve_seasons raises with the advice naming the league and the leagues chosen now
     without_serie_b = load_fixture("league_list_sample.json")
     without_serie_b["data"] = [entry for entry in without_serie_b["data"] if entry["name"] != "Italy Serie B"]
     client, _ = make_client(http_cfg, router=make_router(league_list=without_serie_b))
     with caplog.at_level(logging.WARNING):
         async with client:
-            resolved = await client.resolve_seasons(["A", "SB"])
-    assert list(resolved) == ["A", "SB"] and [(r.label, r.season_id) for r in resolved["SB"]] == [("2026/27", 17404), ("2025/26", 15632), ("2024/25", 12621)]
-    warning = next(r for r in caplog.records if r.getMessage() == "league not among the account's chosen leagues, using configured season ids")
+            resolution = await client.season_resolution(["A", "SB"])
+            with pytest.raises(fs.FootyStatsError) as caught:
+                await client.resolve_seasons(["A", "SB"])
+    assert resolution.codes == ("A",) and resolution.not_chosen == {"SB": "Italy Serie B"} and not resolution.from_configured_ids
+    assert [(r.label, r.season_id) for r in resolution.seasons["A"]] == [("2026/27", 17487), ("2025/26", 15535), ("2024/25", 12659)]
+    assert "Italy Serie C Group A" in resolution.chosen_leagues and "Italy Serie B" not in resolution.chosen_leagues
+    assert resolution.reason("SB") == fs.not_chosen_reason("Italy Serie B") and resolution.reason("A") is None
+    assert fs.competition_season_ids("SB"), "the configured ids exist but are never used for a league the account has not chosen"
+    warning = next(r for r in caplog.records if r.getMessage() == "league not among the account's chosen leagues, competition skipped")
     assert warning.league == "Italy Serie B" and warning.competition == "SB" and "footystats.org" in warning.advice
-    # ... and only a league without configured ids is an error naming what to add on footystats.org
-    monkeypatch.setattr(fs, "competition_season_ids", lambda code, endpoints=None: {})
-    client, _ = make_client(http_cfg, router=make_router(league_list=without_serie_b))
-    async with client:
-        with pytest.raises(fs.FootyStatsError) as caught:
-            await client.resolve_seasons(["A", "SB"])
     message = str(caught.value)
     assert "'Italy Serie B'" in message and "footystats.org" in message and "Italy Serie C Group A" in message
 
@@ -725,26 +727,31 @@ async def test_harvest_skips_unsupported_codes_and_records_season_failures(provi
 
 
 @pytest.mark.asyncio
-async def test_harvest_without_odds_and_missing_competition_propagates(provider_factory: Callable[..., Any], caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_harvest_without_odds_and_missing_competition_is_skipped(provider_factory: Callable[..., Any], caplog: pytest.LogCaptureFixture) -> None:
     provider, _ = provider_factory()
     async with provider.client:
         result = await provider.harvest(["A"], seasons=1, with_odds=False)
     assert len(result.fixtures) == 2 and result.odds == [] and len(result.matches) == 13
     assert result.n_matches_by_season == {"2026/27": 13}
 
+    # the league is not among the account's chosen leagues: nothing of it is fetched (the API would refuse it) and the
+    # competition is a skip, not a failure or an exception -- the configured season ids are never used for it
     only_serie_a = load_fixture("league_list_sample.json")
     only_serie_a["data"] = [e for e in only_serie_a["data"] if e["name"] == "Italy Serie A"]
-    provider, _ = provider_factory(router=make_router(league_list=only_serie_a))
+    provider, transport = provider_factory(router=make_router(league_list=only_serie_a))
     with caplog.at_level(logging.WARNING):
         async with provider.client:
-            fallback = await provider.harvest(["A"], seasons=1, with_odds=False)
-    assert len(fallback.matches) == 13 and fallback.seasons == {"A": ["2026/27"]}  # configured season ids, league not chosen
-    assert any("using configured season ids" in r.getMessage() for r in caplog.records)
-    monkeypatch.setattr(fs, "competition_season_ids", lambda code, endpoints=None: {})
+            skipped = await provider.harvest(["A"], seasons=1, with_odds=False)
+    assert skipped.matches.empty and skipped.fixtures == [] and skipped.failures == {} and skipped.seasons == {}
+    assert skipped.not_chosen == {"A": "Italy Serie C Group A"} and skipped.skipped == {"A": fs.not_chosen_reason("Italy Serie C Group A")}
+    assert skipped.problem_for("A") == skipped.skipped["A"] and "not_chosen=A" in skipped.summary() and skipped.initialised_competitions == ()
+    assert [r.url.path for r in transport.requests] == ["/league-list"]
+    assert any(r.getMessage() == "competitions skipped: leagues not among the account's chosen leagues" for r in caplog.records)
+    # the strict resolution (used by --init-registry) still stops with the advice
     provider, _ = provider_factory(router=make_router(league_list=only_serie_a))
     async with provider.client:
         with pytest.raises(fs.FootyStatsError, match="chosen leagues"):
-            await provider.harvest(["A"])
+            await provider.init_registry(["A"])
 
 
 @pytest.mark.asyncio
