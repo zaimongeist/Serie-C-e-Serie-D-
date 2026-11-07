@@ -300,8 +300,9 @@ def test_spellings_become_aliases_only_when_no_other_club_answers_to_them(tmp_pa
         season="2026/27", registry_path=path, mapping_path=tmp_path / "map.json",
     )  # fmt: skip
     saved = json.loads(path.read_text(encoding="utf-8"))["gironi"]["A"]
-    assert saved["Alfa"] == ["Vecchio Alias", "Alfa Sporting", "Alfa City", "Alfa Nick"] and saved["Beta"] == ["I Leoni"]
-    assert report.new_aliases == {"Alfa": ("Alfa Sporting", "Alfa City", "Alfa Nick")} and report.skipped_aliases == {"Alfa": ("I Leoni",)}
+    # identifying spellings only: the nicknames in alt_names ("I Leoni", "Alfa Nick") are never written
+    assert saved["Alfa"] == ["Vecchio Alias", "Alfa Sporting", "Alfa City"] and saved["Beta"] == ["I Leoni"]
+    assert report.new_aliases == {"Alfa": ("Alfa Sporting", "Alfa City")} and report.skipped_aliases == {}
     assert report.changed and report.n_changes == 0 and "composizione invariata, alias aggiornati" in report.describe()
 
 
@@ -530,3 +531,29 @@ def test_init_registry_of_a_new_season_keeps_both_palermo_clubs_and_promotions(c
     assert "conflict AC Palermo" in diff.describe()
     loaded = TeamRegistry.from_json(target)
     assert loaded.girone_of("AC Palermo Serie D") is Girone.DI and loaded.girone_of("Palermo") is Girone.SB
+
+
+def test_nicknames_in_alt_names_never_become_aliases(tmp_path):
+    """FootyStats ``alt_names`` are nicknames shared by clubs ('Lupi': Campobasso, Cosenza, Avellino...):
+    the sync writes only the identifying spellings (cleanName, name, english_name)."""
+    import json
+
+    from src.common.teams import load_registry
+    from src.ingestion.footystats import TeamInfo, apply_registry_sync
+
+    registry_path = tmp_path / "teams_2026_27.json"
+    registry_path.write_text(
+        json.dumps({"season": "2026/27", "gironi": {"B": {"Campobasso": ["Città di Campobasso"], "Livorno": []}}}), encoding="utf-8"
+    )
+    teams = {
+        "B": [
+            TeamInfo(id=1, name="SS Città di Campobasso", clean_name="Città di Campobasso", english_name="", alt_names=("Lupi",)),
+            TeamInfo(id=2, name="US Livorno 1915", clean_name="Livorno", english_name="", alt_names=("Amaranto", "Labronici")),
+        ]
+    }
+    apply_registry_sync(teams, season="2026/27", registry_path=registry_path, mapping_path=tmp_path / "map.json", competitions=["B"])
+    payload = json.loads(registry_path.read_text(encoding="utf-8"))
+    written = {alias for aliases in payload["gironi"]["B"].values() for alias in aliases}
+    assert {"Lupi", "Amaranto", "Labronici"}.isdisjoint(written)
+    assert payload["gironi"]["B"]["Campobasso"] == ["Città di Campobasso"]  # "SS Città di Campobasso" normalises to the same alias
+    assert load_registry("2026_27", config_dir=tmp_path).exact("SS Città di Campobasso") == "Campobasso"

@@ -533,16 +533,17 @@ async def test_harvest_sync_fills_an_empty_serie_d_girone(http_cfg: HttpConfig, 
     sync = result.registry_sync
     assert sync is not None and sync.changed and sync.written and sync.competitions["DA"].added == tuple(f"Borgo {i:02d}" for i in range(1, 19))
     assert sync.competitions["DA"].removed == () and sync.total == 242 and "registry_sync=changed:18" in result.summary()
-    # the dictionary copy gained the 18 teams (canonical = cleanName, aliases = name / english name / alt_names) ...
+    # the dictionary copy gained the 18 teams (canonical = cleanName, aliases = name / english name; the
+    # nicknames in alt_names are shared by clubs and never become aliases) ...
     saved = json.loads((empty_da_copy / "teams_2026_27.json").read_text(encoding="utf-8"))
     group = saved["gironi"]["DA"]
-    assert len(group) == 18 and group["Borgo 01"] == ["Unione Sportiva Borgo 01", "Borgo 01 Town", "Borgo01", SHARED_NICKNAME]
-    assert group["Borgo 02"] == ["Unione Sportiva Borgo 02", "Borgo 02 Town", "Borgo02"], "a nickname shared by two clubs is written for the first only"
-    assert sync.skipped_aliases == {"Borgo 02": (SHARED_NICKNAME,)}
+    assert len(group) == 18 and group["Borgo 01"] == ["Unione Sportiva Borgo 01", "Borgo 01 Town"]
+    assert group["Borgo 02"] == ["Unione Sportiva Borgo 02", "Borgo 02 Town"], "nicknames are never written"
+    assert sync.skipped_aliases == {}
     assert len(saved["gironi"]["DB"]) == 18 and len(saved["gironi"]["A"]) == 20 and saved["season"] == "2026/27"
     reloaded = TeamRegistry.from_json(empty_da_copy / "teams_2026_27.json")  # the file loads: no alias collision
     assert reloaded.n_teams == 242 and reloaded.gironi == tuple(Girone)
-    assert reloaded.exact(SHARED_NICKNAME) == "Borgo 01" and reloaded.exact("Borgo 05 Town") == "Borgo 05"
+    assert reloaded.exact(SHARED_NICKNAME) is None and reloaded.exact("Borgo 05 Town") == "Borgo 05"
     # ... the provider reloaded it, so the Serie D teams are current, not unmapped ...
     assert provider.registry.teams("DA") == tuple(f"Borgo {i:02d}" for i in range(1, 19)) and provider.registry.n_teams == 242
     assert result.unmapped_teams == {} and result.historical_teams == ()

@@ -2945,9 +2945,11 @@ def apply_registry_sync(
     identified by id whose canonical equals the ``cleanName`` the mapping
     recorded follows a FootyStats rename (``renamed``, the old spelling becomes
     an alias); canonical names chosen by hand (``'Juventus Next Gen'``) never
-    change. Every FootyStats spelling (``cleanName``, ``name``, ``english_name``,
-    ``alt_names``) is added as an alias unless another club already answers to
-    it (``skipped_aliases``); existing aliases are preserved.
+    change. The identifying FootyStats spellings (``cleanName``, ``name``,
+    ``english_name``) are added as aliases unless another club already answers
+    to them (``skipped_aliases``); nicknames in ``alt_names`` (``'Lupi'``,
+    ``'Granata'``, ``'Amaranto'``) are shared by several clubs and are never
+    written. Existing aliases are preserved.
 
     The file is validated with :meth:`TeamRegistry.from_mapping` (``ValueError``
     and nothing written when it would not load) and, when its content changed,
@@ -3159,7 +3161,8 @@ def apply_registry_sync(
         assigned[(code, team.id)] = chosen
         added.setdefault(code, []).append(chosen)
 
-    # FootyStats spellings as aliases (existing aliases preserved, collisions refused)
+    # identifying FootyStats spellings as aliases (existing aliases preserved, collisions refused;
+    # nicknames in alt_names are ambiguous across clubs and never become aliases)
     new_aliases: dict[str, list[str]] = {}
     skipped_aliases: dict[str, list[str]] = {}
     for code, team in items:
@@ -3168,7 +3171,7 @@ def apply_registry_sync(
             continue
         aliases = new_gironi[code][canonical]
         known = {normalize_name(canonical), *(normalize_name(a) for a in aliases)}
-        for spelling in team.spellings:
+        for spelling in team.identity_spellings:
             norm = normalize_name(spelling)
             if norm in known or spelling == canonical:
                 continue
