@@ -1,0 +1,558 @@
+{
+ "success": true,
+ "pager": {
+  "current_page": 1,
+  "max_page": 1,
+  "results_per_page": 100,
+  "total_results": 20
+ },
+ "metadata": {
+  "request_limit": "1800",
+  "request_remaining": "1784",
+  "request_reset_message": "Request limit is refreshed every hour.",
+  "request_limit_refresh_next": 1793965691
+ },
+ "data": [
+  {
+   "id": 59,
+   "name": "Arsenal FC",
+   "cleanName": "Arsenal",
+   "english_name": "Arsenal FC",
+   "shortHand": "arsenal-fc",
+   "country": "England",
+   "continent": null,
+   "founded": "1886",
+   "image": "https://cdn.footystats.org/img/teams/england-arsenal-fc.png",
+   "flag_element": null,
+   "season": "2018/2019",
+   "seasonClean": null,
+   "url": "https://footystats.org/clubs/arsenal-fc-59",
+   "table_position": 5,
+   "performance_rank": 5,
+   "risk": 87,
+   "season_format": "Domestic League",
+   "competition_id": 1625,
+   "full_name": "Arsenal FC",
+   "alt_names": [
+    "The Gunners"
+   ],
+   "official_sites": [
+    "https://www.arsenal.com/"
+   ]
+  },
+  {
+   "id": 92,
+   "name": "Tottenham Hotspur FC",
+   "cleanName": "Tottenham Hotspur",
+   "english_name": "Tottenham Hotspur FC",
+   "shortHand": "tottenham-hotspur-fc",
+   "country": "England",
+   "continent": null,
+   "founded": "1882",
+   "image": "https://cdn.footystats.org/img/teams/england-tottenham-hotspur-fc.png",
+   "flag_element": null,
+   "season": "2018/2019",
+   "seasonClean": null,
+   "url": "https://footystats.org/clubs/tottenham-hotspur-fc-92",
+   "table_position": 4,
+   "performance_rank": 4,
+   "risk": 89,
+   "season_format": "Domestic League",
+   "competition_id": 1625,
+   "full_name": "Tottenham Hotspur FC",
+   "alt_names": [
+    "Spurs / The Lilywhites"
+   ],
+   "official_sites": [
+    "https://www.tottenhamhotspur.com/"
+   ]
+  },
+  {
+   "id": 93,
+   "name": "Manchester City FC",
+   "cleanName": "Manchester City",
+   "english_name": "Manchester City FC",
+   "shortHand": "manchester-city-fc",
+   "country": "England",
+   "continent": null,
+   "founded": "1880",
+   "image": "https://cdn.footystats.org/img/teams/england-manchester-city-fc.png",
+   "flag_element": null,
+   "season": "2018/2019",
+   "seasonClean": null,
+   "url": "https://footystats.org/clubs/manchester-city-fc-93",
+   "table_position": 1,
+   "performance_rank": 1,
+   "risk": 92,
+   "season_format": "Domestic League",
+   "competition_id": 1625,
+   "full_name": "Manchester City FC",
+   "alt_names": [
+    "Man City"
+   ],
+   "official_sites": [
+    "https://www.mancity.com/"
+   ]
+  },
+  {
+   "id": 108,
+   "name": "Leicester City FC",
+   "cleanName": "Leicester City",
+   "english_name": "Leicester City FC",
+   "shortHand": "leicester-city-fc",
+   "country": "England",
+   "continent": null,
+   "founded": "1884",
+   "image": "https://cdn.footystats.org/img/teams/england-leicester-city-fc.png",
+   "flag_element": null,
+   "season": "2018/2019",
+   "seasonClean": null,
+   "url": "https://footystats.org/clubs/leicester-city-fc-108",
+   "table_position": 9,
+   "performance_rank": 9,
+   "risk": 68,
+   "season_format": "Domestic League",
+   "competition_id": 1625,
+   "full_name": "Leicester City FC",
+   "alt_names": [
+    "Leicester"
+   ],
+   "official_sites": [
+    "https://www.lcfc.com/"
+   ]
+  },
+  {
+   "id": 143,
+   "name": "Crystal Palace FC",
+   "cleanName": "Crystal Palace",
+   "english_name": "Crystal Palace FC",
+   "shortHand": "crystal-palace-fc",
+   "country": "England",
+   "continent": null,
+   "founded": "1905",
+   "image": "https://cdn.footystats.org/img/teams/england-crystal-palace-fc.png",
+   "flag_element": null,
+   "season": "2018/2019",
+   "seasonClean": null,
+   "url": "https://footystats.org/clubs/crystal-palace-fc-143",
+   "table_position": 12,
+   "performance_rank": 12,
+   "risk": 76,
+   "season_format": "Domestic League",
+   "competition_id": 1625,
+   "full_name": "Crystal Palace FC",
+   "alt_names": [
+    "Eagles / Glaziers / Palace"
+   ],
+   "official_sites": [
+    "https://www.cpfc.co.uk/"
+   ]
+  },
+  {
+   "id": 144,
+   "name": "Everton FC",
+   "cleanName": "Everton",
+   "english_name": "Everton FC",
+   "shortHand": "everton-fc",
+   "country": "England",
+   "continent": null,
+   "founded": "1878",
+   "image": "https://cdn.footystats.org/img/teams/england-everton-fc.png",
+   "flag_element": null,
+   "season": "2018/2019",
+   "seasonClean": null,
+   "url": "https://footystats.org/clubs/everton-fc-144",
+   "table_position": 8,
+   "performance_rank": 8,
+   "risk": 68,
+   "season_format": "Domestic League",
+   "competition_id": 1625,
+   "full_name": "Everton FC",
+   "alt_names": [
+    "The Toffees / The Blues"
+   ],
+   "official_sites": [
+    "https://www.evertonfc.com/"
+   ]
+  },
+  {
+   "id": 145,
+   "name": "Burnley FC",
+   "cleanName": "Burnley",
+   "english_name": "Burnley FC",
+   "shortHand": "burnley-fc",
+   "country": "England",
+   "continent": null,
+   "founded": "1882",
+   "image": "https://cdn.footystats.org/img/teams/england-burnley-fc.png",
+   "flag_element": null,
+   "season": "2018/2019",
+   "seasonClean": null,
+   "url": "https://footystats.org/clubs/burnley-fc-145",
+   "table_position": 15,
+   "performance_rank": 15,
+   "risk": 79,
+   "season_format": "Domestic League",
+   "competition_id": 1625,
+   "full_name": "Burnley FC",
+   "alt_names": [
+    "The Clarets"
+   ],
+   "official_sites": [
+    "https://www.burnleyfootballclub.com/"
+   ]
+  },
+  {
+   "id": 146,
+   "name": "Southampton FC",
+   "cleanName": "Southampton",
+   "english_name": "Southampton FC",
+   "shortHand": "southampton-fc",
+   "country": "England",
+   "continent": null,
+   "founded": "1885",
+   "image": "https://cdn.footystats.org/img/teams/england-southampton-fc.png",
+   "flag_element": null,
+   "season": "2018/2019",
+   "seasonClean": null,
+   "url": "https://footystats.org/clubs/southampton-fc-146",
+   "table_position": 16,
+   "performance_rank": 16,
+   "risk": 76,
+   "season_format": "Domestic League",
+   "competition_id": 1625,
+   "full_name": "Southampton FC",
+   "alt_names": [
+    "Saints"
+   ],
+   "official_sites": [
+    "https://www.southamptonfc.com/"
+   ]
+  },
+  {
+   "id": 148,
+   "name": "AFC Bournemouth",
+   "cleanName": "AFC Bournemouth",
+   "english_name": "AFC Bournemouth",
+   "shortHand": "afc-bournemouth",
+   "country": "England",
+   "continent": null,
+   "founded": "1899",
+   "image": "https://cdn.footystats.org/img/teams/england-afc-bournemouth.png",
+   "flag_element": null,
+   "season": "2018/2019",
+   "seasonClean": null,
+   "url": "https://footystats.org/clubs/afc-bournemouth-148",
+   "table_position": 14,
+   "performance_rank": 14,
+   "risk": 79,
+   "season_format": "Domestic League",
+   "competition_id": 1625,
+   "full_name": "AFC Bournemouth",
+   "alt_names": [
+    "The Cherries / Boscombe"
+   ],
+   "official_sites": [
+    "https://www.afcb.co.uk/"
+   ]
+  },
+  {
+   "id": 149,
+   "name": "Manchester United FC",
+   "cleanName": "Manchester United",
+   "english_name": "Manchester United FC",
+   "shortHand": "manchester-united-fc",
+   "country": "England",
+   "continent": null,
+   "founded": "1878",
+   "image": "https://cdn.footystats.org/img/teams/england-manchester-united-fc.png",
+   "flag_element": null,
+   "season": "2018/2019",
+   "seasonClean": null,
+   "url": "https://footystats.org/clubs/manchester-united-fc-149",
+   "table_position": 6,
+   "performance_rank": 6,
+   "risk": 76,
+   "season_format": "Domestic League",
+   "competition_id": 1625,
+   "full_name": "Manchester United FC",
+   "alt_names": [
+    "Man Utd"
+   ],
+   "official_sites": [
+    "https://www.manutd.com/"
+   ]
+  },
+  {
+   "id": 151,
+   "name": "Liverpool FC",
+   "cleanName": "Liverpool",
+   "english_name": "Liverpool FC",
+   "shortHand": "liverpool-fc",
+   "country": "England",
+   "continent": null,
+   "founded": "1892",
+   "image": "https://cdn.footystats.org/img/teams/england-liverpool-fc.png",
+   "flag_element": null,
+   "season": "2018/2019",
+   "seasonClean": null,
+   "url": "https://footystats.org/clubs/liverpool-fc-151",
+   "table_position": 2,
+   "performance_rank": 2,
+   "risk": 63,
+   "season_format": "Domestic League",
+   "competition_id": 1625,
+   "full_name": "Liverpool FC",
+   "alt_names": [
+    "The Reds"
+   ],
+   "official_sites": [
+    "https://www.liverpoolfc.com/"
+   ]
+  },
+  {
+   "id": 152,
+   "name": "Chelsea FC",
+   "cleanName": "Chelsea",
+   "english_name": "Chelsea FC",
+   "shortHand": "chelsea-fc",
+   "country": "England",
+   "continent": null,
+   "founded": "1905",
+   "image": "https://cdn.footystats.org/img/teams/england-chelsea-fc.png",
+   "flag_element": null,
+   "season": "2018/2019",
+   "seasonClean": null,
+   "url": "https://footystats.org/clubs/chelsea-fc-152",
+   "table_position": 3,
+   "performance_rank": 3,
+   "risk": 66,
+   "season_format": "Domestic League",
+   "competition_id": 1625,
+   "full_name": "Chelsea FC",
+   "alt_names": [
+    "The Blues / The Pensioners"
+   ],
+   "official_sites": [
+    "https://www.chelseafc.com/en"
+   ]
+  },
+  {
+   "id": 153,
+   "name": "West Ham United FC",
+   "cleanName": "West Ham United",
+   "english_name": "West Ham United FC",
+   "shortHand": "west-ham-united-fc",
+   "country": "England",
+   "continent": null,
+   "founded": "1895",
+   "image": "https://cdn.footystats.org/img/teams/england-west-ham-united-fc.png",
+   "flag_element": null,
+   "season": "2018/2019",
+   "seasonClean": null,
+   "url": "https://footystats.org/clubs/west-ham-united-fc-153",
+   "table_position": 10,
+   "performance_rank": 10,
+   "risk": 63,
+   "season_format": "Domestic League",
+   "competition_id": 1625,
+   "full_name": "West Ham United FC",
+   "alt_names": [
+    "The Hammers / The Irons"
+   ],
+   "official_sites": [
+    "https://www.whufc.com/"
+   ]
+  },
+  {
+   "id": 155,
+   "name": "Watford FC",
+   "cleanName": "Watford",
+   "english_name": "Watford FC",
+   "shortHand": "watford-fc",
+   "country": "England",
+   "continent": null,
+   "founded": "1881",
+   "image": "https://cdn.footystats.org/img/teams/england-watford-fc.png",
+   "flag_element": null,
+   "season": "2018/2019",
+   "seasonClean": null,
+   "url": "https://footystats.org/clubs/watford-fc-155",
+   "table_position": 11,
+   "performance_rank": 11,
+   "risk": 100,
+   "season_format": "Domestic League",
+   "competition_id": 1625,
+   "full_name": "Watford FC",
+   "alt_names": [
+    "The Hornets / The Golden Boys / The 'Orns"
+   ],
+   "official_sites": [
+    "http://www.watfordfc.com/"
+   ]
+  },
+  {
+   "id": 157,
+   "name": "Newcastle United FC",
+   "cleanName": "Newcastle United",
+   "english_name": "Newcastle United FC",
+   "shortHand": "newcastle-united-fc",
+   "country": "England",
+   "continent": null,
+   "founded": "1892",
+   "image": "https://cdn.footystats.org/img/teams/england-newcastle-united-fc.png",
+   "flag_element": null,
+   "season": "2018/2019",
+   "seasonClean": null,
+   "url": "https://footystats.org/clubs/newcastle-united-fc-157",
+   "table_position": 13,
+   "performance_rank": 13,
+   "risk": 66,
+   "season_format": "Domestic League",
+   "competition_id": 1625,
+   "full_name": "Newcastle United FC",
+   "alt_names": [
+    "The Magpies / The Toon / Geordies"
+   ],
+   "official_sites": [
+    "https://www.nufc.co.uk/"
+   ]
+  },
+  {
+   "id": 161,
+   "name": "Cardiff City FC",
+   "cleanName": "Cardiff City",
+   "english_name": "Cardiff City FC",
+   "shortHand": "cardiff-city-fc",
+   "country": "Wales",
+   "continent": null,
+   "founded": "1889",
+   "image": "https://cdn.footystats.org/img/teams/wales-cardiff-city-fc.png",
+   "flag_element": null,
+   "season": "2018/2019",
+   "seasonClean": null,
+   "url": "https://footystats.org/clubs/cardiff-city-fc-161",
+   "table_position": 18,
+   "performance_rank": 18,
+   "risk": 66,
+   "season_format": "Domestic League",
+   "competition_id": 1625,
+   "full_name": "Cardiff City FC",
+   "alt_names": [
+    "Bluebirds"
+   ],
+   "official_sites": [
+    "https://www.cardiffcityfc.co.uk/"
+   ]
+  },
+  {
+   "id": 162,
+   "name": "Fulham FC",
+   "cleanName": "Fulham",
+   "english_name": "Fulham FC",
+   "shortHand": "fulham-fc",
+   "country": "England",
+   "continent": null,
+   "founded": "1879",
+   "image": "https://cdn.footystats.org/img/teams/england-fulham-fc.png",
+   "flag_element": null,
+   "season": "2018/2019",
+   "seasonClean": null,
+   "url": "https://footystats.org/clubs/fulham-fc-162",
+   "table_position": 19,
+   "performance_rank": 19,
+   "risk": 74,
+   "season_format": "Domestic League",
+   "competition_id": 1625,
+   "full_name": "Fulham FC",
+   "alt_names": [
+    "The Cottagers / The Whites"
+   ],
+   "official_sites": [
+    "https://www.fulhamfc.com/"
+   ]
+  },
+  {
+   "id": 209,
+   "name": "Brighton & Hove Albion FC",
+   "cleanName": "Brighton & Hove Albion",
+   "english_name": "Brighton Hove Albion FC",
+   "shortHand": "brighton-hove-albion-fc",
+   "country": "England",
+   "continent": null,
+   "founded": "1901",
+   "image": "https://cdn.footystats.org/img/teams/england-brighton-hove-albion-fc.png",
+   "flag_element": null,
+   "season": "2018/2019",
+   "seasonClean": null,
+   "url": "https://footystats.org/clubs/brighton-hove-albion-fc-209",
+   "table_position": 17,
+   "performance_rank": 17,
+   "risk": 63,
+   "season_format": "Domestic League",
+   "competition_id": 1625,
+   "full_name": "Brighton & Hove Albion FC",
+   "alt_names": [
+    "Brighton"
+   ],
+   "official_sites": [
+    "https://www.brightonandhovealbion.com/"
+   ]
+  },
+  {
+   "id": 217,
+   "name": "Huddersfield Town FC",
+   "cleanName": "Huddersfield Town",
+   "english_name": "Huddersfield Town FC",
+   "shortHand": "huddersfield-town-fc",
+   "country": "England",
+   "continent": null,
+   "founded": "1908",
+   "image": "https://cdn.footystats.org/img/teams/england-huddersfield-town-fc.png",
+   "flag_element": null,
+   "season": "2018/2019",
+   "seasonClean": null,
+   "url": "https://footystats.org/clubs/huddersfield-town-fc-217",
+   "table_position": 20,
+   "performance_rank": 20,
+   "risk": 58,
+   "season_format": "Domestic League",
+   "competition_id": 1625,
+   "full_name": "Huddersfield Town FC",
+   "alt_names": [
+    "The Terriers"
+   ],
+   "official_sites": [
+    "https://www.htafc.com/"
+   ]
+  },
+  {
+   "id": 223,
+   "name": "Wolverhampton Wanderers FC",
+   "cleanName": "Wolverhampton Wanderers",
+   "english_name": "Wolverhampton Wanderers FC",
+   "shortHand": "wolverhampton-wanderers-fc",
+   "country": "England",
+   "continent": null,
+   "founded": "1877",
+   "image": "https://cdn.footystats.org/img/teams/england-wolverhampton-wanderers-fc.png",
+   "flag_element": null,
+   "season": "2018/2019",
+   "seasonClean": null,
+   "url": "https://footystats.org/clubs/wolverhampton-wanderers-fc-223",
+   "table_position": 7,
+   "performance_rank": 7,
+   "risk": 58,
+   "season_format": "Domestic League",
+   "competition_id": 1625,
+   "full_name": "Wolverhampton Wanderers FC",
+   "alt_names": [
+    "Wolves"
+   ],
+   "official_sites": [
+    "http://www.wolves.co.uk/"
+   ]
+  }
+ ],
+ "message": "Usage of the API is bound to our Terms of Use : https://footystats.org/api/documentations/terms-of-use-and-legal"
+}

@@ -1,0 +1,222 @@
+# Competitions of the perimeter, one [[competition]] table each, in DISPLAY ORDER.
+#
+# This file is the single source of truth for "which leagues exist": the Girone
+# enum (src/common/schemas.py) is built from it at import time, the team registry
+# (config/teams_<season>.json) uses the codes as keys, the engine fits one home
+# advantage and one sum(alpha) = 0 constraint group per code, the simulator, the
+# console and the dashboard iterate it instead of hard-coding A/B/C.
+#
+# To add a league: append a [[competition]] table here, add its teams under the
+# same code in config/teams_<season>.json (or leave the key empty and let the
+# FootyStats harvester fill it from /league-teams) and add the FootyStats league
+# to your footystats.org account (the `footystats_name` is the `name` field
+# returned by /league-list). Codes are short upper-case identifiers (letters and
+# digits) and must be unique; `family` groups the gironi of one league ("Serie C"
+# has three codes, "Serie B" one, "Serie D" nine), `tier` is the level in the
+# Italian pyramid (2 = Serie B, 3 = Serie C, 4 = Serie D) and is informational only.
+#
+# `sofascore_tournament_id` is the undocumented SofaScore unique-tournament id
+# used by the legacy harvester (see config/endpoints.toml); 0 means unknown and
+# the competition is then not served by that provider (Serie D). FootyStats
+# resolves its own season ids from /league-list; the optional
+# [competition.season_ids] sub-table (season label -> FootyStats season id,
+# verified live on 2026-11-06) is a fallback that the FootyStats harvester uses
+# only when /league-list itself cannot be reached. It cannot stand in for a
+# league the account has not chosen:
+# the API refuses the data of such a league ("League is not chosen by the user"),
+# so every competition to harvest must be among the account's chosen leagues and
+# a competition whose league is not chosen is skipped by the harvester with a
+# warning (the others are harvested as usual).
+#
+# Serie D (tier 4) has nine gironi of 18 teams (34 rounds), codes DA..DI, family
+# "Serie D". Their team lists are NOT known offline: the FootyStats harvester
+# initialises them in config/teams_<season>.json from /league-teams the first
+# time it runs with a key covering Serie D (auto-init), for future seasons too.
+
+[[competition]]
+code = "A"
+label = "Serie C Girone A"
+short = "Girone A"
+country = "Italy"
+footystats_name = "Italy Serie C Group A"
+sofascore_tournament_id = 141
+tier = 3
+family = "Serie C"
+[competition.season_ids]
+"2024/25" = 12659
+"2025/26" = 15535
+"2026/27" = 17487
+
+[[competition]]
+code = "B"
+label = "Serie C Girone B"
+short = "Girone B"
+country = "Italy"
+footystats_name = "Italy Serie C Group B"
+sofascore_tournament_id = 142
+tier = 3
+family = "Serie C"
+[competition.season_ids]
+"2024/25" = 12647
+"2025/26" = 15532
+"2026/27" = 17492
+
+[[competition]]
+code = "C"
+label = "Serie C Girone C"
+short = "Girone C"
+country = "Italy"
+footystats_name = "Italy Serie C Group C"
+sofascore_tournament_id = 143
+tier = 3
+family = "Serie C"
+[competition.season_ids]
+"2024/25" = 12670
+"2025/26" = 15519
+"2026/27" = 17473
+
+[[competition]]
+code = "SB"
+label = "Serie B"
+short = "Serie B"
+country = "Italy"
+footystats_name = "Italy Serie B"
+# TO VERIFY: 53 is the SofaScore unique-tournament id commonly reported for Serie B;
+# it is unused as long as Serie B is harvested through FootyStats.
+sofascore_tournament_id = 53
+tier = 2
+family = "Serie B"
+[competition.season_ids]
+"2024/25" = 12621
+"2025/26" = 15632
+"2026/27" = 17404
+
+# Serie D 2026/27: nine gironi of 18 teams (34 rounds). SofaScore does not cover them (id 0);
+# FootyStats league names and season ids verified live on 2026-11-06. Team lists come from the
+# auto-init of the FootyStats harvester (config/teams_<season>.json).
+
+[[competition]]
+code = "DA"
+label = "Serie D Girone A"
+short = "D-A"
+country = "Italy"
+footystats_name = "Italy Serie D Group A"
+sofascore_tournament_id = 0
+tier = 4
+family = "Serie D"
+[competition.season_ids]
+"2024/25" = 13475
+"2025/26" = 15710
+"2026/27" = 17664
+
+[[competition]]
+code = "DB"
+label = "Serie D Girone B"
+short = "D-B"
+country = "Italy"
+footystats_name = "Italy Serie D Group B"
+sofascore_tournament_id = 0
+tier = 4
+family = "Serie D"
+[competition.season_ids]
+"2024/25" = 13232
+"2025/26" = 15706
+"2026/27" = 17667
+
+[[competition]]
+code = "DC"
+label = "Serie D Girone C"
+short = "D-C"
+country = "Italy"
+footystats_name = "Italy Serie D Group C"
+sofascore_tournament_id = 0
+tier = 4
+family = "Serie D"
+[competition.season_ids]
+"2024/25" = 13479
+"2025/26" = 15718
+"2026/27" = 17666
+
+[[competition]]
+code = "DD"
+label = "Serie D Girone D"
+short = "D-D"
+country = "Italy"
+footystats_name = "Italy Serie D Group D"
+sofascore_tournament_id = 0
+tier = 4
+family = "Serie D"
+[competition.season_ids]
+"2024/25" = 13481
+"2025/26" = 15714
+"2026/27" = 17676
+
+[[competition]]
+code = "DE"
+label = "Serie D Girone E"
+short = "D-E"
+country = "Italy"
+footystats_name = "Italy Serie D Group E"
+sofascore_tournament_id = 0
+tier = 4
+family = "Serie D"
+[competition.season_ids]
+"2024/25" = 13473
+"2025/26" = 15685
+"2026/27" = 17669
+
+[[competition]]
+code = "DF"
+label = "Serie D Girone F"
+short = "D-F"
+country = "Italy"
+footystats_name = "Italy Serie D Group F"
+sofascore_tournament_id = 0
+tier = 4
+family = "Serie D"
+[competition.season_ids]
+"2024/25" = 13470
+"2025/26" = 15707
+"2026/27" = 17671
+
+[[competition]]
+code = "DG"
+label = "Serie D Girone G"
+short = "D-G"
+country = "Italy"
+footystats_name = "Italy Serie D Group G"
+sofascore_tournament_id = 0
+tier = 4
+family = "Serie D"
+[competition.season_ids]
+"2024/25" = 13469
+"2025/26" = 15712
+"2026/27" = 17672
+
+[[competition]]
+code = "DH"
+label = "Serie D Girone H"
+short = "D-H"
+country = "Italy"
+footystats_name = "Italy Serie D Group H"
+sofascore_tournament_id = 0
+tier = 4
+family = "Serie D"
+[competition.season_ids]
+"2024/25" = 13477
+"2025/26" = 15693
+"2026/27" = 17674
+
+[[competition]]
+code = "DI"
+label = "Serie D Girone I"
+short = "D-I"
+country = "Italy"
+footystats_name = "Italy Serie D Group I"
+sofascore_tournament_id = 0
+tier = 4
+family = "Serie D"
+[competition.season_ids]
+"2024/25" = 13472
+"2025/26" = 15705
+"2026/27" = 17675

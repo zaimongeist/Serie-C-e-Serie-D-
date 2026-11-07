@@ -1,0 +1,43 @@
+{
+  "events": [
+    {
+      "tournament": {"name": "Serie C, Girone A", "slug": "serie-c-girone-a", "uniqueTournament": {"name": "Serie C, Girone A", "id": 141}, "id": 141},
+      "season": {"name": "Serie C, Girone A 25/26", "year": "25/26", "id": 77030},
+      "roundInfo": {"round": 3},
+      "status": {"code": 0, "description": "Not started", "type": "notstarted"},
+      "homeTeam": {"name": "AlbinoLeffe", "slug": "albinoleffe", "shortName": "AlbinoLeffe", "nameCode": "ALB", "id": 2601},
+      "awayTeam": {"name": "Lumezzane", "slug": "lumezzane", "shortName": "Lumezzane", "nameCode": "LUM", "id": 2650},
+      "homeScore": {},
+      "awayScore": {},
+      "id": 13579121,
+      "startTimestamp": 1757170800,
+      "slug": "albinoleffe-lumezzane"
+    },
+    {
+      "tournament": {"name": "Serie C, Girone A", "slug": "serie-c-girone-a", "uniqueTournament": {"name": "Serie C, Girone A", "id": 141}, "id": 141},
+      "season": {"name": "Serie C, Girone A 25/26", "year": "25/26", "id": 77030},
+      "roundInfo": {"round": 3},
+      "status": {"code": 0, "description": "Not started", "type": "notstarted"},
+      "homeTeam": {"name": "Renate", "slug": "renate", "shortName": "Renate", "nameCode": "REN", "id": 2669},
+      "awayTeam": {"name": "Alcione Milano", "slug": "alcione-milano", "shortName": "Alcione", "nameCode": "ALC", "id": 251784},
+      "homeScore": {},
+      "awayScore": {},
+      "id": 13579122,
+      "startTimestamp": 1757250000,
+      "slug": "renate-alcione-milano"
+    },
+    {
+      "tournament": {"name": "Serie C, Girone A", "slug": "serie-c-girone-a", "uniqueTournament": {"name": "Serie C, Girone A", "id": 141}, "id": 141},
+      "season": {"name": "Serie C, Girone A 25/26", "year": "25/26", "id": 77030},
+      "roundInfo": {"round": 3},
+      "status": {"code": 7, "description": "2nd half", "type": "inprogress"},
+      "homeTeam": {"name": "Arzignano Valchiampo", "slug": "arzignano-valchiampo", "shortName": "Arzignano", "nameCode": "ARZ", "id": 112835},
+      "awayTeam": {"name": "Triestina", "slug": "triestina", "shortName": "Triestina", "nameCode": "TRI", "id": 2704},
+      "homeScore": {"current": 1, "display": 1, "period1": 1},
+      "awayScore": {"current": 0, "display": 0, "period1": 0},
+      "id": 13579123,
+      "startTimestamp": 1757250000,
+      "slug": "arzignano-valchiampo-triestina"
+    }
+  ]
+}

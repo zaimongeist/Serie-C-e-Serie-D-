@@ -1,0 +1,110 @@
+# External data-source endpoints. Everything the harvester calls is templated
+# here so an upstream change is a config edit, not a code change.
+#
+# Template variables: {tournament_id} {season_id} {round} {page} {event_id} {league_id} {match_id}
+#
+# Reachability (verified November 2026):
+# * api.sofascore.com answers HTTP 403 to requests coming from datacenter /
+#   cloud IP ranges (hosted CI, cloud notebooks, VPS), whatever the headers.
+#   Run the harvester from a RESIDENTIAL connection (your own PC) and copy
+#   data/processed/*.csv to wherever the pipeline or the dashboard runs:
+#       python -m src.ingestion.harvester --gironi A B C --seasons 3
+#   The 403 is not retried (it is not transient); the raw JSON cache in
+#   data/raw/ lets a run be resumed without re-downloading what succeeded:
+#   the current season's payloads expire after [http] cache_ttl_hours (6 h,
+#   results and statistics still change), those of completed seasons after
+#   [http] history_cache_ttl_hours (8760 h = 365 days, they never change), so a
+#   `--seasons 3` run repeated later re-downloads the current season only.
+# * FotMob is EXPERIMENTAL: since 2026 /api/allLeagues returns an HTML 404 page
+#   and the API requires a signed `x-mas` header computed by the FotMob web
+#   client. The provider is kept for when a valid signature is available
+#   (pass it with --x-mas / env FOTMOB_X_MAS); it is not a working fallback
+#   out of the box and is never selected unless listed in --providers.
+
+[sofascore]
+base_url = "https://api.sofascore.com"
+# Undocumented Serie C unique-tournament ids (Girone A / B / C).
+tournament_ids = { A = 141, B = 142, C = 143 }
+seasons = "/api/v1/unique-tournament/{tournament_id}/seasons"
+rounds = "/api/v1/unique-tournament/{tournament_id}/season/{season_id}/rounds"
+events_by_round = "/api/v1/unique-tournament/{tournament_id}/season/{season_id}/events/round/{round}"
+events_last = "/api/v1/unique-tournament/{tournament_id}/season/{season_id}/events/last/{page}"
+events_next = "/api/v1/unique-tournament/{tournament_id}/season/{season_id}/events/next/{page}"
+event_statistics = "/api/v1/event/{event_id}/statistics"
+# statistic keys inside statistics[].groups[].statisticsItems[].key
+[sofascore.stat_keys]
+shots = ["totalShotsOnGoal", "shots", "Total shots"]
+shots_target = ["shotsOnGoal", "Shots on target"]
+corners = ["cornerKicks", "Corner kicks"]
+xg = ["expectedGoals", "Expected goals"]
+
+[fotmob]
+# EXPERIMENTAL (see the reachability note above): all_leagues answers an HTML
+# 404 since 2026 and every endpoint needs the signed `x-mas` header.
+base_url = "https://www.fotmob.com"
+# FotMob league ids are not stable across seasons: leave 0 and the harvester
+# resolves them at runtime from `all_leagues` (name match on "Serie C").
+league_ids = { A = 0, B = 0, C = 0 }
+all_leagues = "/api/allLeagues"
+league = "/api/leagues?id={league_id}&tab=matches&type=league"
+match_details = "/api/matchDetails?matchId={match_id}"
+
+[http]
+timeout_seconds = 20.0
+max_retries = 5
+backoff_base_seconds = 1.0
+backoff_max_seconds = 60.0
+max_concurrency = 4
+min_delay_seconds = 0.4
+# TTL of the raw JSON cache for the current season (results and statistics still change).
+cache_ttl_hours = 6
+# TTL for completed seasons (immutable payloads): 365 days. A run with `--seasons 3`
+# repeated after cache_ttl_hours re-downloads only the current season; set it to 0
+# (or pass --history-cache-ttl-hours 0) to force the history to be downloaded again.
+history_cache_ttl_hours = 8760
+
+[footystats]
+# Official, documented API (https://footystats.org/api/). Unlike SofaScore it answers
+# from datacenter IPs, so it is the provider the GitHub Actions job uses. The API key
+# (your account at footystats.org -> API) is NEVER written here: it is read from the
+# environment variable named in `key_env`, from a `.env` file in the repository root
+# (FOOTYSTATS_API_KEY=...) or from `--key`. On footystats.org add the competitions you
+# want to harvest to your account ("Choose leagues"): the harvester only sees the
+# chosen ones (`league_list` with chosen_leagues_only=true). Needed for this project
+# (the `footystats_name` of every [[competition]] in config/competitions.toml):
+#   Italy Serie C Group A, Italy Serie C Group B, Italy Serie C Group C, Italy Serie B,
+#   Italy Serie D Group A .. Italy Serie D Group I (nine leagues)
+# EVERY competition to harvest MUST be among the account's chosen leagues: the API
+# refuses /league-teams and /league-matches of a league that is not chosen
+# ("League is not chosen by the user", verified 2026-11-07), whatever season id is
+# passed. A requested competition whose league is not chosen is therefore skipped
+# with a warning naming the league to add (the others are harvested and written as
+# usual). FootyStats plans cap the number of chosen leagues: narrow --competitions
+# when the account cannot hold all 13. The configured season ids
+# ([competition.season_ids] in competitions.toml, then [footystats.season_ids] below)
+# are a fallback used only when /league-list itself cannot be reached.
+base_url = "https://api.football-data-api.com"
+league_list = "/league-list"
+league_matches = "/league-matches"
+league_teams = "/league-teams"
+key_env = "FOOTYSTATS_API_KEY"
+# Standard plans allow about 1800 requests per hour (HTTP 429 beyond that, retried with
+# backoff). A full run of 13 competitions x 3 seasons costs ~80 requests (one league list,
+# then one league-teams and one or two league-matches pages per season).
+max_requests_per_hour = 1800
+# Competition code -> `name` field of /league-list. Legacy fallback used only when the
+# shared competitions module (src/common/competitions.py) is not available; the Serie D
+# gironi are configured in competitions.toml only.
+[footystats.league_names]
+A = "Italy Serie C Group A"
+B = "Italy Serie C Group B"
+C = "Italy Serie C Group C"
+SB = "Italy Serie B"
+# Legacy fallback season ids (verified 2026-11-06). The primary source is now the
+# [competition.season_ids] sub-table of config/competitions.toml (filled for all 13
+# competitions); entries here only add labels that table does not list.
+[footystats.season_ids]
+A = { "2024/25" = 12659, "2025/26" = 15535, "2026/27" = 17487 }
+B = { "2024/25" = 12647, "2025/26" = 15532, "2026/27" = 17492 }
+C = { "2024/25" = 12670, "2025/26" = 15519, "2026/27" = 17473 }
+SB = { "2024/25" = 12621, "2025/26" = 15632, "2026/27" = 17404 }

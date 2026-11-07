@@ -1,0 +1,422 @@
+{
+ "success": true,
+ "pager": {
+  "current_page": 1,
+  "max_page": 1,
+  "results_per_page": 2000,
+  "total_results": 7
+ },
+ "metadata": {
+  "request_limit": "1800",
+  "request_remaining": "1787",
+  "request_reset_message": "Request limit is refreshed every hour.",
+  "request_limit_refresh_next": 1793965691
+ },
+ "data": [
+  {
+   "name": "Italy Serie A",
+   "country": "Italy",
+   "league_name": "Serie A",
+   "image": "https://cdn.footystats.org/img/competitions/italy-serie-a.png",
+   "season": [
+    {
+     "id": 68,
+     "year": 20162017
+    },
+    {
+     "id": 69,
+     "year": 20152016
+    },
+    {
+     "id": 70,
+     "year": 20142015
+    },
+    {
+     "id": 71,
+     "year": 20132014
+    },
+    {
+     "id": 182,
+     "year": 20172018
+    },
+    {
+     "id": 1680,
+     "year": 20182019
+    },
+    {
+     "id": 2588,
+     "year": 20192020
+    },
+    {
+     "id": 3940,
+     "year": 20112012
+    },
+    {
+     "id": 3941,
+     "year": 20082009
+    },
+    {
+     "id": 3942,
+     "year": 20092010
+    },
+    {
+     "id": 3945,
+     "year": 20122013
+    },
+    {
+     "id": 4889,
+     "year": 20202021
+    },
+    {
+     "id": 6198,
+     "year": 20212022
+    },
+    {
+     "id": 7608,
+     "year": 20222023
+    },
+    {
+     "id": 9697,
+     "year": 20232024
+    },
+    {
+     "id": 11181,
+     "year": 20102011
+    },
+    {
+     "id": 12530,
+     "year": 20242025
+    },
+    {
+     "id": 15068,
+     "year": 20252026
+    },
+    {
+     "id": 17084,
+     "year": 20262027
+    }
+   ]
+  },
+  {
+   "name": "Italy Serie B",
+   "country": "Italy",
+   "league_name": "Serie B",
+   "image": "https://cdn.footystats.org/img/competitions/italy-serie-b.png",
+   "season": [
+    {
+     "id": 77,
+     "year": 20162017
+    },
+    {
+     "id": 78,
+     "year": 20152016
+    },
+    {
+     "id": 79,
+     "year": 20142015
+    },
+    {
+     "id": 80,
+     "year": 20132014
+    },
+    {
+     "id": 81,
+     "year": 20122013
+    },
+    {
+     "id": 183,
+     "year": 20172018
+    },
+    {
+     "id": 1749,
+     "year": 20182019
+    },
+    {
+     "id": 2642,
+     "year": 20192020
+    },
+    {
+     "id": 3946,
+     "year": 20092010
+    },
+    {
+     "id": 3948,
+     "year": 20102011
+    },
+    {
+     "id": 3949,
+     "year": 20112012
+    },
+    {
+     "id": 4972,
+     "year": 20202021
+    },
+    {
+     "id": 6205,
+     "year": 20212022
+    },
+    {
+     "id": 7864,
+     "year": 20222023
+    },
+    {
+     "id": 9808,
+     "year": 20232024
+    },
+    {
+     "id": 12621,
+     "year": 20242025
+    },
+    {
+     "id": 15632,
+     "year": 20252026
+    },
+    {
+     "id": 17404,
+     "year": 20262027
+    }
+   ]
+  },
+  {
+   "name": "Italy Serie C",
+   "country": "Italy",
+   "league_name": "Serie C",
+   "image": "https://cdn.footystats.org/img/competitions/italy-serie-c.png",
+   "season": [
+    {
+     "id": 522,
+     "year": 20172018
+    },
+    {
+     "id": 523,
+     "year": 20162017
+    },
+    {
+     "id": 524,
+     "year": 20152016
+    },
+    {
+     "id": 525,
+     "year": 20142015
+    },
+    {
+     "id": 526,
+     "year": 20132014
+    },
+    {
+     "id": 1796,
+     "year": 20182019
+    },
+    {
+     "id": 2669,
+     "year": 20192020
+    },
+    {
+     "id": 3953,
+     "year": 20122013
+    },
+    {
+     "id": 3956,
+     "year": 20092010
+    },
+    {
+     "id": 3957,
+     "year": 20102011
+    },
+    {
+     "id": 3958,
+     "year": 20112012
+    },
+    {
+     "id": 4978,
+     "year": 20202021
+    }
+   ]
+  },
+  {
+   "name": "Italy Serie C Group A",
+   "country": "Italy",
+   "league_name": "Serie C Group A",
+   "image": "https://cdn.footystats.org/img/competitions/italy-serie-c-group-a.png",
+   "season": [
+    {
+     "id": 6401,
+     "year": 20212022
+    },
+    {
+     "id": 8311,
+     "year": 20222023
+    },
+    {
+     "id": 10298,
+     "year": 20232024
+    },
+    {
+     "id": 12659,
+     "year": 20242025
+    },
+    {
+     "id": 15535,
+     "year": 20252026
+    },
+    {
+     "id": 17487,
+     "year": 20262027
+    }
+   ]
+  },
+  {
+   "name": "Italy Serie C Group B",
+   "country": "Italy",
+   "league_name": "Serie C Group B",
+   "image": "https://cdn.footystats.org/img/competitions/italy-serie-c-group-b.png",
+   "season": [
+    {
+     "id": 6403,
+     "year": 20212022
+    },
+    {
+     "id": 8312,
+     "year": 20222023
+    },
+    {
+     "id": 10299,
+     "year": 20232024
+    },
+    {
+     "id": 12647,
+     "year": 20242025
+    },
+    {
+     "id": 15532,
+     "year": 20252026
+    },
+    {
+     "id": 17492,
+     "year": 20262027
+    }
+   ]
+  },
+  {
+   "name": "Italy Serie C Group C",
+   "country": "Italy",
+   "league_name": "Serie C Group C",
+   "image": "https://cdn.footystats.org/img/competitions/italy-serie-c-group-c.png",
+   "season": [
+    {
+     "id": 6404,
+     "year": 20212022
+    },
+    {
+     "id": 8313,
+     "year": 20222023
+    },
+    {
+     "id": 10300,
+     "year": 20232024
+    },
+    {
+     "id": 12670,
+     "year": 20242025
+    },
+    {
+     "id": 15519,
+     "year": 20252026
+    },
+    {
+     "id": 17473,
+     "year": 20262027
+    }
+   ]
+  },
+  {
+   "name": "England Premier League",
+   "country": "England",
+   "league_name": "Premier League",
+   "image": "https://cdn.footystats.org/img/competitions/england-premier-league.png",
+   "season": [
+    {
+     "id": 9,
+     "year": 20162017
+    },
+    {
+     "id": 10,
+     "year": 20152016
+    },
+    {
+     "id": 11,
+     "year": 20142015
+    },
+    {
+     "id": 12,
+     "year": 20132014
+    },
+    {
+     "id": 161,
+     "year": 20172018
+    },
+    {
+     "id": 246,
+     "year": 20122013
+    },
+    {
+     "id": 1625,
+     "year": 20182019
+    },
+    {
+     "id": 2012,
+     "year": 20192020
+    },
+    {
+     "id": 3119,
+     "year": 20112012
+    },
+    {
+     "id": 3121,
+     "year": 20102011
+    },
+    {
+     "id": 3125,
+     "year": 20092010
+    },
+    {
+     "id": 3131,
+     "year": 20082009
+    },
+    {
+     "id": 3137,
+     "year": 20072008
+    },
+    {
+     "id": 4759,
+     "year": 20202021
+    },
+    {
+     "id": 6135,
+     "year": 20212022
+    },
+    {
+     "id": 7704,
+     "year": 20222023
+    },
+    {
+     "id": 9660,
+     "year": 20232024
+    },
+    {
+     "id": 12325,
+     "year": 20242025
+    },
+    {
+     "id": 15050,
+     "year": 20252026
+    },
+    {
+     "id": 17146,
+     "year": 20262027
+    }
+   ]
+  }
+ ],
+ "message": "Usage of the API is bound to our Terms of Use : https://footystats.org/api/documentations/terms-of-use-and-legal"
+}

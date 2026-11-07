@@ -1,0 +1,9 @@
+# Tool configuration only. Serie C Quant Lab is run in place from the repository root
+# (`pip install -r requirements.txt`, then `python main.py` / `streamlit run src/dashboard/app.py`):
+# the code imports the top-level `src` package and reads `config/` relative to the checkout,
+# so it is not distributed as a wheel and there is deliberately no [build-system]/[project] table.
+# Python 3.12+ is required by the pinned numpy/scipy releases (see requirements.txt).
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
