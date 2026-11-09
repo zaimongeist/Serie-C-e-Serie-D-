@@ -45,6 +45,9 @@ Environment variables
 ``SERIEC_HISTORY`` (int 0-2, default 2), ``SERIEC_SIM_ROUNDS`` (int >= 1, optional), ``SERIEC_SEED`` (int >= 0, default 7)
     Demo only: synthetic past seasons, fixed number of played rounds (clamped so
     one round of fixtures remains) and random seed of the simulated league.
+``SERIEC_BACKTEST`` (``auto`` default, ``manual``, ``off``)
+    When the walk-forward backtest of *Affidabilità modello* (and so the
+    recalibration) is computed: at start, on the tab's button, or never.
 
 Invalid or out-of-range values (non-integers, a negative seed, zero rounds, an
 unparseable date, an unknown season file) are logged and replaced by the
@@ -67,19 +70,38 @@ recoveries with their original date.
 
 Sections
 --------
-The sidebar radio *Sezione* (key ``'section'``) splits the page into the
-sections of :mod:`src.dashboard.state`: *Serie B e Serie C* (default) and
-*Serie D*. The Dixon-Coles fit is one for the whole perimeter; every tab,
-selector, table, pick list, export and the perimeter text are restricted to the
-selected section, the picks (5 X / 12 GG) are ranked within it and the
-matchdays are grouped from its own fixtures. The *Competizione* selector lists
-*Tutti* plus the section's competitions; the matchday, fixture and filter
-widgets have per-section keys (:func:`src.dashboard.state.section_key`), so
-switching section starts from that section's defaults. When Serie D is
-configured but not yet initialised (its gironi are filled by the FootyStats
-harvester from the API, never shipped with the code) every tab shows one notice
-with :attr:`~src.dashboard.state.PipelineState.serie_d_status` and the exact
-command to run.
+The sidebar radio *Sezione* (key ``'section'``) has one page per league of
+``config/competitions.toml`` (:data:`src.dashboard.state.SECTIONS`): *Serie C*
+(default, gironi A/B/C), *Serie B*, *Serie D* and every league switched on with
+``enabled = true`` (Serie A, the European top flights). The Dixon-Coles fit is
+one per *country* (:func:`src.engine.fitgroups.fit_by_group`, L-BFGS-B by
+default, SLSQP from *Opzioni del modello*); every tab, selector, table, pick
+list, export and the perimeter text are restricted to the selected section, the
+picks (5 X / 12 GG) are ranked within it and the matchdays are grouped from its
+own fixtures. The *Competizione* selector lists *Tutti* plus the section's
+competitions; the matchday, fixture and filter widgets have per-section keys
+(:func:`src.dashboard.state.section_key`), so switching section starts from that
+section's defaults. A section configured but without data (Serie D before its
+first harvest, a league just enabled) shows one notice per tab with its status
+and how to download it.
+
+Schedine and Affidabilità modello
+---------------------------------
+*Schedine* proposes, for the selected matchday and the chosen sections (default:
+every section with data), three slips -- 5 X, 10 GG and a mixed one (best sign
+among 1, 2, GG, Over 2.5) -- with probability, fair and book odds, EV, expected
+winning legs, suggested stake, the accumulator-margin warning, a CSV and the
+past record of the same slips. *Affidabilità modello* shows the **walk-forward**
+backtest (every past matchday predicted with the matches before it only, never
+the production fit): scores per market against the league base rates and the
+de-vigged bookmaker, the reliability chart with Wilson intervals, the scores per
+competition, the track record of the lists, slips and value singles with their
+intervals, and the validated recalibration with the *Usa probabilità
+ricalibrate* toggle, which switches the probabilities of Giornata, Opportunità,
+Selezioni and Schedine (read before any tab renders). The backtest runs once per
+data version (``SERIEC_BACKTEST=auto``, the default; ``manual`` = on the tab's
+button, ``off`` = never), is shared by every session and persisted in
+``data/backtest.parquet`` / ``data/backtest.json`` (git-ignored).
 
 The heavy work (load/simulate, fit, predict, value) lives in
 :mod:`src.dashboard.state` and is cached with ``st.cache_resource`` keyed on
@@ -99,6 +121,7 @@ from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Final
 
+import pandas as pd
 
 # -- bootstrap: make ``src.*`` importable when launched as ``streamlit run src/dashboard/app.py``
 _REPO_ROOT: Final[Path] = Path(__file__).resolve().parents[2]
@@ -127,19 +150,61 @@ from src.dashboard.legend import (
 )
 from src.dashboard.state import (
     ALL_MATCHDAYS,
+    ALL_SECTIONS_LABEL,
+    DEFAULT_BACKTEST_SEASONS,
     DEFAULT_HISTORY_SEASONS,
     DEFAULT_SECTION,
     DEMO_BADGE,
     DEMO_WARNING,
+    EVIDENCE_NOTE,
+    INDEPENDENCE_NOTE,
     MATCHDAY_TABLE_KEY_PREFIX,
     MAX_HISTORY_SEASONS,
     MIN_SIM_ROUNDS,
+    QUOTED_BRIER_COLUMN,
+    QUOTED_LOG_LOSS_COLUMN,
+    RAW_COMPARE_COLUMNS,
+    RELIABILITY_SELECTIONS,
     SECTION_D,
     Matchday,
     NoDataError,
     PipelineState,
+    ReliabilityReport,
+    ValidatedTuning,
+    accumulators_table,
+    apply_recalibration,
     btts_picks_table,
     build_state,
+    competition_metrics_table,
+    default_slips_matchday,
+    headline_for,
+    market_card,
+    metrics_table_for,
+    picks_by_matchday_table,
+    picks_record_table,
+    picks_track_for,
+    raw_column_name,
+    recalibration_table,
+    reliability_export_frame,
+    reliability_figure,
+    reliability_for_state,
+    reliability_key,
+    reliability_table_for,
+    rolling_frame,
+    section_members,
+    sections_with_data,
+    slips_csv_bytes,
+    slips_for,
+    slips_matchdays,
+    slips_by_matchday_table,
+    slips_record_table,
+    slips_summary_for,
+    slips_track_for,
+    tuning_disclosure,
+    tuning_table,
+    validated_tuning,
+    value_track_for,
+    with_rolling,
     competition_options,
     competition_rounds,
     coverage_text,
@@ -184,7 +249,10 @@ from src.dashboard.state import (
     value_table,
 )
 from src.engine.calendar import IN_PLAY_TEXT, STATUS_TO_PLAY, rome_midnight
+from src.engine.calibration import DEFAULT_MIN_GAIN
+from src.engine.fitgroups import DEFAULT_FIT_METHOD
 from src.engine.picks import DEFAULT_N_BTTS, DEFAULT_N_DRAWS
+from src.engine.slips import DEFAULT_N_GG, DEFAULT_N_MIXED, DEFAULT_N_X, MIXED_MAX_LEGS, MIXED_MIN_LEGS, slips_frame
 from src.engine.tables import DEFAULT_FORM_N, DEFAULT_XG_N, RECOVERIES_COLUMNS
 
 log = get_logger(__name__)
@@ -256,9 +324,43 @@ TAB_LABELS: Final[tuple[str, ...]] = (
     "Risultati",
     "Opportunità di Valore",
     "Selezioni di giornata",
+    "Schedine",
+    "Affidabilità modello",
     "Export",
     "Legenda",
 )
+#: Environment variable of the walk-forward backtest behind *Affidabilità modello* and the recalibration:
+#: ``auto`` (default: computed at start once per data version, cached and persisted in data/backtest.*),
+#: ``manual`` (only on the button of the tab, or read back from disk), ``off`` (never).
+BACKTEST_ENV_VAR: Final[str] = "SERIEC_BACKTEST"
+BACKTEST_MODES: Final[tuple[str, ...]] = ("auto", "manual", "off")
+#: ``st.session_state`` keys of the reliability tab: the recalibration toggle (read before any tab renders), the
+#: request of a manual backtest, the evaluated seasons, the scope (section or every section), the reliability
+#: selection, the tuning button and the switch that applies the tuned xi / prior.
+RECALIBRATION_STATE_KEY: Final[str] = "use_recalibration"
+BACKTEST_REQUEST_KEY: Final[str] = "backtest_requested"
+BACKTEST_BUTTON_KEY: Final[str] = "run_backtest"
+RELIABILITY_SEASONS_KEY: Final[str] = "reliability_seasons"
+RELIABILITY_SCOPE_KEY: Final[str] = "reliability_scope"
+RELIABILITY_SELECTION_KEY: Final[str] = "reliability_selection"
+TUNING_BUTTON_KEY: Final[str] = "run_tuning"
+USE_TUNED_KEY: Final[str] = "use_tuned"
+#: Options of the evaluated-seasons selector (number of seasons up to the current one).
+RELIABILITY_SEASON_OPTIONS: Final[dict[int, str]] = {1: "Stagione corrente", 2: "Stagione corrente e precedente"}
+#: ``st.session_state`` keys of the slips tab.
+SLIPS_SECTIONS_KEY: Final[str] = "slips_sections"
+SLIPS_MATCHDAY_KEY: Final[str] = "slips_matchday"
+SLIPS_N_X_KEY: Final[str] = "slips_n_x"
+SLIPS_N_GG_KEY: Final[str] = "slips_n_gg"
+SLIPS_N_MIXED_KEY: Final[str] = "slips_n_mixed"
+SLIPS_MIN_P_KEY: Final[str] = "slips_min_probability"
+SLIPS_ONLY_QUOTED_KEY: Final[str] = "slips_only_quoted"
+#: Largest legs of the X and GG slips the sliders allow.
+SLIPS_MAX_X: Final[int] = 15
+SLIPS_MAX_GG: Final[int] = 20
+#: ``st.session_state`` key of the optimiser selector (sidebar, *Opzioni del modello*).
+FIT_METHOD_KEY: Final[str] = "fit_method"
+FIT_METHODS: Final[tuple[str, ...]] = (DEFAULT_FIT_METHOD, "SLSQP")
 
 
 # =============================================================================
@@ -410,6 +512,9 @@ def load_state(
     processed: str | None = None,
     odds: str | None = None,
     stamp: float | None = None,
+    method: str = DEFAULT_FIT_METHOD,
+    xi: float = 0.0018,
+    prior: str = "auto",
 ) -> PipelineState:
     """Build (and cache) the pipeline state for one combination of sidebar parameters and one version of the local data.
 
@@ -418,9 +523,15 @@ def load_state(
     only part of the cache key, so new data downloaded by a refresh yields a new
     state. Raises :class:`~src.dashboard.state.NoDataError` without real data
     (``simulate`` not ``True``): the exception is not cached, the next run tries
-    again.
+    again. ``method`` is the optimiser of the per-country fit (L-BFGS-B by
+    default, SLSQP from *Opzioni del modello*), ``xi`` / ``prior`` the model
+    settings (the defaults, or the walk-forward tuned ones when the user applies
+    them in *Affidabilità modello*).
     """
     return build_state(
+        method=method,
+        xi=xi,
+        prior=prior,
         processed_dir=Path(processed) if processed else PROCESSED_DIR,
         odds_dir=Path(odds) if odds else ODDS_DIR,
         min_ev=min_ev,
@@ -436,13 +547,20 @@ def load_state(
 
 
 @st.cache_resource(max_entries=16)
-def calendar_state(_state: PipelineState, built_at: str, now: datetime) -> PipelineState:
+def calendar_state(_state: PipelineState, built_at: str, now: datetime, variant: str = "raw") -> PipelineState:
     """The cached state with its calendar regrouped at ``now`` (:func:`src.dashboard.state.state_at`), cached per minute.
 
     ``_state`` is not hashed (Streamlit skips arguments with a leading
-    underscore): ``built_at`` identifies it.
+    underscore): ``built_at`` identifies it and ``variant`` tells its raw and
+    recalibrated versions apart (they share ``built_at``).
     """
     return state_at(_state, now)
+
+
+@st.cache_resource(max_entries=8)
+def calibrated_state(_state: PipelineState, built_at: str, model_key: str, _report: ReliabilityReport) -> PipelineState:
+    """The state with the validated recalibration applied (:func:`src.dashboard.state.apply_recalibration`), cached per fit and backtest."""
+    return apply_recalibration(_state, _report.recalibration)
 
 
 # =============================================================================
@@ -694,8 +812,9 @@ def render_section_controls(container: st.delta_generator.DeltaGenerator, state:
                 key=SECTION_STATE_KEY,
                 horizontal=True,
                 help=(
-                    "Serie B e Serie C (gironi A/B/C) oppure Serie D (gironi A-I): ogni tab, selettore, tabella, lista e "
-                    "export mostra solo la sezione scelta. La stima Dixon-Coles resta unica per tutto il perimetro."
+                    "Una sezione per campionato (Serie C gironi A/B/C, Serie B, Serie D gironi A-I e i campionati abilitati in "
+                    "config/competitions.toml): ogni tab, selettore, tabella, lista e export mostra solo la sezione scelta. "
+                    "La stima Dixon-Coles è una per paese (Serie B, C e D insieme)."
                 ),
             )
         )
@@ -708,7 +827,7 @@ def render_section_controls(container: st.delta_generator.DeltaGenerator, state:
                 comp_options,
                 index=0,
                 key=GIRONE_STATE_KEY,
-                help="Filtra classifica, partite e opportunità per competizione della sezione (girone di Serie C, Serie B o girone di Serie D).",
+                help="Filtra classifica, partite e opportunità per competizione della sezione (un girone di Serie C o di Serie D, oppure il campionato intero).",
             )
         )
     return section, selected_girone(girone_label)
@@ -717,14 +836,21 @@ def render_section_controls(container: st.delta_generator.DeltaGenerator, state:
 def render_source_badge(container: st.delta_generator.DeltaGenerator, state: PipelineState, section: str | None = None) -> None:
     """Data-source badge: *Dati reali FootyStats* or *Demo* (red, with the warning), the section's perimeter, fit diagnostics, Serie D status."""
     params = state.params
+    groups = ", ".join(g for g in state.fit_groups if g) or "unico"
+    calibration = (
+        "ricalibrate (" + ", ".join(m.value for m in state.recalibration.enabled_markets) + ")"
+        if state.calibrated and state.recalibration is not None
+        else "originali del modello"
+    )
     body = (
         f"**{perimeter_text(state, section)}**  \n"
-        f"{state.n_matches} partite nel fit (stima congiunta di tutto il perimetro) · "
+        f"{state.n_matches} partite nel fit (una stima per paese: {groups}) · "
         f"**{len(section_predictions(state, section))}** partite in programma · "
         f"{state.n_historical_teams} squadre storiche escluse  \n"
         f"Fit: {params.method} · LL {params.log_likelihood:.1f}  \n"
         f"Convergenza: {'sì' if params.converged else 'no'} · {params.fit_seconds:.2f} s  \n"
-        f"Prior gaussiana: {'attiva' if state.prior_enabled else 'disattivata'}"
+        f"Prior gaussiana: {'attiva' if state.prior_enabled else 'disattivata'} · xi {state.xi:g}  \n"
+        f"Probabilità: {calibration}"
     )
     coverage = coverage_text(state, section)
     if coverage:
@@ -757,7 +883,13 @@ def render_section_notice(state: PipelineState, section: str) -> bool:
             icon="ℹ️",
         )
     else:
-        st.info(f"Sezione {section}: nessuna squadra del perimetro {state.season_label} con partite nei dati.", icon="ℹ️")
+        st.info(
+            f"Sezione {section}: nessuna squadra del perimetro {state.season_label} con partite nei dati. Se il campionato è "
+            "appena stato abilitato in config/competitions.toml (enabled = true), sceglilo anche sull'account footystats.org "
+            "(Choose leagues) e premi «Aggiorna dati ora»: la raccolta riempie le sue squadre nel dizionario e ne scarica partite, "
+            "calendario e quote; poi la sezione mostra classifica, giornate, risultati, valore, selezioni e schedine.",
+            icon="ℹ️",
+        )
     return True
 
 
@@ -883,6 +1015,9 @@ def matchday_column_config() -> dict[str, object]:
     config["μ"] = cc.NumberColumn("μ", format="%.2f", help="Gol attesi della squadra ospite.")
     for column in ("P1 (%)", "PX (%)", "P2 (%)", "O1.5 (%)", "O2.5 (%)", "O3.5 (%)", "GG (%)"):
         config[column] = cc.NumberColumn(column, format="%.1f %%")
+    for column, _market, _selection in RAW_COMPARE_COLUMNS:
+        raw = raw_column_name(column)
+        config[raw] = cc.NumberColumn(raw, format="%.1f %%", help="Probabilità originale del modello, prima della ricalibrazione validata fuori campione.")
     for column in ("Fair 1", "Fair X", "Fair 2", "Fair O2.5", "Fair GG"):
         config[column] = cc.NumberColumn(column, format="%.2f", help="Quota fair = 1 / probabilità del modello.")
     for column in ("Book 1", "Book X", "Book 2", "Book O2.5", "Book GG"):
@@ -1006,14 +1141,18 @@ def render_match_tab(state: PipelineState, girone: Girone | None, matchday: Matc
     fixture_key = section_key(FIXTURE_STATE_KEY, section)
     applied_key = section_key(APPLIED_ROW_STATE_KEY, section)
     round_number: int | None = None
+    compare = state.calibrated
     if girone is not None:
         selector, _ = st.columns([1, 3])
         with selector:
             round_number = round_selector(state, girone, matchday, section)
-        table = matchday_table_for(state, None, girone, section, round_number=round_number) if round_number is not None else matchday_table_for(state, None, girone, section)
+        if round_number is not None:
+            table = matchday_table_for(state, None, girone, section, round_number=round_number, compare_raw=compare)
+        else:
+            table = matchday_table_for(state, None, girone, section, compare_raw=compare)
         scope_label = f"{girone.short} · Giornata {round_number}" if round_number is not None else girone.short
     else:
-        table = matchday_table_for(state, matchday, None, section)
+        table = matchday_table_for(state, matchday, None, section, compare_raw=compare)
         scope_label = matchday.label if matchday is not None else f"tutte le competizioni di {section}"
     if table.empty:
         message = f"Nessuna partita in calendario per {scope_label}."
@@ -1049,6 +1188,12 @@ def render_match_tab(state: PipelineState, girone: Girone | None, matchday: Matc
             else "; scegli un'altra giornata dal menù «Giornata n.»." if girone is not None else "."
         )
     )
+    if compare and state.recalibration is not None:
+        st.caption(
+            "Probabilità ricalibrate attive (tab *Affidabilità modello*): accanto a P1, PX, P2, O2.5 e GG la colonna «orig.» "
+            "riporta la probabilità originale del modello; quote fair, EV, liste e schedine usano quelle ricalibrate. "
+            + state.recalibration.describe()
+        )
     table_key = matchday_table_key(matchday if girone is None else None, girone, section, round_number=round_number)
     event = st.dataframe(
         table,
@@ -1481,6 +1626,647 @@ def render_export_tab(state: PipelineState, section: str = DEFAULT_SECTION) -> N
 
 
 # =============================================================================
+# Reliability (walk-forward backtest) and recalibration
+# =============================================================================
+@dataclass
+class ReliabilityStore:
+    """Process-wide memo of the reliability reports and of the views derived from them (track records, tuning).
+
+    Shared by every session (``st.cache_resource``): a backtest computed for
+    one data version is reused by every rerun and every session until the data
+    changes (its key, :func:`reliability_cache_key`, carries the data version).
+    ``values`` holds the derived views keyed by ``(report key, parameters)``;
+    both maps keep only the most recent entries.
+    """
+
+    lock: threading.Lock = field(default_factory=threading.Lock)
+    reports: dict[str, ReliabilityReport] = field(default_factory=dict)
+    values: dict[tuple, object] = field(default_factory=dict)
+    tuning: dict[str, ValidatedTuning] = field(default_factory=dict)
+
+    def remember(self, key: str, report: ReliabilityReport, *, keep: int = 4) -> None:
+        with self.lock:
+            self.reports[key] = report
+            while len(self.reports) > keep:
+                self.reports.pop(next(iter(self.reports)))
+
+    def memo(self, key: tuple, compute):  # noqa: ANN001, ANN201 - a callable and its result
+        with self.lock:
+            if key in self.values:
+                return self.values[key]
+        value = compute()
+        with self.lock:
+            self.values[key] = value
+            while len(self.values) > 64:
+                self.values.pop(next(iter(self.values)))
+        return value
+
+
+@st.cache_resource
+def reliability_store() -> ReliabilityStore:
+    """The process-wide :class:`ReliabilityStore`."""
+    return ReliabilityStore()
+
+
+def backtest_mode() -> str:
+    """``SERIEC_BACKTEST``: ``auto`` (default), ``manual`` or ``off``; an unknown value is logged and read as ``auto``."""
+    raw = os.getenv(BACKTEST_ENV_VAR, "").strip().lower()
+    if not raw:
+        return "auto"
+    if raw not in BACKTEST_MODES:
+        log.warning("unknown backtest mode, using auto", extra={"variable": BACKTEST_ENV_VAR, "value": raw})
+        return "auto"
+    return raw
+
+
+def data_version(*, demo: bool, data_dir: Path, seed: int, n_rounds: int | None, season: str, history: int, as_of: date) -> str:
+    """Identifier of the data a state is built on: the local data stamp, or the demo's simulation parameters."""
+    if demo:
+        return f"demo:{seed}:{n_rounds}:{season}:{history}:{as_of.isoformat()}"
+    return f"data:{data_stamp(data_dir)}"
+
+
+def reliability_cache_key(state: PipelineState, version: str, n_seasons: int) -> str:
+    """Key of the backtest of a state: the logic version and the competition configuration (:func:`reliability_key`), the data version, the season, the evaluated seasons and the model settings.
+
+    The configuration part makes a league switched on or off, or moved to another
+    section, miss the saved ``data/backtest.*`` even when the data files did not change.
+    """
+    return reliability_key(version, state.season_label, n_seasons, f"xi={state.xi:g}", f"prior={state.prior}")
+
+
+def selected_backtest_seasons() -> int:
+    """The evaluated seasons chosen in *Affidabilità modello* (:data:`DEFAULT_BACKTEST_SEASONS` by default)."""
+    value = st.session_state.get(RELIABILITY_SEASONS_KEY, DEFAULT_BACKTEST_SEASONS)
+    return int(value) if value in RELIABILITY_SEASON_OPTIONS else DEFAULT_BACKTEST_SEASONS
+
+
+def obtain_reliability(
+    state: PipelineState,
+    *,
+    version: str,
+    n_seasons: int,
+    data_dir: Path,
+    quotes_dir: Path,
+    compute: bool,
+) -> ReliabilityReport | None:
+    """The reliability report of ``state``: from memory, else from ``data/backtest.*``, else computed now (when ``compute``).
+
+    The walk-forward fits one model per past week block, so it runs once per
+    data version with a progress bar and is then persisted (real data only)
+    and shared by every session. ``None`` when nothing is available and
+    ``compute`` is false (manual mode before the button, mode ``off``). The
+    matchday-by-matchday recalibration of the backtest is attached here too
+    (:func:`attach_rolling`), never on a tab's first render.
+    """
+    key = reliability_cache_key(state, version, n_seasons)
+    store = reliability_store()
+    with store.lock:
+        found = store.reports.get(key)
+    if found is not None:
+        return found
+    report: ReliabilityReport | None = None
+    odds_history = pd.DataFrame() if state.is_demo else data_refresh.load_odds_history_frame(quotes_dir)
+    if not state.is_demo:
+        loaded = data_refresh.load_backtest(data_dir, key=key)
+        if loaded is not None:
+            report = ReliabilityReport(result=loaded[0], recalibration=loaded[1], odds_history=odds_history, key=key, from_cache=True)
+    if report is None and compute:
+        bar = st.progress(0.0, text="Verifica fuori campione del modello (backtest walk-forward)…")
+
+        def progress(fraction: float, message: str) -> None:
+            bar.progress(min(max(float(fraction), 0.0), 1.0), text=message)
+
+        with st.spinner("Backtest walk-forward: ogni giornata passata viene prevista con un modello stimato solo sulle partite precedenti…"):
+            report = reliability_for_state(state, n_seasons=n_seasons, odds_history=odds_history, progress=progress, key=key)
+        bar.empty()
+        if not state.is_demo:
+            data_refresh.save_backtest(report.result, report.recalibration, key=key, processed_dir=data_dir)
+    if report is not None:
+        report = attach_rolling(report, state=state, data_dir=data_dir)
+        store.remember(key, report)
+        log.info("reliability report ready", extra={"key": key, "n_matches": report.result.n_matches, "from_cache": report.from_cache})
+    return report
+
+
+#: Errors a view built on the backtest may raise on a stale or inconsistent report (a saved backtest of a league
+#: switched off since, a regrouped section): caught per view so the other tabs still render.
+REPORT_ERRORS: Final[tuple[type[Exception], ...]] = (ValueError, KeyError, RuntimeError)
+
+
+def report_error_notice(what: str, exc: BaseException) -> None:
+    """Log a failed backtest view and say so on the page instead of stopping the script (the next tabs still render)."""
+    log.warning("reliability view failed", extra={"view": what, "error": str(exc)})
+    st.warning(
+        f"{what}: vista non disponibile ({exc}). Il backtest non corrisponde ai dati o alla configurazione attuale: "
+        "aggiorna i dati (il backtest viene ricalcolato) oppure, se il problema resta, cancella data/backtest.parquet. "
+        "Le altre schede funzionano normalmente.",
+        icon="⚠️",
+    )
+
+
+def attach_rolling(report: ReliabilityReport, *, state: PipelineState, data_dir: Path) -> ReliabilityReport:
+    """The report with its matchday-by-matchday out-of-sample recalibration, read from disk or computed now (with a spinner) and saved.
+
+    Needed only when the recalibration enabled a market (otherwise the
+    probabilities are never recalibrated and nothing is computed). It costs one
+    validated recalibration per past matchday (tens of seconds on two real
+    seasons), so it runs once per backtest, here on the loading path rather than
+    inside a tab, and is persisted next to ``data/backtest.parquet`` under the
+    same key (real data only): a restart reads it back.
+    """
+    if report.empty or report.rolling is not None or not report.recalibration.enabled:
+        return report
+    rolling = None if state.is_demo else data_refresh.load_rolling(data_dir, key=report.key, frame=report.frame)
+    if rolling is None:
+        with st.spinner("Ricalibrazione fuori campione giornata per giornata (ogni giornata corretta solo con quelle precedenti)…"):
+            rolling = rolling_frame(report)
+        if not state.is_demo:
+            data_refresh.save_rolling(rolling, key=report.key, processed_dir=data_dir)
+    return with_rolling(report, rolling)
+
+
+def recalibration_wanted(report: ReliabilityReport | None) -> bool:
+    """The *Usa probabilità ricalibrate* choice, read before any tab renders (default: on only when the model enabled a market)."""
+    if report is None:
+        return False
+    if RECALIBRATION_STATE_KEY not in st.session_state:
+        st.session_state[RECALIBRATION_STATE_KEY] = bool(report.recalibration.enabled)
+    return bool(st.session_state.get(RECALIBRATION_STATE_KEY)) and report.recalibration.enabled
+
+
+def _metric_value(value: float, fmt: str = "{:.4f}") -> str:
+    return fmt.format(value) if value is not None and pd.notna(value) else "n.d."
+
+
+def render_recalibration_controls(state: PipelineState, report: ReliabilityReport) -> None:
+    """The recalibration status (*Calibrazione applicata: sì/no*), its per-market table and the toggle."""
+    model = report.recalibration
+    st.markdown("**Imparare dal differenziale: ricalibrazione validata**")
+    st.caption(
+        "La correzione (Platt per GG/NG e Over/Under, temperatura multinomiale per 1X2, con penalità verso «nessuna correzione») "
+        "è stimata sulle giornate passate più vecchie e giudicata su quelle più recenti: un mercato viene corretto solo se la "
+        "log loss fuori campione migliora almeno della soglia, altrimenti restano le probabilità originali. È reversibile: il "
+        "modello non viene mai sovrascritto."
+    )
+    if model.enabled:
+        st.success(model.describe(), icon="✅")
+    else:
+        st.info(model.describe(), icon="ℹ️")
+    st.toggle(
+        "Usa probabilità ricalibrate",
+        key=RECALIBRATION_STATE_KEY,
+        disabled=not model.enabled,
+        help=(
+            "Acceso: Giornata, Opportunità di Valore, Selezioni di giornata e Schedine usano le probabilità ricalibrate (solo i "
+            "mercati che hanno superato la verifica fuori campione); nella tabella Giornata compare accanto la probabilità originale. "
+            "Spento: le probabilità originali del modello."
+        ),
+    )
+    st.dataframe(recalibration_table(model), hide_index=True, **FULL_WIDTH["dataframe"])
+
+
+def render_tuning(state: PipelineState, report: ReliabilityReport, version: str) -> None:
+    """Optional walk-forward tuning of the time decay xi and of the prior strength (button, cached per data version).
+
+    The point is chosen on the earlier matchdays of the current season and
+    confirmed on the later ones (:func:`validated_tuning`); the switch that
+    applies it is enabled only when the held-out gain reaches the
+    recalibration's own threshold.
+    """
+    store = reliability_store()
+    key = f"{version}|{state.season_label}"
+    with st.expander("Ottimizza decadimento (xi) e prior (facoltativo, lento)", expanded=False):
+        st.caption(
+            "Ripete il backtest della stagione corrente per 9 combinazioni (xi 0.001 / 0.0018 / 0.003 per giorno × prior "
+            "automatica / forza 0.2 / 0.4). La combinazione viene **scelta** sulle giornate più vecchie (log loss fuori campione "
+            "media di 1X2, GG/NG e Over/Under 2.5) e **confermata** sul 30% più recente, che la scelta non ha visto: si può "
+            f"applicare solo se lì batte la configurazione di produzione di almeno lo {DEFAULT_MIN_GAIN * 100:.1f}% (la stessa "
+            "soglia della ricalibrazione). Richiede qualche minuto sui dati reali; il risultato resta in memoria finché i dati "
+            "non cambiano."
+        )
+        tuned = store.tuning.get(key)
+        if st.button("Esegui l'ottimizzazione", key=TUNING_BUTTON_KEY):
+            bar = st.progress(0.0, text="Ottimizzazione walk-forward…")
+            seasons = (state.season_label.replace("_", "/"),)
+            tuned = validated_tuning(
+                state.matches,
+                state.registry,
+                seasons=seasons,
+                progress=lambda f, m: bar.progress(min(max(float(f), 0.0), 1.0), text=m),
+            )
+            bar.empty()
+            with store.lock:
+                store.tuning[key] = tuned
+        if tuned is None:
+            return
+        (st.success if tuned.accepted else st.info)(tuned.describe())
+        st.dataframe(tuning_table(tuned), hide_index=True, **FULL_WIDTH["dataframe"])
+        if not tuned.accepted:
+            st.session_state[USE_TUNED_KEY] = False
+        st.toggle(
+            "Usa xi e prior ottimizzati nella stima",
+            key=USE_TUNED_KEY,
+            disabled=not tuned.accepted,
+            help=(
+                "Ristima il modello con la combinazione scelta (e ripete il backtest con la stessa combinazione: le giornate su "
+                "cui è stata scelta non sono più del tutto fuori campione, la tab lo segnala). Attivabile solo se la conferma "
+                "sulle giornate più recenti supera la soglia. Spegnilo per tornare alla configurazione standard."
+            ),
+        )
+
+
+def active_tuning(version: str) -> ValidatedTuning | None:
+    """The validated tuning applied to the fit: switched on by the user and confirmed on held-out matchdays (``None`` otherwise)."""
+    if not st.session_state.get(USE_TUNED_KEY):
+        return None
+    store = reliability_store()
+    for key, tuned in store.tuning.items():
+        if key.startswith(f"{version}|") and tuned.accepted:
+            return tuned
+    return None
+
+
+def tuned_settings(version: str, season: str) -> tuple[float, str]:
+    """``(xi, prior)`` for the fit: the tuned ones when the user switched them on and the held-out check confirmed them, else the defaults."""
+    tuned = active_tuning(version)
+    return tuned.settings if tuned is not None else (0.0018, "auto")
+
+
+#: Why the market is compared only with the model's scores on the quoted matches (under the per-market table).
+QUOTED_SUBSET_NOTE: Final[str] = (
+    "«Log loss modello» e «Brier modello» coprono tutte le partite valutate; il bookmaker si misura solo sulle «Partite con "
+    f"quote». Per il confronto con il mercato usa le colonne «{QUOTED_LOG_LOSS_COLUMN}» e «{QUOTED_BRIER_COLUMN}», "
+    "calcolate sulle stesse partite del mercato (come «Skill vs mercato»): la copertura delle quote cambia da campionato "
+    "a campionato, e confrontare numeri su partite diverse può far sembrare il modello migliore del mercato quando non lo è."
+)
+
+
+def market_column_config() -> dict[str, object]:
+    """Formats and tooltips of the reliability score tables (per market and per competition)."""
+    return {
+        "Skill vs base (%)": st.column_config.NumberColumn("Skill vs base (%)", format="%+.2f %%", help="1 − log loss modello / log loss base: positivo = meglio delle frequenze di base."),
+        "Skill vs mercato (%)": st.column_config.NumberColumn(
+            "Skill vs mercato (%)",
+            format="%+.2f %%",
+            help="1 − log loss modello / log loss mercato sulle stesse partite con quote: positivo = meglio del bookmaker (raro e fragile su campioni piccoli).",
+        ),
+        QUOTED_LOG_LOSS_COLUMN: st.column_config.NumberColumn(QUOTED_LOG_LOSS_COLUMN, help="Log loss del modello sulle sole partite con quote: è il numero da confrontare con «Log loss mercato»."),
+        QUOTED_BRIER_COLUMN: st.column_config.NumberColumn(QUOTED_BRIER_COLUMN, help="Brier del modello sulle sole partite con quote: è il numero da confrontare con «Brier mercato»."),
+        "Margine medio (%)": st.column_config.NumberColumn("Margine medio (%)", format="%.1f %%", help="Sovrapprezzo medio del bookmaker sul mercato."),
+    }
+
+
+def render_reliability_tab(
+    state: PipelineState,
+    report: ReliabilityReport | None,
+    section: str = DEFAULT_SECTION,
+    *,
+    mode: str = "auto",
+    version: str = "",
+) -> None:
+    """*Affidabilità modello*: how well the out-of-sample probabilities matched the results, and the recalibration they support."""
+    demo_banner(state)
+    st.subheader(f"Affidabilità del modello · {section}")
+    st.caption(
+        "Ogni giornata passata (blocco della settimana calcistica) è prevista da un modello stimato **solo** sulle partite "
+        "giocate prima del suo calcio d'inizio, con lo stesso decadimento e la stessa prior della dashboard: sono le probabilità "
+        "che il modello avrebbe pubblicato allora, confrontate con quello che è successo. Le probabilità della stima di produzione "
+        "(che ha già visto quei risultati) non vengono mai usate per giudicare la precisione."
+    )
+    c_seasons, _ = st.columns([1, 2])
+    with c_seasons:
+        if st.session_state.get(RELIABILITY_SEASONS_KEY) not in RELIABILITY_SEASON_OPTIONS:
+            st.session_state[RELIABILITY_SEASONS_KEY] = DEFAULT_BACKTEST_SEASONS
+        st.selectbox(
+            "Stagioni valutate",
+            list(RELIABILITY_SEASON_OPTIONS),
+            format_func=lambda n: RELIABILITY_SEASON_OPTIONS[n],
+            key=RELIABILITY_SEASONS_KEY,
+            help="Più stagioni = più partite valutate e un giudizio più stabile (il backtest viene ricalcolato).",
+        )
+    if report is None:
+        if mode == "off":
+            st.info(f"Backtest disattivato ({BACKTEST_ENV_VAR}=off): nessuna verifica fuori campione e nessuna ricalibrazione.", icon="ℹ️")
+            return
+        st.info(
+            "Il backtest walk-forward non è ancora stato calcolato per questi dati: richiede una stima per ogni settimana passata "
+            "(da qualche secondo a un minuto).",
+            icon="⏳",
+        )
+        if st.button("Calcola l'affidabilità del modello", key=BACKTEST_BUTTON_KEY, type="primary"):
+            st.session_state[BACKTEST_REQUEST_KEY] = True
+            st.rerun()
+        return
+    result = report.result
+    st.caption(result.summary() + (" Letto dal backtest salvato in data/backtest.parquet." if report.from_cache else ""))
+    tuned = active_tuning(version)
+    if tuned is not None:
+        st.warning(tuning_disclosure(tuned), icon="🎛️")
+    if report.empty:
+        st.info("Nessuna partita valutabile: servono almeno 150 partite giocate prima della prima giornata da valutare.")
+        render_recalibration_controls(state, report)
+        return
+    store = reliability_store()
+    present = [s for s in dict.fromkeys(report.frame["section"].astype(str))]
+    scopes = [section, ALL_SECTIONS_LABEL] if section in present else [ALL_SECTIONS_LABEL]
+    scope_key = section_key(RELIABILITY_SCOPE_KEY, section)
+    if st.session_state.get(scope_key) not in scopes:
+        st.session_state.pop(scope_key, None)
+    c_scope, c_sel = st.columns([2, 1])
+    with c_scope:
+        scope = str(st.radio("Ambito", scopes, key=scope_key, horizontal=True, help="La sezione scelta nella sidebar oppure tutte le sezioni insieme."))
+    with c_sel:
+        if st.session_state.get(RELIABILITY_SELECTION_KEY) not in RELIABILITY_SELECTIONS:
+            st.session_state.pop(RELIABILITY_SELECTION_KEY, None)
+        label = str(st.selectbox("Esito", list(RELIABILITY_SELECTIONS), key=RELIABILITY_SELECTION_KEY, help="Esito del grafico di affidabilità e dei riquadri."))
+    market, selection = RELIABILITY_SELECTIONS[label]
+    scope_arg = None if scope == ALL_SECTIONS_LABEL else scope
+    rolled = None
+    if state.calibrated:
+        rolled = store.memo((report.key, "rolling"), lambda: rolling_frame(report)).frame
+    head = headline_for(report, scope_arg, market)
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Partite valutate", f"{head['n']}", help="Partite previste fuori campione nell'ambito scelto.")
+    c2.metric(
+        f"Log loss modello · {market.value}",
+        _metric_value(head["log_loss"]),
+        delta=None if pd.isna(head["log_loss_base"]) else f"{head['log_loss'] - head['log_loss_base']:+.4f} vs base",
+        delta_color="inverse",
+        help=(
+            f"−ln della probabilità data all'esito avvenuto, in media su tutte le {head['n']} partite valutate: più bassa è "
+            "meglio. Il delta è contro le frequenze di base del campionato sulle stesse partite. Non confrontarla con il "
+            "mercato: il bookmaker si misura solo sulle partite con quote (riquadro accanto)."
+        ),
+    )
+    c3.metric(**market_card(head))
+    c4.metric("Brier", _metric_value(head["brier"]), help="Errore quadratico medio delle probabilità (1X2 da 0 a 2, mercati a due esiti da 0 a 1): più basso è meglio.")
+    c5.metric("Accuratezza", _metric_value(head["accuracy"], "{:.1f}%"), help="Quante volte l'esito più probabile secondo il modello è avvenuto.")
+    st.markdown("**Punteggi per mercato** (modello, frequenze di base del campionato, bookmaker senza margine)")
+    st.dataframe(
+        metrics_table_for(report, scope_arg),
+        hide_index=True,
+        **FULL_WIDTH["dataframe"],
+        column_config=market_column_config(),
+    )
+    st.caption(QUOTED_SUBSET_NOTE)
+    table = reliability_table_for(report, scope_arg, market, selection)
+    calibrated_table = reliability_table_for(report, scope_arg, market, selection, frame=rolled) if rolled is not None else None
+    st.plotly_chart(
+        reliability_figure(table, f"Affidabilità · {label} · {scope}", calibrated=calibrated_table),
+        **FULL_WIDTH["plotly_chart"],
+        key="reliability_chart",
+    )
+    st.caption(
+        "Ogni punto è un gruppo di partite con probabilità prevista simile: sull'asse orizzontale la probabilità media prevista, "
+        "su quello verticale quante volte l'esito è avvenuto, con l'intervallo di confidenza al 95% (Wilson). Sulla diagonale "
+        "tratteggiata il modello è tarato; sopra la diagonale l'esito avviene più spesso di quanto previsto, sotto meno spesso. "
+        "Le barre larghe dicono che il gruppo ha poche partite."
+    )
+    st.markdown(f"**Per competizione** · {MARKET_LABELS_UI.get(market, market.value)}")
+    st.dataframe(competition_metrics_table(report, scope_arg, market), hide_index=True, **FULL_WIDTH["dataframe"], column_config=market_column_config())
+
+    st.markdown("**Track record delle liste e delle schedine** (quello che il modello avrebbe proposto in ogni giornata passata)")
+    frame_key = "rolling" if rolled is not None else "raw"
+    picks = store.memo((report.key, "picks", frame_key), lambda: picks_track_for(report, frame=rolled))
+    st.dataframe(picks_record_table(picks, scope_arg), hide_index=True, **FULL_WIDTH["dataframe"])
+    st.caption(
+        f"Top {DEFAULT_N_DRAWS} X e top {DEFAULT_N_BTTS} GG di ogni giornata ({'tutte le sezioni insieme' if scope_arg is None else 'dentro la sezione'}): "
+        "hit rate con intervallo di Wilson al 95% contro la probabilità media del modello (se coincidono il modello è tarato), ROI "
+        "a puntata fissa sulla miglior quota pre-partita quando c'è."
+    )
+    st.markdown("**Multiple top-k delle liste** (le prime k partite della lista di ogni giornata giocate insieme)")
+    st.dataframe(
+        accumulators_table(picks, scope_arg),
+        hide_index=True,
+        **FULL_WIDTH["dataframe"],
+        column_config={
+            "Attese": st.column_config.NumberColumn("Attese", help="Somma, giornata per giornata, del prodotto delle k probabilità (indipendenza ipotizzata)."),
+            "ROI (%)": st.column_config.NumberColumn("ROI (%)", help="Puntata 1 per multipla al prodotto delle migliori quote pre-partita, solo nelle giornate con tutte le partite quotate."),
+        },
+        key="accumulators_record",
+    )
+    st.caption(
+        "È la giocata «le prime 2 GG della Serie C» o «le prime 4 della Serie D» ripetuta su ogni giornata passata della sezione: "
+        "conta quante giornate sono state giocate, quante vinte contro quante il modello se ne aspettava e l'intervallo di "
+        "confidenza, non la singola domenica vinta."
+    )
+    with st.expander("Liste giornata per giornata", expanded=False):
+        st.dataframe(
+            picks_by_matchday_table(picks, scope_arg),
+            hide_index=True,
+            **FULL_WIDTH["dataframe"],
+            column_config={"Giornata": st.column_config.DateColumn("Giornata", format="DD/MM/YYYY", help="Primo giorno del blocco della settimana calcistica.")},
+            key="picks_history",
+        )
+    sections = None if scope_arg is None else section_members(scope_arg)
+    slips_track = store.memo(
+        (report.key, "slips", frame_key, tuple(sections or ()), DEFAULT_N_X, DEFAULT_N_GG, DEFAULT_N_MIXED, 0.0),
+        lambda: slips_track_for(report, sections, frame=rolled),
+    )
+    st.dataframe(slips_record_table(slips_track), hide_index=True, **FULL_WIDTH["dataframe"])
+    with st.expander("Schedine giornata per giornata", expanded=False):
+        st.dataframe(
+            slips_by_matchday_table(slips_track),
+            hide_index=True,
+            **FULL_WIDTH["dataframe"],
+            column_config={"Giornata": st.column_config.DateColumn("Giornata", format="DD/MM/YYYY", help="Primo giorno del blocco della settimana calcistica.")},
+        )
+    if report.has_odds:
+        st.markdown(f"**Singole di valore** (EV ≥ {state.min_ev:.1%} sulla miglior quota pre-partita)")
+        st.dataframe(
+            store.memo((report.key, "value", frame_key, scope, state.min_ev), lambda: value_track_for(report, scope_arg, min_ev=state.min_ev, frame=rolled)),
+            hide_index=True,
+            **FULL_WIDTH["dataframe"],
+        )
+    else:
+        st.caption("Nessuno storico delle quote pre-partita delle partite giocate: confronto con il mercato, ROI e singole di valore non disponibili.")
+    st.warning(EVIDENCE_NOTE, icon="⚖️")
+    render_recalibration_controls(state, report)
+    render_tuning(state, report, version)
+    st.download_button(
+        "Scarica i punteggi aggregati (CSV)",
+        data=export_csv_bytes(reliability_export_frame(report), demo=state.is_demo),
+        file_name=demo_file_name(f"affidabilita_{datetime.now(UTC).astimezone().date().isoformat()}.csv", state.is_demo),
+        mime="text/csv",
+        key="dl_reliability",
+        help="Solo punteggi aggregati per sezione e mercato (nessuna partita e nessuna quota).",
+        **FULL_WIDTH["download_button"],
+    )
+
+
+#: Italian market names of the reliability tab (the value panel's).
+MARKET_LABELS_UI: Final[dict[Market, str]] = {
+    Market.MATCH_ODDS: "Esito finale 1X2",
+    Market.BTTS: "Gol/No Gol",
+    Market.OVER_UNDER_15: "Over/Under 1.5",
+    Market.OVER_UNDER_25: "Over/Under 2.5",
+    Market.OVER_UNDER_35: "Over/Under 3.5",
+}
+
+
+# =============================================================================
+# Slips (schedine)
+# =============================================================================
+def _slip_number(value: float | None, fmt: str) -> str:
+    return fmt.format(value) if value is not None and pd.notna(value) else "n.d."
+
+
+def render_slips_tab(
+    state: PipelineState,
+    report: ReliabilityReport | None,
+    section: str = DEFAULT_SECTION,
+    matchday: Matchday | None = None,
+) -> None:
+    """*Schedine*: the three slips of a matchday (5 X, 10 GG, mista 1 / 2 / GG / Over 2.5) over the chosen sections, and their past record."""
+    demo_banner(state)
+    st.subheader("Schedine della giornata")
+    options = list(section_options(state))
+    defaults = list(sections_with_data(state)) or [section]
+    stored = st.session_state.get(SLIPS_SECTIONS_KEY)
+    if not isinstance(stored, list) or any(s not in options for s in stored):
+        st.session_state[SLIPS_SECTIONS_KEY] = [s for s in defaults if s in options]
+    chosen = list(
+        st.multiselect(
+            "Sezioni",
+            options,
+            key=SLIPS_SECTIONS_KEY,
+            help="Le partite candidate: di default tutte le sezioni con dati. Ogni partita entra al massimo una volta per schedina.",
+        )
+    )
+    if not chosen:
+        st.info("Scegli almeno una sezione.")
+        return
+    days = slips_matchdays(state, chosen)
+    if not days:
+        st.info("Nessuna giornata con partite da giocare nelle sezioni scelte.")
+        return
+    keys = [d.key for d in days]
+    labels = {d.key: d.label for d in days}
+    default = default_slips_matchday(days, matchday)
+    seed_key = f"{SLIPS_MATCHDAY_KEY}_default"
+    if st.session_state.get(SLIPS_MATCHDAY_KEY) not in keys or st.session_state.get(SLIPS_MATCHDAY_KEY) == st.session_state.get(seed_key):
+        st.session_state[SLIPS_MATCHDAY_KEY] = default.key if default is not None else keys[0]
+    st.session_state[seed_key] = default.key if default is not None else keys[0]
+    c_day, c_min, c_quoted = st.columns([3, 1, 1])
+    with c_day:
+        day_key = st.selectbox(
+            "Giornata",
+            keys,
+            format_func=lambda k: labels.get(k, k),
+            key=SLIPS_MATCHDAY_KEY,
+            help="Segue la giornata scelta negli altri tab finché non ne scegli un'altra qui.",
+        )
+    with c_min:
+        min_pct = st.slider("P minima per partita (%)", 0, 90, 0, step=5, key=SLIPS_MIN_P_KEY, help="Esclude le partite il cui segno ha probabilità più bassa.")
+    with c_quoted:
+        only_quoted = bool(st.checkbox("Solo partite quotate", value=False, key=SLIPS_ONLY_QUOTED_KEY, help="Solo selezioni con una quota del bookmaker nei dati."))
+    c_x, c_gg, c_mix = st.columns(3)
+    with c_x:
+        n_x = int(st.slider("Partite schedina X", 1, SLIPS_MAX_X, DEFAULT_N_X, key=SLIPS_N_X_KEY))
+    with c_gg:
+        n_gg = int(st.slider("Partite schedina GG", 1, SLIPS_MAX_GG, DEFAULT_N_GG, key=SLIPS_N_GG_KEY))
+    with c_mix:
+        n_mixed = int(st.slider("Partite schedina mista", MIXED_MIN_LEGS, MIXED_MAX_LEGS, DEFAULT_N_MIXED, key=SLIPS_N_MIXED_KEY))
+    day = next((d for d in days if d.key == day_key), days[0])
+    slips = slips_for(state, day, chosen, n_x=n_x, n_gg=n_gg, n_mixed=n_mixed, min_probability=min_pct / 100.0, only_quoted=only_quoted)
+    summary = slips_summary_for(slips, state)
+    st.caption(
+        f"{day.label} · partite non ancora iniziate delle sezioni {', '.join(chosen)} · probabilità "
+        + ("ricalibrate (tab Affidabilità modello)" if state.calibrated else "originali del modello")
+        + ". Schedina mista: per ogni partita il segno più probabile fra 1, 2, GG e Over 2.5, poi le partite con quel segno più probabile."
+    )
+    for slip, row in zip(slips, summary.to_dict(orient="records")):
+        with st.container(border=True):
+            st.markdown(f"**{slip.title}** · {slip.n_legs} partite")
+            if slip.is_empty:
+                st.info(slip.coverage_note or "Nessuna partita idonea.")
+                continue
+            m1, m2, m3, m4, m5, m6 = st.columns(6)
+            m1.metric("Probabilità", _slip_number(slip.probability * 100.0, "{:.2f}%"), help=INDEPENDENCE_NOTE)
+            m2.metric("Quota fair", _slip_number(slip.fair_odds, "{:.2f}"), help="1 / probabilità della schedina.")
+            m3.metric("Quota book", _slip_number(slip.book_odds, "{:.2f}"), help="Prodotto delle migliori quote, solo se ogni partita è quotata.")
+            m4.metric("EV", _slip_number(None if slip.ev is None else slip.ev * 100.0, "{:+.1f}%"), help="Probabilità × quota book − 1.")
+            m5.metric("Partite vincenti attese", f"{slip.expected_winning_legs:.2f}", help="Somma delle probabilità delle singole partite.")
+            m6.metric("Stake suggerito", str(row["Stake suggerito"]), help="Kelly frazionario sulla schedina, con tetto di 1 unità; «non consigliata» con EV ≤ 0 o senza quote.")
+            st.dataframe(
+                slips_frame([slip]).drop(columns=["Schedina"]),
+                hide_index=True,
+                **FULL_WIDTH["dataframe"],
+                column_config={
+                    "P. Modello (%)": st.column_config.NumberColumn("P. Modello (%)", format="%.1f %%"),
+                    "Quota Fair": st.column_config.NumberColumn("Quota Fair", format="%.2f"),
+                    "Quota Book": st.column_config.NumberColumn("Quota Book", format="%.2f"),
+                },
+                key=f"slip_legs_{slip.kind}",
+            )
+            if slip.coverage_note:
+                st.caption(slip.coverage_note)
+            st.caption(f"⚠️ {slip.margin_note}")
+    st.caption(
+        INDEPENDENCE_NOTE + " Una multipla vince solo se vincono tutte le partite: anche con probabilità alte per partita la "
+        "probabilità della schedina crolla, e il margine del bookmaker si moltiplica a ogni partita aggiunta."
+    )
+    st.download_button(
+        "Scarica le tre schedine (CSV)",
+        data=slips_csv_bytes(slips, day, state),
+        file_name=demo_file_name(f"schedine_{day.key.replace('#', '_')}.csv", state.is_demo),
+        mime="text/csv",
+        key="dl_slips",
+        help="Una riga per partita con le cifre della sua schedina.",
+        **FULL_WIDTH["download_button"],
+    )
+    st.markdown("**Come sarebbero andate le stesse schedine nelle giornate passate**")
+    if report is None or report.empty:
+        st.caption("Track record non disponibile: il backtest walk-forward non è stato calcolato (tab Affidabilità modello).")
+        return
+    try:
+        render_slips_track_record(state, report, chosen, n_x=n_x, n_gg=n_gg, n_mixed=n_mixed, min_pct=min_pct)
+    except REPORT_ERRORS as exc:  # a bad report never takes the rest of the page down
+        report_error_notice("Track record delle schedine", exc)
+
+
+def render_slips_track_record(state: PipelineState, report: ReliabilityReport, chosen: list[str], *, n_x: int, n_gg: int, n_mixed: int, min_pct: int) -> None:
+    """The past record of the three slips over the chosen sections (walk-forward probabilities, recalibrated out of sample when on)."""
+    store = reliability_store()
+    rolled = store.memo((report.key, "rolling"), lambda: rolling_frame(report)).frame if state.calibrated else None
+    members = tuple(dict.fromkeys(m for s in chosen for m in section_members(s)))
+    track = store.memo(
+        (report.key, "slips", "rolling" if rolled is not None else "raw", members, n_x, n_gg, n_mixed, min_pct / 100.0),
+        lambda: slips_track_for(report, list(members), n_x=n_x, n_gg=n_gg, n_mixed=n_mixed, min_probability=min_pct / 100.0, frame=rolled),
+    )
+    st.dataframe(slips_record_table(track), hide_index=True, **FULL_WIDTH["dataframe"])
+    with st.expander("Giornata per giornata", expanded=False):
+        st.dataframe(
+            slips_by_matchday_table(track),
+            hide_index=True,
+            **FULL_WIDTH["dataframe"],
+            column_config={"Giornata": st.column_config.DateColumn("Giornata", format="DD/MM/YYYY")},
+            key="slips_history",
+        )
+    st.caption(
+        "Stesse regole e stesse lunghezze, applicate a ogni giornata passata con le probabilità fuori campione (il filtro «solo "
+        "partite quotate» non si applica allo storico). " + EVIDENCE_NOTE
+    )
+
+
+def render_model_options() -> str:
+    """Sidebar *Opzioni del modello*: the optimiser of the fit (L-BFGS-B by default, SLSQP kept as an option)."""
+    with st.sidebar.expander("Opzioni del modello", expanded=False):
+        if st.session_state.get(FIT_METHOD_KEY) not in FIT_METHODS:
+            st.session_state.pop(FIT_METHOD_KEY, None)
+        method = str(
+            st.selectbox(
+                "Ottimizzatore",
+                list(FIT_METHODS),
+                key=FIT_METHOD_KEY,
+                help="L-BFGS-B (predefinito) e SLSQP raggiungono lo stesso ottimo; L-BFGS-B è circa 40 volte più veloce.",
+            )
+        )
+    return method
+
+
+# =============================================================================
 # Page
 # =============================================================================
 def main() -> None:
@@ -1494,6 +2280,7 @@ def main() -> None:
     """
     demo = demo_requested()
     controls, min_ev, kelly_fraction, bankroll = render_sidebar()
+    method = render_model_options()
     badge = st.sidebar.empty()
     data_box = st.sidebar.container()
     data_dir, quotes_dir = processed_dir(), odds_dir()
@@ -1510,6 +2297,8 @@ def main() -> None:
     history_seasons = env_optional_int("SERIEC_HISTORY", minimum=0, maximum=MAX_HISTORY_SEASONS)
     history = DEFAULT_HISTORY_SEASONS if history_seasons is None else history_seasons
     as_of = resolve_as_of()
+    version = data_version(demo=demo, data_dir=data_dir, seed=seed, n_rounds=n_rounds, season=season, history=history, as_of=as_of)
+    xi, prior = tuned_settings(version, season)
     common = dict(
         min_ev=min_ev,
         kelly_fraction=kelly_fraction,
@@ -1519,6 +2308,9 @@ def main() -> None:
         processed=str(data_dir),
         odds=str(quotes_dir),
         stamp=None if demo else data_stamp(data_dir),
+        method=method,
+        xi=xi,
+        prior=prior,
     )
     try:
         state = load_state(seed=seed, n_rounds=n_rounds, season=season, history_seasons=history, **common)
@@ -1544,17 +2336,33 @@ def main() -> None:
         except NoDataError as again:
             render_setup_page(again, data_dir=data_dir, quotes_dir=quotes_dir)
             return
+    mode = backtest_mode()
+    report: ReliabilityReport | None = None
+    if mode != "off":
+        compute = mode == "auto" or bool(st.session_state.get(BACKTEST_REQUEST_KEY))
+        try:
+            report = obtain_reliability(
+                state, version=version, n_seasons=selected_backtest_seasons(), data_dir=data_dir, quotes_dir=quotes_dir, compute=compute
+            )
+        except (ValueError, KeyError, RuntimeError) as exc:  # the reliability view must never take the page down
+            log.warning("backtest failed", extra={"error": str(exc)})
+            st.warning(f"Backtest walk-forward non riuscito ({exc}): la tab Affidabilità modello resta vuota e si usano le probabilità originali.", icon="⚠️")
+    variant = "raw"
+    if recalibration_wanted(report) and report is not None:
+        state = calibrated_state(state, state.built_at.isoformat(), report.key, report)
+        variant = f"cal:{report.key}"
     if not state.is_demo:
-        state = calendar_state(state, state.built_at.isoformat(), calendar_now())
+        state = calendar_state(state, state.built_at.isoformat(), calendar_now(), variant)
     section, girone = render_section_controls(controls, state)
     render_source_badge(badge, state, section)
 
     st.title(PAGE_TITLE)
     scope = f"tutte le competizioni di {section}" if girone is None else girone.short
     st.caption(
-        f"{perimeter_text(state, section)} · Dixon-Coles su {state.n_matches} partite (stima congiunta di tutto il perimetro) · "
+        f"{perimeter_text(state, section)} · Dixon-Coles su {state.n_matches} partite (una stima per paese) · "
         f"{len(section_predictions(state, section))} previsioni · soglia EV {min_ev:.1%} · Kelly x{kelly_fraction:g} · "
-        f"bankroll {bankroll:g} unità · sezione: {section} · vista: {scope}"
+        f"bankroll {bankroll:g} unità · sezione: {section} · vista: {scope} · probabilità "
+        + ("ricalibrate" if state.calibrated else "originali del modello")
     )
     with st.expander("Dettagli pipeline", expanded=False):
         notes = list(state.notes)
@@ -1565,7 +2373,7 @@ def main() -> None:
         st.caption(f"Stato calcolato alle {state.built_at.astimezone().strftime('%d/%m/%Y %H:%M:%S')} (fonte: {state.source}).")
 
     matchday = selected_matchday(state, section)  # before any tab renders, so the three matchday-aware tabs agree
-    tab_rank, tab_match, tab_results, tab_value, tab_picks, tab_export, tab_legend = st.tabs(list(TAB_LABELS))
+    tab_rank, tab_match, tab_results, tab_value, tab_picks, tab_slips, tab_reliability, tab_export, tab_legend = st.tabs(list(TAB_LABELS))
     with tab_rank:
         render_ranking_tab(state, girone, section)
     with tab_match:
@@ -1576,6 +2384,13 @@ def main() -> None:
         render_value_tab(state, girone, min_ev, matchday, section)
     with tab_picks:
         render_picks_tab(state, matchday, section)
+    with tab_slips:
+        render_slips_tab(state, report, section, matchday)
+    with tab_reliability:
+        try:
+            render_reliability_tab(state, report, section, mode=mode, version=version)
+        except REPORT_ERRORS as exc:  # a bad report never takes the Esporta and Legenda tabs down
+            report_error_notice("Affidabilità modello", exc)
     with tab_export:
         render_export_tab(state, section)
     with tab_legend:

@@ -16,7 +16,9 @@ are the same registry state:
 :meth:`TeamRegistry.teams` answers ``()``, :attr:`TeamRegistry.gironi` lists only
 the competitions that have teams, :meth:`TeamRegistry.missing_competitions`
 names the empty ones and :attr:`TeamRegistry.perimeter_label` counts only the
-teams present.
+teams present. The key of a competition switched off in the configuration
+(``enabled = false``) is skipped when the file is read (logged), so a league
+can be disabled and enabled again without editing the dictionary.
 
 Seasons and perimeter
 ---------------------
@@ -46,7 +48,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, Mapping
 
-from .competitions import describe_competitions, family_label
+from .competitions import ALL_COMPETITIONS, Competition, describe_competitions, family_label, find_competition
+from .logging_config import get_logger
 from .paths import CONFIG_DIR
 from .schemas import Girone
 
@@ -65,6 +68,17 @@ __all__ = [
 DEFAULT_SEASON = "2026_27"
 
 _SEASON_FILE_RE = re.compile(r"^teams_(\d{4}_\d{2})\.json$")
+
+log = get_logger(__name__)
+
+
+def _disabled_competition(key: str) -> Competition | None:
+    """The configured but disabled competition a registry key names (``None`` for an enabled or unknown one)."""
+    try:
+        comp = find_competition(key, ALL_COMPETITIONS)
+    except ValueError:
+        return None
+    return None if comp.enabled else comp
 
 
 def normalize_name(name: str) -> str:
@@ -294,6 +308,13 @@ class TeamRegistry:
         four competitions ``'Verona'`` as an alias of both ``'Virtus Verona'``
         (girone A) and ``'Hellas Verona'`` (Serie B) would otherwise silently keep
         only the club listed last. Repeating a spelling for the *same* club is fine.
+
+        A key naming a competition that ``config/competitions.toml`` lists with
+        ``enabled = false`` (a league switched off after its teams were synced)
+        is skipped with an INFO log line: its clubs are neither current teams nor
+        aliases until the competition is enabled again, so disabling a league is
+        reversible without editing the dictionary. Any other unknown key raises
+        ``ValueError``.
         """
         teams_by_girone: dict[Girone, tuple[str, ...]] = {}
         aliases: dict[str, str] = {}
@@ -310,8 +331,16 @@ class TeamRegistry:
                 )
             aliases[norm] = canonical
 
+        disabled: dict[str, int] = {}
         for g_key, teams in gironi.items():
-            g = Girone.parse(g_key)
+            try:
+                g = Girone.parse(g_key)
+            except ValueError:
+                off = _disabled_competition(g_key)
+                if off is None:
+                    raise
+                disabled[off.code] = len(teams or {})
+                continue
             if g in seen:
                 raise ValueError(f"season {season}: competition {g.value} listed twice")
             seen.add(g)
@@ -325,6 +354,11 @@ class TeamRegistry:
                 register(canonical, canonical, g)
                 for alias in alias_list:
                     register(alias, canonical, g)
+        if disabled:
+            log.info(
+                "registry competitions skipped: disabled in config/competitions.toml",
+                extra={"season": str(season), "teams_by_competition": disabled},
+            )
         return cls(season=season, teams_by_girone=teams_by_girone, aliases=aliases)
 
     @classmethod

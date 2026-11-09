@@ -117,7 +117,8 @@ class CompetitionBase(str, Enum):
     strings too (``Girone.A == 'A'``), so frames, JSON payloads and CSV columns
     keep storing the code. The records the enum was built from are reachable
     through :meth:`competitions` and, per member, :attr:`competition`,
-    :attr:`label`, :attr:`short`, :attr:`family`, :attr:`tier`.
+    :attr:`label`, :attr:`short`, :attr:`family`, :attr:`tier`,
+    :attr:`section` and :attr:`fit_group`.
     """
 
     @classmethod
@@ -182,6 +183,16 @@ class CompetitionBase(str, Enum):
         return self.competition.country
 
     @property
+    def section(self) -> str:
+        """Dashboard section that shows the competition (``'Serie C'`` for the three gironi, ``'Serie B'``, ``'Serie D'``)."""
+        return self.competition.section
+
+    @property
+    def fit_group(self) -> str:
+        """Fit group of the competition, i.e. its country (``'Italy'``): one Dixon-Coles model per group."""
+        return self.competition.fit_group
+
+    @property
     def footystats_name(self) -> str:
         """``name`` of the competition in the FootyStats ``/league-list`` endpoint."""
         return self.competition.footystats_name
@@ -223,8 +234,9 @@ def build_girone_enum(
     return enum_cls
 
 
-#: The competitions of this installation (``config/competitions.toml``): ``Girone.A``, ``Girone.B``,
-#: ``Girone.C`` (Serie C) and ``Girone.SB`` (Serie B) by default. The value is the competition code.
+#: The **enabled** competitions of this installation (``config/competitions.toml``): ``Girone.A``,
+#: ``Girone.B``, ``Girone.C`` (Serie C), ``Girone.SB`` (Serie B) and ``Girone.DA`` .. ``Girone.DI`` (Serie D)
+#: by default. A disabled competition (``enabled = false``) is not a member. The value is the competition code.
 Girone = build_girone_enum(COMPETITIONS)
 
 

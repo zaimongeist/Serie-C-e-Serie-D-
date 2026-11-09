@@ -20,7 +20,13 @@ The module is layered like :mod:`src.ingestion.harvester`:
   name;
 * pure parsers -- :func:`parse_match` and :func:`parse_odds` from the 215-field
   match objects to :class:`MatchRecord` / :class:`Fixture` / :class:`OddsQuote`
-  (a match not played at its kick-off is kept as a *postponed* fixture);
+  (a match not played at its kick-off is kept as a *postponed* fixture). The
+  ``odds_ft_*`` / ``odds_btts_*`` fields are filled for **completed** matches
+  too (the pre-match price): :meth:`FootyStatsProvider.harvest` parses them into
+  :attr:`FootyStatsHarvest.odds_history`, which the CLI and the dashboard save
+  in the git-ignored odds history (:func:`src.ingestion.harvester.save_odds_history`,
+  ``data/odds/history/odds_history.csv``) for the out-of-sample comparison
+  of the model with the market. Prices are never printed or logged, only counts;
 * the **registry sync** -- :func:`sync_registry` / :func:`apply_registry_sync`
   make the current season's dictionary (``config/teams_<season>.json``) equal to
   ``/league-teams`` for every requested competition (identity by FootyStats team
@@ -128,8 +134,10 @@ from src.ingestion.harvester import (
     Sleeper,
     _write_decision,
     load_endpoints,
+    odds_history_path,
     save_fixtures,
     save_odds,
+    save_odds_history,
     save_processed,
 )
 from src.ingestion.team_matcher import TeamMatcher
@@ -1818,6 +1826,12 @@ class FootyStatsHarvest:
     was written). ``fixtures`` hold scheduled (matches in play included, with
     their past kick-off) and postponed matches (:attr:`Fixture.status`); odds are
     collected for the scheduled ones that have not kicked off yet.
+    ``odds_history`` holds the pre-match quotes FootyStats keeps on the
+    **completed** matches of every harvested season (same markets and
+    selection names as ``odds``, one :class:`OddsQuote` per match and market,
+    only for matches in :attr:`matches`); it is empty when odds were not
+    requested. It feeds the odds history
+    (:func:`src.ingestion.harvester.save_odds_history`), never the value engine.
     """
 
     matches: pd.DataFrame
@@ -1838,6 +1852,7 @@ class FootyStatsHarvest:
     not_chosen: dict[str, str] = field(default_factory=dict)
     registry_sync: RegistrySyncReport | None = None
     registry_sync_error: str | None = None
+    odds_history: list[OddsQuote] = field(default_factory=list)
 
     @property
     def n_postponed(self) -> int:
@@ -1877,7 +1892,7 @@ class FootyStatsHarvest:
         """One-line human summary (used by the CLI and the logs)."""
         return (
             f"provider={self.provider} competitions={','.join(self.seasons) or '-'} matches={len(self.matches)} "
-            f"fixtures={len(self.fixtures)} odds={len(self.odds)} "
+            f"fixtures={len(self.fixtures)} odds={len(self.odds)} odds_history={len(self.odds_history)} "
             f"seasons={','.join(sorted(self.n_matches_by_season, reverse=True)) or '-'} "
             f"historical_teams={len(self.historical_teams)} unmapped_teams={len(self.unmapped_teams)} "
             f"requests={self.stats.get('requests', 0)} cache_hits={self.stats.get('cache_hits', 0)} "
@@ -2046,7 +2061,13 @@ class FootyStatsProvider:
         now: datetime,
         teams: Sequence[TeamInfo] | None = None,
         assignments: Mapping[int, str] | None = None,
-    ) -> tuple[list[MatchRecord], list[Fixture], list[OddsQuote], ParseReport]:
+    ) -> tuple[list[MatchRecord], list[Fixture], list[OddsQuote], ParseReport, list[OddsQuote]]:
+        """Parse one season: ``(records, fixtures, odds of the fixtures, report, odds history of the completed matches)``.
+
+        Fixtures (and their pre-match odds) are kept for the ``current`` season
+        only; the odds history (the quotes FootyStats keeps on completed matches)
+        is collected for every season when ``with_odds``.
+        """
         completed = season_completed(ref.label, now.date())
         if teams is None:
             teams = await self.client.league_teams(ref.season_id, stable=completed)
@@ -2074,11 +2095,14 @@ class FootyStatsProvider:
         records: list[MatchRecord] = []
         fixtures: list[Fixture] = []
         odds: list[OddsQuote] = []
+        history: list[OddsQuote] = []
         out_of_season = 0
         for m in raw:
             parsed = parse_match(m, code, names, now=reference, report=report)
             if isinstance(parsed, MatchRecord):
                 records.append(parsed)
+                if with_odds:
+                    history.extend(parse_odds(m, parsed.match_id))
                 if season_of(parsed.date) != ref.label and not _PLAIN_YEAR_RE.match(ref.label):
                     out_of_season += 1
             elif isinstance(parsed, Fixture) and current:
@@ -2097,6 +2121,7 @@ class FootyStatsProvider:
                 "raw_matches": len(raw),
                 "current": current,
                 "completed": completed,
+                "odds_history_quotes": len(history),
                 **report.as_dict(),
             },
         )
@@ -2124,7 +2149,7 @@ class FootyStatsProvider:
                 "matches dated outside their season label",
                 extra={"competition": code, "season": ref.label, "matches": out_of_season},
             )
-        return records, fixtures, odds, report
+        return records, fixtures, odds, report, history
 
     async def harvest(
         self,
@@ -2145,7 +2170,9 @@ class FootyStatsProvider:
         :attr:`FootyStatsEndpoints.live_matches_cache_ttl`, and its
         ``incomplete`` matches are judged as of the instant the payload was
         downloaded (:meth:`MatchesSnapshot.reference_time`), never as of a later
-        clock. A season that fails is recorded
+        clock. With ``with_odds`` the pre-match quotes of the **completed** matches
+        of every season are collected too (:attr:`FootyStatsHarvest.odds_history`).
+        A season that fails is recorded
         in :attr:`FootyStatsHarvest.failures` and the rest is kept; a competition
         the schema cannot store yet is recorded in :attr:`FootyStatsHarvest.skipped`.
         A competition whose league is **not among the account's chosen leagues**
@@ -2192,6 +2219,7 @@ class FootyStatsProvider:
         records: list[MatchRecord] = []
         fixtures: list[Fixture] = []
         odds: list[OddsQuote] = []
+        odds_history: list[OddsQuote] = []
         last_error: HarvestError | None = None
         initialised: tuple[str, ...] = ()
         prefetched: dict[str, list[TeamInfo]] = {}
@@ -2221,7 +2249,7 @@ class FootyStatsProvider:
                     listing = prefetched.get(code) if index == 0 and is_registry_season else None
                     assignments = sync_report.assignments.get(code) if sync_report is not None and is_registry_season else None
                     try:
-                        season_records, season_fixtures, season_odds, report = await self._harvest_season(
+                        season_records, season_fixtures, season_odds, report, season_history = await self._harvest_season(
                             code, ref, current=index == 0, with_odds=with_odds, now=now, teams=listing, assignments=assignments
                         )
                     except HarvestError as exc:
@@ -2250,6 +2278,7 @@ class FootyStatsProvider:
                     records.extend(season_records)
                     fixtures.extend(season_fixtures)
                     odds.extend(season_odds)
+                    odds_history.extend(season_history)
             try:
                 self.mapper.save()
             except OSError as exc:
@@ -2269,6 +2298,13 @@ class FootyStatsProvider:
             q for q in odds if q.match_id in fixture_ids and not ((q.match_id, q.market) in seen_quotes or seen_quotes.add((q.match_id, q.market)))
         ]
         frame = matches_to_frame(records) if records else empty_matches_frame()
+        played_ids = set(frame["match_id"].astype(str)) if len(frame) else set()
+        seen_history: set[tuple[str, Market]] = set()
+        history_unique = [
+            q
+            for q in odds_history
+            if q.match_id in played_ids and not ((q.match_id, q.market) in seen_history or seen_history.add((q.match_id, q.market)))
+        ]
         totals: Counter[str] = Counter()
         for per_season in counts.values():
             totals.update(per_season)
@@ -2290,6 +2326,7 @@ class FootyStatsProvider:
             not_chosen=not_chosen,
             registry_sync=sync_report,
             registry_sync_error=sync_error,
+            odds_history=history_unique,
         )
         log.info("footystats harvest complete", extra={"summary": result.summary()})
         return result
@@ -3355,10 +3392,18 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--fixtures-out", type=Path, default=PROCESSED_DIR / "fixtures.csv", help="fixtures CSV output")
     parser.add_argument("--odds-out", type=Path, default=ODDS_DIR / "footystats.csv", help="odds CSV output (match_id,bookmaker,market,selection,odds)")
     parser.add_argument(
+        "--odds-history-out",
+        type=Path,
+        default=None,
+        help="odds history CSV: the pre-match quotes of the completed matches (same columns as --odds-out), merged with "
+        "the rows already there; default: history/odds_history.csv next to --odds-out, a sub-folder so the dashboard "
+        "never reads it as current prices; not written with --no-odds",
+    )
+    parser.add_argument(
         "--no-odds",
         action="store_true",
         help="do not collect pre-match odds: --odds-out is not rewritten, only its quotes of postponed or already "
-        "kicked-off matches are removed (stale prices)",
+        "kicked-off matches are removed (stale prices); the odds history is not written either",
     )
     parser.add_argument("--key", default=None, help="FootyStats API key (default: env FOOTYSTATS_API_KEY, then .env in the repository root); never printed")
     parser.add_argument("--list-leagues", action="store_true", help="list the leagues chosen on the account with their season ids, then exit")
@@ -3514,6 +3559,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             if not args.no_odds:
                 save_odds(result.odds, args.odds_out)
                 print(f"odds -> {args.odds_out}")
+                if result.odds_history:
+                    history_out = args.odds_history_out if args.odds_history_out is not None else odds_history_path(Path(args.odds_out).parent)
+                    save_odds_history(result.odds_history, history_out)
+                    print(f"odds history -> {history_out} ({len(result.odds_history)} quotes of completed matches)")
             else:
                 pruned = prune_stale_odds(args.odds_out, result.fixtures, now=_utc_now())
                 if pruned:

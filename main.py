@@ -14,6 +14,17 @@ console:
 7. CSV export of the value report, of the picks (``<stem>_selezioni.csv``), of the matchday table
    (``<stem>_giornata.csv``) and of the played results (``<stem>_risultati.csv``)
 
+plus, after the fit, **AFFIDABILITÀ MODELLO** (``--backtest``, on by default with real data): the
+walk-forward backtest (every past matchday predicted by a model fitted only on the matches before it,
+src.engine.backtest), its aggregated scores per section and market against the league base rates and
+the bookmaker (the model's own scores on the quoted matches next to the market's), the track record of
+the lists, of their top-k multiples and of the slips and the validated recalibration
+(src.engine.calibration; applied to the probabilities of the following sections only when it improves
+the out-of-sample log loss, ``--no-recalibration`` keeps the raw ones), exported to
+``<stem>_affidabilita.csv``; and, at the end, **SCHEDINE** (``--slips``, on by default): the three
+slips of the next matchday over the chosen sections (5 X, 10 GG, mista 1 / 2 / GG / Over 2.5,
+src.engine.slips), exported to ``<stem>_schedine.csv``.
+
 Perimeter and history
 ---------------------
 The *perimeter* is the registry of ``--season`` (``config/teams_2026_27.json``
@@ -30,20 +41,25 @@ decay down-weights them). Teams that appear only in history are fitted as
 current one. Fixtures dated in another season than the registry's (a stale
 ``fixtures.csv`` of last season) are never predicted: they are listed as skipped.
 
-Sections (``--section bc|d|all``, default ``all``)
---------------------------------------------------
-The fit (steps 1-2) is one for the whole perimeter; steps 3-8 are printed once
-per *section* -- *Serie B e Serie C* and *Serie D*, the same split as the
-dashboard sidebar -- each with its own banner, ranking per competition, matchday
-table, value panel, trap alerts and picks (5 X / 12 GG ranked within the
-section). Only the sections that have teams run: the Serie D gironi ship empty
-(the FootyStats harvester initialises them from the API), so until then the
-console prints the Serie D status and the command that initialises it. With
-more than one section the per-section CSVs carry the section slug
-(``<stem>_bc_giornata.csv``, ``<stem>_d_giornata.csv``, ...); the value report
-at ``--export`` always covers the whole perimeter. In the simulated full mode
-``--serie-d-demo`` adds a synthetic Serie D registry (nine gironi of 18 clubs)
-so the section can be shown offline.
+Sections (``--section``, default ``all``)
+-----------------------------------------
+The fit (steps 1-2) is one per fit group (country: Serie B, C and D together,
+:func:`src.engine.fitgroups.fit_by_group`, L-BFGS-B unless ``--method SLSQP``);
+steps 3-8 are printed once per *section* -- the sections of
+``config/competitions.toml``, the same split as the dashboard sidebar: ``Serie
+C``, ``Serie B``, ``Serie D`` and every league switched on later -- each with its
+own banner, ranking per competition, matchday table, value panel, trap alerts and
+picks (5 X / 12 GG ranked within the section). ``--section`` takes a section
+name, its slug or a comma-separated list (``serie-b``, ``"Serie C"``, ``c,d``),
+``all`` (every section with teams) or the legacy aliases ``bc`` (Serie C and
+Serie B) and ``d``. Only the sections that have teams run: the Serie D gironi
+ship empty (the FootyStats harvester initialises them from the API), so until
+then the console prints the Serie D status and the command that initialises it.
+With more than one section the per-section CSVs carry the section slug
+(``<stem>_c_giornata.csv``, ``<stem>_b_giornata.csv``, ``<stem>_d_giornata.csv``,
+...); the value report at ``--export`` always covers the whole perimeter. In the
+simulated full mode ``--serie-d-demo`` adds a synthetic Serie D registry (nine
+gironi of 18 clubs) so the section can be shown offline.
 
 Real data and demo
 ------------------
@@ -84,6 +100,8 @@ Examples::
     python main.py --season 2026_27 --kelly 0.25 --min-ev 0.05 --export reports/value.csv
     python main.py --n-draws 8 --n-btts 15        # longer matchday pick lists (section 8)
     python main.py --mode full --rounds 6 --history 0 --serie-d-demo --section d   # the Serie D section on synthetic data
+    python main.py --processed data/processed/matches.csv --section serie-b --no-backtest   # Serie B only, no reliability section
+    python main.py --mode full --history 1 --backtest --slip-mixed 8   # demo with the reliability section and a longer mixed slip
 """
 from __future__ import annotations
 
@@ -111,9 +129,11 @@ from src.common.schemas import (
 )
 from src.common.teams import DEFAULT_SEASON, TeamRegistry, list_seasons, load_registry
 from src.engine.calendar import IN_PLAY_TEXT, STATUS_TO_PLAY, kicked_off, rome_midnight
+from src.engine.fitgroups import DEFAULT_FIT_METHOD, GroupedFit, fit_by_group
 from src.engine.model import DixonColesConfig, DixonColesEngine, FittedParams
 from src.engine.picks import DEFAULT_N_BTTS, DEFAULT_N_DRAWS, Matchday, Pick, btts_picks, draw_picks, matchdays, picks_frame
-from src.engine.tables import matchday_table, results_table
+from src.engine.slips import DEFAULT_N_GG, DEFAULT_N_MIXED, DEFAULT_N_X, MIXED_MAX_LEGS, MIXED_MIN_LEGS, Slip, build_slips, slips_frame, slips_summary
+from src.engine.tables import matchday_table
 from src.engine.value import KellyConfig, RegressionTrap, ValueEngine, ValueOpportunity, detect_regression_traps
 from src.simulation.generator import (
     DEMO_WARNING,
@@ -228,14 +248,16 @@ def load_real_data(
     look like a legitimate empty season: a warning is logged and appended to
     ``notes`` (printed by :func:`main`) and the missing input is treated as empty.
     """
+    from src.dashboard.state import load_enabled_csv
     from src.ingestion.harvester import load_fixtures, load_processed
 
     notes = [] if notes is None else notes
-    matches = load_processed(Path(processed))
+    # rows of a league switched off after its download are skipped with a note instead of aborting the run
+    matches = load_enabled_csv(Path(processed), load_processed, notes=notes, what="partite")
     fx: list[Fixture] = []
     if fixtures is not None:
         if Path(fixtures).is_file():
-            fx = load_fixtures(Path(fixtures))
+            fx = load_enabled_csv(Path(fixtures), load_fixtures, notes=notes, what="partite in calendario")
         else:
             _missing_input("--fixtures", Path(fixtures), "nessuna partita in programma da prevedere", notes)
     quotes: list[OddsQuote] = []
@@ -261,22 +283,41 @@ def load_real_data(
 # registry competition that was never harvested (no match in any season) is ignored by the
 # rule instead of pinning it to zero coverage (``CoverageReport.ignored`` names it).
 from src.dashboard.state import (  # noqa: E402
+    ALL_SECTIONS_LABEL,
+    DEFAULT_BACKTEST_SEASONS,
+    EVIDENCE_NOTE,
+    INDEPENDENCE_NOTE,
     PRIOR_MIN_MATCHES_PER_TEAM,
+    QUOTED_LOG_LOSS_COLUMN,
+    SECTION_ALIASES,
     SECTION_BC,
     SECTION_D,
+    SECTIONS,
     CoverageReport,
+    ReliabilityReport,
+    accumulators_table,
+    build_reliability,
     configured_gironi,
     coverage_report,
     demo_file_name,
     export_csv_bytes,
+    grouped_results_table,
     history_label,
     in_section,
     matches_per_team,
+    metrics_table_for,
     other_season_reason,
     perimeter_matches,
     picks_csv_bytes,
+    picks_record_table,
+    picks_track_for,
     prior_recommended,
+    prior_setting,
+    recalibration_table,
+    reliability_export_frame,
+    resolve_section,
     section_matches,
+    section_members,
     season_fixtures,
     section_slug,
     sections_for,
@@ -284,11 +325,45 @@ from src.dashboard.state import (  # noqa: E402
     serie_d_harvest_command,
     serie_d_status_text,
     simulate_current_season,
+    slips_export_frame,
+    slips_gironi,
+    slips_record_table,
+    slips_track_for,
     split_by_season,
 )
 
-#: ``--section`` values -> the sections of :mod:`src.dashboard.state` they ask for (``all`` = every section with teams).
-SECTION_CHOICES: Final[dict[str, tuple[str, ...]]] = {"bc": (SECTION_BC,), "d": (SECTION_D,), "all": (SECTION_BC, SECTION_D)}
+#: ``--section`` shortcuts -> the sections of :mod:`src.dashboard.state` they ask for (``all`` = every section with
+#: teams); any section name or slug is accepted too (:func:`parse_sections`).
+SECTION_CHOICES: Final[dict[str, tuple[str, ...]]] = {
+    "all": tuple(SECTIONS),
+    "bc": tuple(SECTION_ALIASES[SECTION_BC]),
+    "d": (SECTION_D,),
+}
+
+
+def parse_sections(value: str) -> tuple[str, ...]:
+    """The sections asked for by ``--section``: ``all``, a section name or slug, an alias, or a comma-separated list.
+
+    ``'all'`` -> every configured section; ``'bc'`` -> ``('Serie C', 'Serie B')``;
+    ``'serie-b'`` / ``'Serie B'`` / ``'b'`` -> ``('Serie B',)``; ``'c,d'`` ->
+    ``('Serie C', 'Serie D')``. :class:`argparse.ArgumentTypeError` for an
+    unknown name. Configuration order, without duplicates.
+    """
+    text = str(value).strip()
+    if text.lower() in SECTION_CHOICES:
+        return SECTION_CHOICES[text.lower()]
+    found: list[str] = []
+    for part in (p for p in text.split(",") if p.strip()):
+        try:
+            found.extend(section_members(resolve_section(part)))
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError(
+                f"sezione sconosciuta {part.strip()!r}: usa all, {', '.join(SECTIONS)} (o le sigle {', '.join(section_slug(s) for s in SECTIONS)}, bc)"
+            ) from exc
+    if not found:
+        raise argparse.ArgumentTypeError("--section vuota: usa all o il nome di una sezione")
+    ordered = [s for s in SECTIONS if s in found] + [s for s in dict.fromkeys(found) if s not in SECTIONS]
+    return tuple(dict.fromkeys(ordered))
 
 #: Console pointer to the glossary, printed with the matchday picks.
 LEGEND_POINTER: Final[str] = "Legenda: tab Legenda della dashboard oppure README"
@@ -354,6 +429,18 @@ def matchday_export_path(export: Path) -> Path:
     """``reports/value_report.csv`` -> ``reports/value_report_giornata.csv`` (the matchday table of section 4)."""
     export = Path(export)
     return export.with_name(f"{export.stem}_giornata.csv")
+
+
+def reliability_export_path(export: Path) -> Path:
+    """``reports/value_report.csv`` -> ``reports/value_report_affidabilita.csv`` (aggregated walk-forward scores)."""
+    export = Path(export)
+    return export.with_name(f"{export.stem}_affidabilita.csv")
+
+
+def slips_export_path(export: Path) -> Path:
+    """``reports/value_report.csv`` -> ``reports/value_report_schedine.csv`` (the three slips of the next matchday)."""
+    export = Path(export)
+    return export.with_name(f"{export.stem}_schedine.csv")
 
 
 def results_export_path(export: Path) -> Path:
@@ -545,6 +632,12 @@ class PipelineOutput:
     model's reading (:func:`src.engine.tables.results_table`); with ``--export``
     they are written to ``matchday_export_path`` / ``results_export_path``.
 
+    ``reliability`` is the walk-forward report of the *AFFIDABILITÀ MODELLO*
+    section (``None`` without ``backtest``), ``recalibrated`` whether its
+    validated recalibration was applied to the predictions, ``slips`` the three
+    slips of the *SCHEDINE* section for ``slips_matchday``; their CSVs are
+    ``reliability_export_path`` / ``slips_export_path`` with ``--export``.
+
     ``sections`` holds the per-section results (:class:`SectionOutput`, keyed by
     section name) when :func:`run_pipeline` ran sections. The top-level
     ``matchdays`` / frames / picks / export paths mirror the **single** section
@@ -580,6 +673,12 @@ class PipelineOutput:
     matchday_export_path: Path | None = None
     results_export_path: Path | None = None
     sections: dict[str, SectionOutput] = field(default_factory=dict)
+    reliability: ReliabilityReport | None = None
+    reliability_export_path: Path | None = None
+    recalibrated: bool = False
+    slips: list[Slip] = field(default_factory=list)
+    slips_matchday: Matchday | None = None
+    slips_export_path: Path | None = None
 
     @property
     def next_matchday(self) -> Matchday | None:
@@ -603,6 +702,15 @@ def run_pipeline(
     sections: Sequence[str] | None = None,
     now: datetime | None = None,
     demo: bool = False,
+    backtest: bool = False,
+    backtest_seasons: int = DEFAULT_BACKTEST_SEASONS,
+    prior: str = "auto",
+    odds_history: pd.DataFrame | None = None,
+    recalibrate: bool = True,
+    slips: bool = True,
+    n_slip_x: int = DEFAULT_N_X,
+    n_slip_gg: int = DEFAULT_N_GG,
+    n_slip_mixed: int = DEFAULT_N_MIXED,
 ) -> PipelineOutput:
     """Fit -> predict -> value, printing each step when ``verbose``.
 
@@ -639,6 +747,16 @@ def run_pipeline(
     goes to :func:`demo_export_path` (``DEMO_<name>``) and starts with the
     column ``AVVISO`` = ``DATI SIMULATI - NON USARE PER SCOMMETTERE``
     (:func:`src.dashboard.state.mark_demo_frame`).
+
+    ``backtest`` prints the *AFFIDABILITÀ MODELLO* section right after the fit
+    (:func:`src.dashboard.state.build_reliability` over ``backtest_seasons``
+    seasons with the ``config`` time decay and the ``prior`` setting;
+    ``odds_history`` adds the comparison with the bookmaker) and, with
+    ``recalibrate``, applies its validated recalibration to every probability
+    that follows (only the markets that improved out of sample). ``slips``
+    prints the *SCHEDINE* section at the end: the three slips of the next
+    matchday of the sections run (``n_slip_x`` X, ``n_slip_gg`` GG,
+    ``n_slip_mixed`` mixed legs).
     """
     if demo and export is not None:
         export = demo_export_path(Path(export))
@@ -678,9 +796,12 @@ def run_pipeline(
     # 2. fit -------------------------------------------------------------------
     if verbose:
         _banner("2) STIMA DIXON-COLES")
-    engine = DixonColesEngine(config)
-    params = engine.fit(matches, registry=registry)
+    engine = fit_by_group(matches, registry=registry, config=config, fixtures=season_fixtures(fixtures, label), method=None)
+    params = engine.params_
     say(f"metodo: {params.method}   convergenza: {params.converged} ({params.message})   iterazioni: {params.n_iter}   tempo: {params.fit_seconds:.2f}s")
+    if len(engine.groups) > 1 or engine.missing_groups:
+        for line in engine.describe():
+            say(line)
     say(
         f"log-likelihood pesata: {params.log_likelihood:.3f}   n={params.n_matches}   n_eff={params.effective_n:.1f}   xi={params.xi}   "
         f"prior: l2(alpha,beta)={config.l2_penalty:.2f} l2(gamma->{config.home_prior})={config.l2_penalty_home:.2f} l2(rho)={config.l2_penalty_rho:.2f}   penalità={params.penalty:.3f}"
@@ -715,6 +836,31 @@ def run_pipeline(
         log.warning("parameters at optimiser bounds", extra={"parameters": at_bounds, "n_matches": params.n_matches})
         notes.append(warning)
 
+    # AFFIDABILITÀ MODELLO: the walk-forward backtest and the validated recalibration (applied to what follows)
+    reliability: ReliabilityReport | None = None
+    reliability_path: Path | None = None
+    if backtest:
+        reliability = _reliability_section(
+            matches,
+            say=say,
+            verbose=verbose,
+            registry=registry,
+            label=label,
+            n_seasons=backtest_seasons,
+            xi=float(config.xi),
+            prior=prior,
+            odds_history=odds_history,
+            sections=sections,
+            recalibrate=recalibrate,
+        )
+        if export is not None:
+            reliability_path = reliability_export_path(Path(export))
+            reliability_path.parent.mkdir(parents=True, exist_ok=True)
+            reliability_path.write_bytes(export_csv_bytes(reliability_export_frame(reliability), demo=demo))
+            say(f"punteggi aggregati scritti in: {reliability_path}")
+    model = reliability.recalibration if reliability is not None and recalibrate else None
+    recalibrated = model is not None and model.enabled
+
     # 3-8 are printed per section (3. ranking, 4. next matchday, 5-6. value + traps, 8. picks, 7. export); the
     # predictions and the value engine run once for the whole perimeter first, so every section shares one fit.
     predictions: list[MatchPrediction] = []
@@ -739,7 +885,8 @@ def run_pipeline(
             skip_lines.append((fx.girone, f"[{fx.girone.value}] {fx.date} {fx.label}: partita saltata, squadra fuori dal perimetro {label} ({', '.join(outside)})"))
             continue
         try:
-            predictions.append(engine.predict(fx))
+            prediction = engine.predict(fx)
+            predictions.append(model.apply_prediction(prediction) if recalibrated and model is not None else prediction)
         except (KeyError, ValueError) as exc:
             # a team (or girone) without played matches in the dataset: early season, hand-edited
             # fixtures.csv, girone not harvested ... skip the fixture instead of aborting the run.
@@ -827,9 +974,33 @@ def run_pipeline(
             traps=list(traps),
             matchdays=giornate,
             matchday_frame=matchday_table(predictions, params=params, matches=trap_frame, opportunities=opportunities, traps=traps, matchday=next_day),
-            results_frame=results_table(matches, engine=engine, season=label),
+            results_frame=grouped_results_table(matches, engine, season=label),
             draw_picks=draw_picks(predictions, n=n_draws, matchday=next_day, opportunities=opportunities) if next_day else [],
             btts_picks=btts_picks(predictions, n=n_btts, matchday=next_day, opportunities=opportunities) if next_day else [],
+        )
+
+    slip_list: list[Slip] = []
+    slip_day: Matchday | None = None
+    slip_path: Path | None = None
+    if slips and (sections is None or len(passes) > 0):
+        slip_list, slip_day, slip_path = _slips_section(
+            say=say,
+            verbose=verbose,
+            sections=None if sections is None else [str(sec) for sec in sections],
+            predictions=predictions,
+            opportunities=opportunities,
+            quotes=quotes,
+            calendar=calendar,
+            current=current,
+            now=now,
+            value_engine=value_engine,
+            n_x=n_slip_x,
+            n_gg=n_slip_gg,
+            n_mixed=n_slip_mixed,
+            export=None if export is None else Path(export),
+            demo=demo,
+            reliability=reliability,
+            recalibrated=recalibrated,
         )
 
     return PipelineOutput(
@@ -858,7 +1029,160 @@ def run_pipeline(
         matchday_export_path=head.matchday_export_path,
         results_export_path=head.results_export_path,
         sections=section_outputs,
+        reliability=reliability,
+        reliability_export_path=reliability_path,
+        recalibrated=recalibrated,
+        slips=slip_list,
+        slips_matchday=slip_day,
+        slips_export_path=slip_path,
     )
+
+
+#: Columns of the compact per-market table of the console's *AFFIDABILITÀ MODELLO* section.
+CONSOLE_RELIABILITY_COLUMNS: Final[tuple[str, ...]] = (
+    "Mercato",
+    "Partite",
+    "Log loss modello",
+    "Log loss base",
+    "Skill vs base (%)",
+    "Brier modello",
+    "Accuratezza (%)",
+    "Partite con quote",
+    QUOTED_LOG_LOSS_COLUMN,
+    "Log loss mercato",
+    "Skill vs mercato (%)",
+)
+
+
+def _reliability_section(
+    matches: pd.DataFrame,
+    *,
+    say: "Callable[..., object]",
+    verbose: bool,
+    registry: TeamRegistry | None,
+    label: str,
+    n_seasons: int,
+    xi: float,
+    prior: str,
+    odds_history: pd.DataFrame | None,
+    sections: Sequence[str] | None,
+    recalibrate: bool,
+) -> ReliabilityReport:
+    """The console's *AFFIDABILITÀ MODELLO*: walk-forward scores per section and market, track records, recalibration.
+
+    Aggregates only (no match-level line): what the dashboard tab shows, for
+    the whole perimeter and each section that runs.
+    """
+    if verbose:
+        _banner("AFFIDABILITÀ MODELLO (backtest walk-forward: ogni giornata prevista solo con le partite precedenti)")
+    report = build_reliability(matches, registry=registry, season_label=label, n_seasons=n_seasons, xi=xi, prior=prior, odds_history=odds_history)
+    say(report.result.summary())
+    if report.empty:
+        say("nessuna partita valutabile fuori campione: niente punteggi, niente ricalibrazione.")
+        return report
+    present = list(dict.fromkeys(report.frame["section"].astype(str)))
+    scopes: list[str | None] = [None, *[sec for sec in (sections if sections is not None else present) if sec in present]]
+    for scope in scopes:
+        table = metrics_table_for(report, scope)
+        say(f"\n--- {ALL_SECTIONS_LABEL if scope is None else scope}: punteggi per mercato (log loss e Brier: più bassi = meglio) ---")
+        say(table[list(CONSOLE_RELIABILITY_COLUMNS)].to_string(index=False, na_rep="-"))
+    if not report.has_odds:
+        say("nessuno storico delle quote pre-partita: confronto con il mercato e ROI non disponibili.")
+    else:
+        say(
+            f"il mercato è misurato solo sulle partite con quote: confrontalo con «{QUOTED_LOG_LOSS_COLUMN}» (stesse partite), "
+            "non con «Log loss modello» (tutte le partite valutate)."
+        )
+    picks = picks_track_for(report)
+    say(f"\ntrack record delle liste (top {DEFAULT_N_DRAWS} X e top {DEFAULT_N_BTTS} GG di ogni giornata passata, {ALL_SECTIONS_LABEL.lower()}):")
+    say(picks_record_table(picks, None).to_string(index=False, na_rep="-"))
+    for scope in scopes:
+        table = accumulators_table(picks, scope)
+        if table.empty:
+            continue
+        say(f"multiple top-k delle liste ({ALL_SECTIONS_LABEL if scope is None else scope}: le prime k partite di ogni giornata giocate insieme):")
+        say(table.drop(columns=["Lista"]).to_string(index=False, na_rep="-"))
+    track = slips_track_for(report, None if sections is None else list(sections))
+    say("track record delle tre schedine (stesse regole della sezione SCHEDINE):")
+    say(slips_record_table(track).to_string(index=False, na_rep="-"))
+    say(EVIDENCE_NOTE)
+    model = report.recalibration
+    say("\n" + model.describe())
+    say(recalibration_table(model)[["Mercato", "Applicata", "Partite verifica", "Log loss prima", "Log loss dopo", "Miglioramento (%)", "Motivo"]].to_string(index=False, na_rep="-"))
+    if model.enabled:
+        say(
+            "probabilità usate nelle sezioni seguenti: "
+            + ("ricalibrate (" + ", ".join(m.value for m in model.enabled_markets) + ")" if recalibrate else "originali (--no-recalibration)")
+        )
+    log.info("reliability section", extra={"n_matches": report.result.n_matches, "recalibration": [m.value for m in model.enabled_markets]})
+    return report
+
+
+def _slips_section(
+    *,
+    say: "Callable[..., object]",
+    verbose: bool,
+    sections: Sequence[str] | None,
+    predictions: Sequence[MatchPrediction],
+    opportunities: Sequence[ValueOpportunity],
+    quotes: Sequence[OddsQuote],
+    calendar: Sequence[Fixture],
+    current: pd.DataFrame,
+    now: datetime | None,
+    value_engine: ValueEngine,
+    n_x: int,
+    n_gg: int,
+    n_mixed: int,
+    export: Path | None,
+    demo: bool,
+    reliability: ReliabilityReport | None,
+    recalibrated: bool,
+) -> tuple[list[Slip], Matchday | None, Path | None]:
+    """The console's *SCHEDINE*: the three slips of the next matchday of the sections run, with the CSV."""
+    scope = "tutte le sezioni" if sections is None else ", ".join(sections)
+    if verbose:
+        _banner(f"SCHEDINE ({scope}: {n_x} X, {n_gg} GG, mista 1 / 2 / GG / Over 2.5 da {n_mixed})")
+    gironi = slips_gironi(sections)
+    days = matchdays(calendar, gironi=None if sections is None else gironi, played=current, now=now)
+    day = days[0] if days else None
+    chosen = None if sections is None else list(dict.fromkeys(m for sec in sections for m in section_members(sec)))
+    candidates = [p for p in predictions if p.fixture.girone in gironi] if day is not None else []
+    slip_list = build_slips(
+        candidates,
+        now=now,
+        opportunities=opportunities,
+        quotes=quotes,
+        n_x=n_x,
+        n_gg=n_gg,
+        n_mixed=n_mixed,
+        sections=chosen,
+        matchday=day,
+    )
+    bankroll, fraction = value_engine.kelly.bankroll_units, value_engine.kelly.fraction
+    if day is None:
+        say("nessuna partita in programma prevedibile: nessuna schedina.")
+    else:
+        say(f"{day.label} · probabilità {'ricalibrate' if recalibrated else 'originali del modello'}")
+        say(slips_summary(slip_list, bankroll_units=bankroll, fraction=fraction).to_string(index=False, na_rep="-"))
+        for slip in slip_list:
+            say(f"\n{slip.title} ({slip.n_legs} partite){' · ' + slip.coverage_note if slip.coverage_note else ''}")
+            legs = slips_frame([slip]).drop(columns=["Schedina"])
+            say(legs.to_string(index=False, na_rep="-") if not legs.empty else "nessuna partita.")
+            if slip.margin_note:
+                say(slip.margin_note)
+        say("\n" + INDEPENDENCE_NOTE)
+        if reliability is not None and not reliability.empty:
+            track = slips_track_for(reliability, sections, n_x=n_x, n_gg=n_gg, n_mixed=n_mixed)
+            say("stesse schedine nelle giornate passate (backtest fuori campione):")
+            say(slips_record_table(track).to_string(index=False, na_rep="-"))
+    path: Path | None = None
+    if export is not None:
+        path = slips_export_path(export)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(export_csv_bytes(slips_export_frame(slip_list, day, bankroll_units=bankroll, fraction=fraction), demo=demo))
+        say(f"schedine scritte in: {path}")
+    log.info("slips section", extra={"matchday": None if day is None else day.key, "legs": {s.kind: s.n_legs for s in slip_list}})
+    return slip_list, day, path
 
 
 def _run_section(
@@ -871,7 +1195,7 @@ def _run_section(
     current: pd.DataFrame,
     history: pd.DataFrame,
     matches: pd.DataFrame,
-    engine: DixonColesEngine,
+    engine: "DixonColesEngine | GroupedFit",
     params: FittedParams,
     predictions: Sequence[MatchPrediction],
     opportunities: Sequence[ValueOpportunity],
@@ -952,7 +1276,7 @@ def _run_section(
         )
         say(format_matchday_console(matchday_frame))
         say(MATCHDAY_CONSOLE_LEGEND)
-    results_frame = results_table(matches, engine=engine, season=label, gironi=gironi if section is not None else None)
+    results_frame = grouped_results_table(matches, engine, season=label, gironi=gironi if section is not None else None)
     log.info(
         "matchday table",
         extra={"section": section, "matchday": None if next_day is None else next_day.key, "n_rows": len(matchday_frame), "n_results": len(results_frame)},
@@ -1140,7 +1464,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--processed", type=Path, help="harvested matches CSV, possibly several seasons (overrides simulation)")
     p.add_argument("--fixtures", type=Path, help="fixtures CSV (with --processed)")
     p.add_argument("--odds", type=Path, help="directory of bookmaker odds CSVs (with --processed)")
-    p.add_argument("--method", choices=["SLSQP", "L-BFGS-B"], default="SLSQP")
+    p.add_argument(
+        "--method",
+        choices=["SLSQP", "L-BFGS-B"],
+        default=DEFAULT_FIT_METHOD,
+        help=f"optimiser of the per-country Dixon-Coles fit (default {DEFAULT_FIT_METHOD}: same optimum as SLSQP, about 40 times faster)",
+    )
     p.add_argument("--xi", type=float, default=None, help="time-decay per day (default 0 for simulated data, which is stationary across seasons, 0.0018 for real data)")
     p.add_argument(
         "--prior",
@@ -1162,13 +1491,48 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--trap-team", default=None, help="team whose last 3 matches are rewritten to showcase REGRESSION_TRAP (simulated modes only; default: automatic)")
     p.add_argument(
         "--section",
-        choices=sorted(SECTION_CHOICES),
         default="all",
         help=(
-            "which section(s) to print and export after the joint fit: bc = Serie B e Serie C, d = Serie D, all (default) = every "
-            "section that has teams, one after the other with its own banner, ranking, matchday table, value, picks and CSVs "
-            "(suffixed _bc / _d when both run)"
+            "which section(s) to print and export after the fit: all (default) = every section that has teams, one after the "
+            f"other with its own banner, ranking, matchday table, value, picks and CSVs (suffixed _<slug> when several run); or a "
+            f"section name / slug / comma-separated list ({', '.join(SECTIONS)}; slugs {', '.join(section_slug(x) for x in SECTIONS)}); "
+            "bc = Serie C and Serie B (legacy alias), d = Serie D"
         ),
+    )
+    p.add_argument(
+        "--backtest",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="print the AFFIDABILITÀ MODELLO section (walk-forward backtest, scores against base rates and bookmaker, track "
+        "records, validated recalibration) and export <stem>_affidabilita.csv; default: on with real data, off in the simulated modes",
+    )
+    p.add_argument(
+        "--backtest-seasons",
+        type=int,
+        choices=[1, 2, 3],
+        default=DEFAULT_BACKTEST_SEASONS,
+        help=f"seasons up to the current one evaluated by the backtest (default {DEFAULT_BACKTEST_SEASONS})",
+    )
+    p.add_argument(
+        "--recalibration",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="apply the validated recalibration of the backtest to the probabilities (only the markets that improved out of sample; default on)",
+    )
+    p.add_argument(
+        "--slips",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="print the SCHEDINE section (three slips of the next matchday) and export <stem>_schedine.csv (default on)",
+    )
+    p.add_argument("--slip-x", type=int, default=DEFAULT_N_X, metavar="N", help=f"legs of the X slip (default {DEFAULT_N_X})")
+    p.add_argument("--slip-gg", type=int, default=DEFAULT_N_GG, metavar="N", help=f"legs of the GG slip (default {DEFAULT_N_GG})")
+    p.add_argument(
+        "--slip-mixed",
+        type=int,
+        default=DEFAULT_N_MIXED,
+        metavar="N",
+        help=f"legs of the mixed slip 1 / 2 / GG / Over 2.5 ({MIXED_MIN_LEGS}-{MIXED_MAX_LEGS}, default {DEFAULT_N_MIXED})",
     )
     p.add_argument(
         "--serie-d-demo",
@@ -1245,9 +1609,18 @@ def main(argv: Sequence[str] | None = None) -> PipelineOutput:
 
     if args.rounds is not None and args.rounds < 1:
         build_parser().error(f"--rounds {args.rounds}: servono almeno 1 giornata giocata")
-    for option, value in (("--n-draws", args.n_draws), ("--n-btts", args.n_btts)):
+    for option, value in (("--n-draws", args.n_draws), ("--n-btts", args.n_btts), ("--slip-x", args.slip_x), ("--slip-gg", args.slip_gg)):
         if value < 1:
             build_parser().error(f"{option} {value}: serve almeno 1 partita")
+    if not MIXED_MIN_LEGS <= args.slip_mixed <= MIXED_MAX_LEGS:
+        build_parser().error(f"--slip-mixed {args.slip_mixed}: la schedina mista va da {MIXED_MIN_LEGS} a {MIXED_MAX_LEGS} partite")
+    section_text = str(args.section).strip()
+    try:
+        wanted_sections = parse_sections(section_text)
+    except argparse.ArgumentTypeError as exc:
+        build_parser().error(f"--section {section_text}: {exc}")
+    if section_text.lower() in SECTION_CHOICES:
+        section_text = section_text.lower()
     if args.serie_d_demo and (args.processed or args.footystats or args.mode != "full"):
         build_parser().error("--serie-d-demo vale solo per la lega simulata di --mode full (senza --processed)")
     if args.serie_d_demo and not serie_d_gironi():
@@ -1334,13 +1707,19 @@ def main(argv: Sequence[str] | None = None) -> PipelineOutput:
         config = replace(config, l2_penalty=args.l2)
 
     available = sections_for(registry.gironi)  # the sections with teams, display order
-    wanted = SECTION_CHOICES[args.section]
+    wanted = wanted_sections
     runnable = [sec for sec in available if sec in wanted]
-    unavailable = [sec for sec in wanted if sec not in available and (args.section != "all" or sec == SECTION_D)]
+    unavailable = [sec for sec in wanted if sec not in available and (section_text != "all" or sec == SECTION_D)]
+    backtest = (not demo) if args.backtest is None else bool(args.backtest)
+    odds_history = None
+    if backtest and args.odds is not None:
+        from src.dashboard import data_refresh  # noqa: PLC0415
+
+        odds_history = data_refresh.load_odds_history_frame(Path(args.odds))
 
     _banner(f"SERIE C QUANT LAB -- {source}")
     print(perimeter_banner(registry, current, history))
-    print(f"Sezioni: {', '.join(runnable) if runnable else 'nessuna'} (--section {args.section})")
+    print(f"Sezioni: {', '.join(runnable) if runnable else 'nessuna'} (--section {section_text})")
     for note in sim_notes:
         print(note)
     for note in input_notes:
@@ -1360,6 +1739,15 @@ def main(argv: Sequence[str] | None = None) -> PipelineOutput:
         sections=runnable,
         now=now,
         demo=demo,
+        backtest=backtest,
+        backtest_seasons=args.backtest_seasons,
+        prior=prior_setting(None if args.prior == "auto" else args.prior == "on"),
+        odds_history=odds_history,
+        recalibrate=bool(args.recalibration),
+        slips=bool(args.slips),
+        n_slip_x=args.slip_x,
+        n_slip_gg=args.slip_gg,
+        n_slip_mixed=args.slip_mixed,
     )
     out.notes = input_notes + sim_notes + out.notes
     for sec in unavailable:

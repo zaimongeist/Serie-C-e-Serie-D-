@@ -1,4 +1,4 @@
-"""Dixon-Coles engine for the configured competitions (Serie C Gironi A / B / C and Serie B).
+"""Dixon-Coles engine for the configured competitions of one fit group (Serie B, Serie C Gironi A / B / C, Serie D Gironi A-I).
 
 Model
 -----
@@ -109,6 +109,17 @@ clubs on their own would force the strongest teams of the lower division to
 average zero. The fit logs a warning; a fixture of that competition is not
 predictable until its matches are harvested (``KeyError`` from
 :meth:`DixonColesEngine.rates`, skipped with a note by the callers).
+
+Fit groups
+----------
+One engine fits one *fit group*: the competitions of one country
+(:attr:`src.common.competitions.Competition.fit_group`), connected by the clubs
+that move between divisions. Leagues of different countries share no match
+and are fitted by separate engines: :func:`src.engine.fitgroups.fit_by_group`
+splits the frame by group, fits one engine per group and wraps them in a
+:class:`~src.engine.fitgroups.GroupedFit` with the prediction and reporting
+interface of this class. With the shipped configuration (Italy only) it is a
+single engine.
 
 The objective exposes an analytic gradient (:func:`negative_log_likelihood_grad`)
 which is passed to :func:`scipy.optimize.minimize`.

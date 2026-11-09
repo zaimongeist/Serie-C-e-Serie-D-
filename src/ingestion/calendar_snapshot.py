@@ -26,15 +26,27 @@ per competition, the current round exactly as the dashboard shows it (same
 helper, canonical team names) plus the postponed matches and recoveries
 (:func:`src.engine.calendar.recoveries`).
 
-Only public calendar facts are handled (rounds, kick-off times, teams, final
-scores): no odds and no match statistics. The API key is read like the
-harvester does (``--key``, ``FOOTYSTATS_API_KEY``, ``.env``) and is never
-printed.
+**Reliability** (``--reliability``) -- reads the product's matches CSV (every
+season) and, optionally, its odds history, runs the walk-forward backtest of
+the dashboard's *Affidabilità modello* tab (:func:`src.engine.backtest.walk_forward`:
+every past week block predicted by a model fitted only on the matches before
+it) and prints **aggregated metrics only** (:func:`reliability_markdown`): per
+section and market the number of matches, log loss and Brier of the model, of
+the league base rates and of the de-vigged bookmaker, the calibration bins with
+their counts, the hit rates of the top-N lists and of the three slips with
+their Wilson intervals, the aggregate ROI and the recalibration decision. No
+match, no team, no price is printed: the repository and its CI logs are public.
+
+Only public calendar facts are handled by the first two modes (rounds, kick-off
+times, teams, final scores): no odds and no match statistics. The API key is
+read like the harvester does (``--key``, ``FOOTYSTATS_API_KEY``, ``.env``) and is
+never printed.
 
 Usage::
 
     python -m src.ingestion.calendar_snapshot --summary snapshot/riepilogo.md
     python -m src.ingestion.calendar_snapshot --product-view --matches ci/matches.csv --fixtures ci/fixtures.csv
+    python -m src.ingestion.calendar_snapshot --reliability --matches ci/matches.csv --odds-history ci/history/odds_history.csv
 """
 from __future__ import annotations
 
@@ -421,6 +433,199 @@ def product_view_markdown(
     return "\n".join(lines) + "\n"
 
 
+#: Seasons up to the current one evaluated by the CI backtest (the dashboard's default).
+RELIABILITY_SEASONS: int = 2
+
+
+def _fmt(value: Any, digits: int = 4) -> str:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return "-"
+    return "-" if number != number else f"{number:.{digits}f}"  # NaN check without numpy
+
+
+def _pct_text(value: Any, digits: int = 1) -> str:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return "-"
+    return "-" if number != number else f"{number * 100:.{digits}f}%"
+
+
+def _md_table(header: Sequence[str], rows: Iterable[Sequence[Any]]) -> list[str]:
+    lines = ["| " + " | ".join(header) + " |", "|" + "|".join("---" for _ in header) + "|"]
+    lines += ["| " + " | ".join(str(c) for c in row) + " |" for row in rows]
+    return lines
+
+
+#: Minimum number of quoted matches/bets behind any odds-derived aggregate printed in the public CI log:
+#: below it, a market score or an ROI could reveal the FootyStats price of a single match.
+PUBLIC_MIN_QUOTED: int = 30
+
+
+def _public(value: str, n_quoted: Any) -> str:
+    """``value`` when it rests on at least :data:`PUBLIC_MIN_QUOTED` quoted items, else a placeholder."""
+    try:
+        enough = int(n_quoted) >= PUBLIC_MIN_QUOTED
+    except (TypeError, ValueError):
+        enough = False
+    return value if enough else f"n<{PUBLIC_MIN_QUOTED}"
+
+
+def reliability_markdown(result: Any, recalibration: Any, odds_history: pd.DataFrame | None = None) -> str:
+    """Aggregated walk-forward metrics as Markdown, safe for a public CI log (no match, no team, no price).
+
+    ``result`` is a :class:`src.engine.backtest.BacktestResult`, ``recalibration``
+    the :class:`src.engine.calibration.RecalibrationModel` fitted on it,
+    ``odds_history`` the long odds frame of the completed matches (only its
+    de-vigged aggregates are scored). Sections: per section and market the
+    scores of model, base rates and bookmaker; calibration bins (counts and
+    frequencies) of the reference selection of each market over every section;
+    hit rates of the top-5 X / top-12 GG lists, of their top-k multiples and of
+    the three slips with their Wilson intervals and the aggregate ROI; the
+    recalibration decision.
+    """
+    from src.engine.backtest import ALL_SECTIONS, DEFAULT_MARKETS, market_comparison, market_spec, metrics, picks_track_record, reliability, slips_track_record
+    from src.engine.slips import make_slip_builder
+
+    frame = result.frame
+    odds = odds_history if odds_history is not None and len(odds_history) else None
+    lines = ["# Affidabilità del modello (backtest walk-forward, solo metriche aggregate)", "", result.summary(), ""]
+    if frame.empty:
+        lines.append("Nessuna partita valutabile: niente metriche.")
+        return "\n".join(lines) + "\n"
+    lines.append(
+        f"Partite con quote pre-partita nello storico: {int(frame['match_id'].isin(set(odds['match_id'].astype(str))).sum()) if odds is not None else 0}."
+    )
+    lines.append("")
+    model_scores = metrics(frame, by=("section",))
+    overall = metrics(frame, by=())
+    cmp_sec = market_comparison(frame, odds, by=("section",)) if odds is not None else pd.DataFrame()
+    cmp_all = market_comparison(frame, odds, by=()) if odds is not None else pd.DataFrame()
+    lines.append("## Punteggi per sezione e mercato")
+    # the market is scored only on the quoted matches: the model's scores on those same matches sit next to it
+    # ("LL modello" / "Brier" cover every evaluated match and are never comparable with the market's)
+    header = [
+        "Sezione",
+        "Mercato",
+        "n",
+        "LL modello",
+        "LL base",
+        "Brier",
+        "Accuratezza",
+        "n con quote",
+        "LL modello (con quote)",
+        "LL mercato",
+        "Brier modello (con quote)",
+        "Brier mercato",
+        "Skill vs mercato",
+    ]
+    rows = []
+    for scope, scores, cmp in ((ALL_SECTIONS, overall, cmp_all), *((s, model_scores.loc[model_scores["section"] == s], cmp_sec.loc[cmp_sec["section"] == s] if len(cmp_sec) else cmp_sec) for s in dict.fromkeys(model_scores["section"].astype(str)))):
+        by_market = {str(r["market"]): r for r in cmp.to_dict(orient="records")} if len(cmp) else {}
+        for r in scores.to_dict(orient="records"):
+            c = by_market.get(str(r["market"]))
+            rows.append(
+                [
+                    scope,
+                    r["market"],
+                    int(r["n"]),
+                    _fmt(r["log_loss"]),
+                    _fmt(r["log_loss_naive"]),
+                    _fmt(r["brier"]),
+                    _pct_text(r["accuracy"]),
+                    int(c["n"]) if c is not None else 0,
+                    _public(_fmt(c["log_loss_model"]), c["n"]) if c is not None else "-",
+                    _public(_fmt(c["log_loss_market"]), c["n"]) if c is not None else "-",
+                    _public(_fmt(c["brier_model"]), c["n"]) if c is not None else "-",
+                    _public(_fmt(c["brier_market"]), c["n"]) if c is not None else "-",
+                    _public(_pct_text(c["skill"], 2), c["n"]) if c is not None else "-",
+                ]
+            )
+    lines += _md_table(header, rows)
+    lines.append("")
+    lines.append(
+        "Il mercato è misurato solo sulle partite con quote: confrontalo con «LL modello (con quote)» e «Brier modello "
+        "(con quote)», calcolate sulle stesse partite, non con «LL modello» (tutte le partite valutate)."
+        f" Nel log pubblico ogni valore ricavato dalle quote è mostrato solo con almeno {PUBLIC_MIN_QUOTED} partite quotate."
+    )
+    lines.append("")
+    lines.append("## Taratura (tutte le sezioni): probabilità prevista vs frequenza osservata per fascia")
+    for market in DEFAULT_MARKETS:
+        spec = market_spec(market)
+        selections = spec.selections if spec.is_binary is False else spec.selections[:1]
+        for selection in selections:
+            table = reliability(frame, market, selection, bins=10)
+            lines.append(f"**{spec.key} · {selection}**")
+            lines += _md_table(
+                ["Fascia", "n", "Prevista", "Osservata", "IC 95%"],
+                (
+                    [f"{r['bin_low']:.1f}-{r['bin_high']:.1f}", int(r["n"]), _pct_text(r["mean_pred"]), _pct_text(r["observed"]), f"{_pct_text(r['wilson_low'])} - {_pct_text(r['wilson_high'])}"]
+                    for r in table.to_dict(orient="records")
+                ),
+            )
+            lines.append("")
+    picks = picks_track_record(frame, odds_history=odds, by_section=True)
+    lines.append("## Liste di giornata (top 5 X, top 12 GG)")
+    lines += _md_table(
+        ["Ambito", "Lista", "Giornate", "Selezioni", "Hit rate", "IC 95%", "P media", "Con quota", "ROI", "IC 95% ROI"],
+        (
+            [r["scope"], r["list"], int(r["n_matchdays"]), int(r["n_picks"]), _pct_text(r["hit_rate"]), f"{_pct_text(r['wilson_low'])} - {_pct_text(r['wilson_high'])}", _pct_text(r["mean_p"]), int(r["n_with_odds"]), _public(_pct_text(r["roi"]), r["n_with_odds"]), _public(f"{_pct_text(r['roi_low'])} - {_pct_text(r['roi_high'])}", r["n_with_odds"])]
+            for r in picks.summary.to_dict(orient="records")
+        ),
+    )
+    lines.append("")
+    lines.append("## Multiple top-k delle liste (le prime k partite di ogni giornata, tutte vincenti)")
+    lines += _md_table(
+        ["Ambito", "Multipla", "Giornate", "Vinte", "Attese", "Win rate", "IC 95%", "P media", "Con quota", "ROI", "IC 95% ROI"],
+        (
+            [r["scope"], f"Top {int(r['k'])} {r['list']}", int(r["n_matchdays"]), int(r["wins"]), _fmt(r["expected_wins"], 2), _pct_text(r["win_rate"]), f"{_pct_text(r['wilson_low'])} - {_pct_text(r['wilson_high'])}", _pct_text(r["mean_p"], 2), int(r["n_with_odds"]), _public(_pct_text(r["roi"]), r["n_with_odds"]), _public(f"{_pct_text(r['roi_low'])} - {_pct_text(r['roi_high'])}", r["n_with_odds"])]
+            for r in picks.accumulators.to_dict(orient="records")
+        ),
+    )
+    lines.append("")
+    slips = slips_track_record(frame, odds_history=odds, slip_builder=make_slip_builder())
+    lines.append("## Schedine (5 X, 10 GG, mista 1 / 2 / GG / Over 2.5 da 6)")
+    lines += _md_table(
+        ["Schedina", "Giornate", "Vinte", "Attese", "Win rate", "IC 95%", "Gambe vinte", "P media gamba", "Con quota", "ROI", "IC 95% ROI"],
+        (
+            [r["slip"], int(r["n_slips"]), int(r["wins"]), _fmt(r["expected_wins"], 2), _pct_text(r["win_rate"]), f"{_pct_text(r['wilson_low'])} - {_pct_text(r['wilson_high'])}", _pct_text(r["leg_hit_rate"]), _pct_text(r["mean_leg_p"]), int(r["n_with_odds"]), _public(_pct_text(r["roi"]), r["n_with_odds"]), _public(f"{_pct_text(r['roi_low'])} - {_pct_text(r['roi_high'])}", r["n_with_odds"])]
+            for r in slips.summary.to_dict(orient="records")
+        ),
+    )
+    lines.append("")
+    lines.append("## Ricalibrazione")
+    lines.append(recalibration.describe())
+    summary = recalibration.summary_frame()
+    lines += _md_table(
+        ["Mercato", "Applicata", "n verifica", "LL prima", "LL dopo", "Miglioramento"],
+        ([r["market"], "sì" if r["enabled"] else "no", int(r["n_eval"]), _fmt(r["log_loss_before"]), _fmt(r["log_loss_after"]), _pct_text(r["gain"], 2)] for r in summary.to_dict(orient="records")),
+    )
+    return "\n".join(lines) + "\n"
+
+
+def run_reliability(matches_path: Path, *, season: str, odds_history_path: Path | None = None, config_dir: Path = CONFIG_DIR, n_seasons: int = RELIABILITY_SEASONS) -> str:
+    """Walk-forward backtest of the product's matches CSV and its aggregated Markdown (see :func:`reliability_markdown`)."""
+    from src.common.teams import load_registry
+    from src.engine.backtest import walk_forward
+    from src.engine.calibration import RecalibrationModel, fit_recalibration
+    from src.ingestion.harvester import load_odds_history
+
+    matches = load_processed(matches_path)
+    try:
+        registry = load_registry(season, config_dir=config_dir)
+    except (FileNotFoundError, ValueError, TypeError):
+        registry = None
+    current = season_key(season)
+    present = set(matches["date"].map(season_of)) if len(matches) else set()
+    seasons = sorted(s for s in present | {current} if s <= current)[-max(int(n_seasons), 1):]
+    result = walk_forward(matches, registry=registry, seasons=seasons)
+    model = fit_recalibration(result.frame) if not result.empty else RecalibrationModel.identity()
+    odds = load_odds_history(odds_history_path) if odds_history_path is not None and Path(odds_history_path).is_file() else None
+    return reliability_markdown(result, model, odds)
+
+
 def _parse_now(value: str | None) -> datetime:
     if not value:
         return datetime.now(tz=ROME)
@@ -444,6 +649,12 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--product-view", action="store_true", help="stampa la giornata corrente di ogni competizione dai CSV del prodotto (--matches, --fixtures)")
     parser.add_argument("--matches", type=Path, default=None, help="CSV partite scritto da python -m src.ingestion.footystats --out")
     parser.add_argument("--fixtures", type=Path, default=None, help="CSV fixture scritto da python -m src.ingestion.footystats --fixtures-out")
+    parser.add_argument(
+        "--reliability",
+        action="store_true",
+        help="backtest walk-forward sui CSV del prodotto (--matches, --odds-history facoltativo): stampa solo metriche aggregate",
+    )
+    parser.add_argument("--odds-history", type=Path, default=None, help="storico quote delle partite giocate (history/odds_history.csv della raccolta)")
     parser.add_argument("--log-level", default="INFO")
     return parser
 
@@ -460,6 +671,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     configure_logging(args.log_level, force=True)
     now = _parse_now(args.now)
     comps = _selected(args.competitions)
+    if args.reliability:
+        if args.matches is None:
+            parser.error("--reliability needs --matches")
+        if not args.matches.exists():
+            print(f"affidabilità: file mancante ({args.matches}): la raccolta FootyStats non l'ha scritto", file=sys.stderr)
+            return 1
+        text = run_reliability(args.matches, season=args.season, odds_history_path=args.odds_history, config_dir=args.config_dir)
+        if args.summary is not None:
+            args.summary.parent.mkdir(parents=True, exist_ok=True)
+            args.summary.write_text(text, encoding="utf-8")
+        print(text)
+        return 0
     if args.product_view:
         if args.matches is None or args.fixtures is None:
             parser.error("--product-view needs --matches and --fixtures")

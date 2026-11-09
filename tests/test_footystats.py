@@ -1246,3 +1246,96 @@ def test_prune_stale_odds_drops_quotes_of_postponed_and_kicked_off_matches(tmp_p
     assert fs.prune_stale_odds(path, fixtures, now=now) == 0 and fs.prune_stale_odds(tmp_path / "absent.csv", fixtures, now=now) == 0
     # the quotes the dashboard reads no longer price the postponed match
     assert {q.match_id for q in load_odds_quotes(tmp_path)} == {"FS-1", "FS-4", "FS-9"}
+
+
+# ============================================================================ odds history (completed matches)
+def _history_quote(match_id: str, market: Market, odds: dict[str, float], bookmaker: str = "FootyStats") -> Any:
+    from src.common.schemas import OddsQuote  # noqa: PLC0415
+
+    return OddsQuote(match_id=match_id, bookmaker=bookmaker, market=market, odds=odds)
+
+
+@pytest.mark.asyncio
+async def test_harvest_collects_the_odds_history_of_completed_matches(provider_factory: Callable[..., Any]) -> None:
+    provider, _transport = provider_factory()
+    async with provider.client:
+        result = await provider.harvest(["A"], seasons=2)
+    played = set(result.matches["match_id"].astype(str))
+    fixtures = {f.match_id for f in result.fixtures}
+    history = result.odds_history
+    assert history and {q.match_id for q in history} <= played, "history only for completed matches of the frame"
+    assert not {q.match_id for q in history} & fixtures, "a scheduled fixture is priced by `odds`, never by the history"
+    assert len({(q.match_id, q.market) for q in history}) == len(history), "one quote per match and market"
+    assert {q.market for q in history} == set(Market)
+    # both seasons contribute (the history is not limited to the current season): match ids are offset per season id
+    offsets = {int(q.match_id.removeprefix("FS-")) // 1_000_000 for q in history}
+    assert offsets == {CURRENT_A, PAST_A}
+    # the complete match 453873 of the current season carries the FootyStats pre-match book (odds_ft_1 = 1.37)
+    sample = [q for q in history if q.match_id == f"FS-{CURRENT_A * 1_000_000 + 453873}" and q.market is Market.MATCH_ODDS]
+    assert len(sample) == 1 and sample[0].odds["1"] == 1.37 and sample[0].bookmaker == fs.FOOTYSTATS_BOOKMAKER
+    assert f"odds_history={len(history)}" in result.summary() and "matches=" in result.summary()
+    # without odds nothing is collected
+    provider2, _ = provider_factory()
+    async with provider2.client:
+        bare = await provider2.harvest(["A"], seasons=1, with_odds=False)
+    assert bare.odds_history == [] and "odds_history=0" in bare.summary()
+
+
+def test_cli_writes_the_odds_history_next_to_the_odds_never_among_current_prices(
+    cli_env: CountingTransport, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from src.ingestion.harvester import load_odds_history  # noqa: PLC0415
+
+    out, fixtures_out, odds_out = tmp_path / "p" / "matches.csv", tmp_path / "p" / "fixtures.csv", tmp_path / "o" / "footystats.csv"
+    common = ["--competitions", "A", "--seasons", "1", "--key", KEY, "--no-sync", "--out", str(out), "--fixtures-out", str(fixtures_out), "--odds-out", str(odds_out), "--cache-dir", str(tmp_path / "raw"), "--mapping", str(tmp_path / "map.json")]
+    assert fs.main(common) == 0
+    captured = capsys.readouterr()
+    history_path = tmp_path / "o" / "history" / "odds_history.csv"
+    assert f"odds history -> {history_path}" in captured.out and KEY not in captured.out
+    history = load_odds_history(history_path)
+    played = set(pd.read_csv(out, dtype="string")["match_id"])
+    assert len(history) and set(history["match_id"]) <= played and list(history.columns) == ["match_id", "bookmaker", "market", "selection", "odds"]
+    # the dashboard / main.py reader of current prices does not see the history (non-recursive folder)
+    assert {q.match_id for q in load_odds_quotes(odds_out.parent)} <= {f"FS-{CURRENT_A * 1_000_000 + 900001}", f"FS-{CURRENT_A * 1_000_000 + 900002}"}
+    # --no-odds writes no history; an explicit path is honoured
+    explicit = tmp_path / "elsewhere" / "h.csv"
+    assert fs.main([*common, "--no-odds", "--odds-history-out", str(explicit)]) == 0 and not explicit.exists()
+    assert fs.main([*common, "--odds-history-out", str(explicit)]) == 0 and len(load_odds_history(explicit)) == len(history)
+    assert _scan_for_key(tmp_path, KEY) == []
+
+
+def test_save_odds_history_merges_atomically_and_load_validates(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    from src.ingestion.harvester import ODDS_HISTORY_PATH, load_odds_history, odds_history_path, save_odds_history  # noqa: PLC0415
+
+    assert ODDS_HISTORY_PATH == fs.ODDS_DIR / "history" / "odds_history.csv" and odds_history_path(tmp_path) == tmp_path / "history" / "odds_history.csv"
+    path = odds_history_path(tmp_path)
+    first = [
+        _history_quote("FS-1", Market.MATCH_ODDS, {"1": 2.1, "X": 3.3, "2": 3.6}),
+        _history_quote("FS-1", Market.BTTS, {"GG": 1.85, "NG": 1.95}),
+        _history_quote("FS-2", Market.OVER_UNDER_25, {"Over 2.5": 2.05, "Under 2.5": 1.75}),
+    ]
+    caplog.set_level(logging.INFO)
+    assert save_odds_history(first, path) == path
+    frame = load_odds_history(path)
+    assert len(frame) == 7 and set(frame["match_id"]) == {"FS-1", "FS-2"} and str(frame["odds"].dtype) == "float64"
+    assert "2.1" in path.read_text(encoding="utf-8") and "3.6" in path.read_text(encoding="utf-8"), "prices written exactly"
+    # a later run: FS-1 re-quoted (replaces its rows), FS-2 not harvested this time (kept), FS-3 new
+    second = [_history_quote("FS-1", Market.MATCH_ODDS, {"1": 2.0, "X": 3.4, "2": 3.8}), _history_quote("FS-3", Market.BTTS, {"GG": 1.7, "NG": 2.1})]
+    save_odds_history(second, path)
+    frame = load_odds_history(path)
+    assert sorted(set(frame["match_id"])) == ["FS-1", "FS-2", "FS-3"] and len(frame) == 3 + 2 + 2
+    fs1 = frame.loc[frame["match_id"] == "FS-1"]
+    assert set(fs1["market"]) == {"1X2"} and fs1.loc[fs1["selection"] == "1", "odds"].item() == 2.0
+    assert not list(path.parent.glob(".*.tmp")), "replaced atomically"
+    # keep_previous=False rewrites; prices are never logged, only counts
+    save_odds_history(second, path, keep_previous=False)
+    assert sorted(set(load_odds_history(path)["match_id"])) == ["FS-1", "FS-3"]
+    assert "3.8" not in caplog.text and "odds history saved" in caplog.text
+    # invalid rows and incomplete books are dropped on read; a missing file is an empty frame
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write("FS-4,FootyStats,1X2,1,2.2\nFS-4,FootyStats,1X2,X,3.1\n")  # incomplete book
+        handle.write("FS-5,FootyStats,GG/NG,GG,1.0\nFS-5,FootyStats,GG/NG,NG,2.0\n")  # odds <= 1
+        handle.write("FS-6,FootyStats,BTTS,GG,1.9\nFS-6,FootyStats,BTTS,NG,1.9\n")  # unknown market spelling
+    cleaned = load_odds_history(path)
+    assert sorted(set(cleaned["match_id"])) == ["FS-1", "FS-3"]
+    assert load_odds_history(tmp_path / "absent.csv").empty and list(load_odds_history(tmp_path / "absent.csv").columns) == ["match_id", "bookmaker", "market", "selection", "odds"]
