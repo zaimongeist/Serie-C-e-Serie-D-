@@ -70,6 +70,7 @@ from src.common.paths import CONFIG_DIR, DATA_DIR, ODDS_DIR, PROCESSED_DIR, RAW_
 from src.common.schemas import (
     FIXTURE_STATUSES,
     MATCH_COLUMNS,
+    SELECTIONS,
     Fixture,
     Girone,
     MatchRecord,
@@ -88,6 +89,10 @@ __all__ = [
     "REQUIRED_FIXTURE_COLUMNS",
     "FOTMOB_STAT_KEYS",
     "ODDS_COLUMNS",
+    "ODDS_HISTORY_COLUMNS",
+    "ODDS_HISTORY_DIRNAME",
+    "ODDS_HISTORY_FILE",
+    "ODDS_HISTORY_PATH",
     "PROVIDER_NAMES",
     "STAT_FIELDS",
     "AsyncHarvesterClient",
@@ -111,13 +116,16 @@ __all__ = [
     "default_providers",
     "load_endpoints",
     "load_fixtures",
+    "load_odds_history",
     "load_processed",
     "main",
+    "odds_history_path",
     "parse_retry_after",
     "parse_stat_value",
     "run_concurrently",
     "save_fixtures",
     "save_odds",
+    "save_odds_history",
     "save_processed",
     "season_label_from_year",
     "site_origin",
@@ -2559,6 +2567,159 @@ load_processed = Harvester.load_processed
 save_fixtures = Harvester.save_fixtures
 load_fixtures = Harvester.load_fixtures
 save_odds = Harvester.save_odds
+
+
+# =============================================================================
+# Odds history (pre-match quotes of completed matches)
+# =============================================================================
+#: Sub-folder of the odds directory that holds the odds history. A sub-folder on purpose: every
+#: ``*.csv`` directly in the odds directory is read as a list of **current** prices by
+#: :func:`src.dashboard.state.load_odds_quotes` and ``main.load_odds_dir`` (non-recursive glob), and
+#: the quotes of matches already played must never reach the value engine.
+ODDS_HISTORY_DIRNAME: Final[str] = "history"
+#: File name of the odds history inside :data:`ODDS_HISTORY_DIRNAME`.
+ODDS_HISTORY_FILE: Final[str] = "odds_history.csv"
+#: Default location of the odds history: ``data/odds/history/odds_history.csv`` (git-ignored like all of ``data/odds``).
+ODDS_HISTORY_PATH: Final[Path] = ODDS_DIR / ODDS_HISTORY_DIRNAME / ODDS_HISTORY_FILE
+#: Columns of the odds history: the same long format as :data:`ODDS_COLUMNS` (one row per quoted selection).
+ODDS_HISTORY_COLUMNS: Final[tuple[str, ...]] = ODDS_COLUMNS
+
+
+def odds_history_path(odds_dir: Path | str = ODDS_DIR) -> Path:
+    """Where the odds history of an odds directory lives: ``<odds_dir>/history/odds_history.csv``."""
+    return Path(odds_dir) / ODDS_HISTORY_DIRNAME / ODDS_HISTORY_FILE
+
+
+def _empty_odds_history() -> pd.DataFrame:
+    frame = pd.DataFrame({c: pd.Series(dtype="string") for c in ODDS_HISTORY_COLUMNS})
+    return frame.assign(odds=pd.Series(dtype="float64"))[list(ODDS_HISTORY_COLUMNS)]
+
+
+def _odds_history_rows(odds: Iterable[OddsQuote]) -> pd.DataFrame:
+    """Long frame of quotes (one row per selection, canonical selection order of each market)."""
+    rows = [
+        {
+            "match_id": quote.match_id,
+            "bookmaker": quote.bookmaker,
+            "market": quote.market.value,
+            "selection": selection,
+            "odds": float(quote.odds[selection]),
+        }
+        for quote in odds
+        for selection in SELECTIONS[quote.market]
+        if selection in quote.odds
+    ]
+    if not rows:
+        return _empty_odds_history()
+    frame = pd.DataFrame(rows, columns=list(ODDS_HISTORY_COLUMNS))
+    for column in ("match_id", "bookmaker", "market", "selection"):
+        frame[column] = frame[column].astype("string")
+    frame["odds"] = frame["odds"].astype("float64")
+    return frame
+
+
+def _read_odds_history_file(path: Path) -> pd.DataFrame | None:
+    """The raw rows of an odds-history CSV, ``None`` when the file is missing or unreadable (logged)."""
+    if not path.is_file():
+        return None
+    try:
+        raw = pd.read_csv(path, dtype="string", keep_default_na=False)  # odds kept as text: rewritten exactly as read
+    except pd.errors.EmptyDataError:
+        return _empty_odds_history()
+    except (OSError, pd.errors.ParserError, UnicodeDecodeError, ValueError) as exc:
+        log.warning("odds history unreadable", extra={"path": str(path), "error": str(exc)})
+        return None
+    missing = [c for c in ODDS_HISTORY_COLUMNS if c not in raw.columns]
+    if missing:
+        log.warning("odds history skipped: missing columns", extra={"path": str(path), "missing": missing})
+        return None
+    return raw[list(ODDS_HISTORY_COLUMNS)]
+
+
+def save_odds_history(odds: Iterable[OddsQuote], path: Path | str = ODDS_HISTORY_PATH, *, keep_previous: bool = True) -> Path:
+    """Write the pre-match quotes of **completed** matches to the odds history; returns ``path``.
+
+    The file has the long format of :func:`save_odds` (:data:`ODDS_HISTORY_COLUMNS`:
+    ``match_id,bookmaker,market,selection,odds``, one row per selection) and is
+    what the walk-forward backtest compares the model with
+    (:func:`src.engine.backtest.market_comparison`, the ROI of the track
+    record). With ``keep_previous`` (default) the rows already in ``path`` whose
+    ``match_id`` is not among the new quotes are kept, so a competition or a
+    season that was not downloaded this time keeps its history, while the new
+    quotes of a match replace every previous row of that match. The file is
+    replaced atomically (a temporary file in the same folder, then
+    :func:`os.replace`). Only counts are logged, never a price.
+    """
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    new = _odds_history_rows(odds)
+    kept = 0
+    frame = new
+    if keep_previous:
+        previous = _read_odds_history_file(target)
+        if previous is not None and len(previous):
+            fresh_ids = set(new["match_id"].astype(str))
+            old = previous.loc[~previous["match_id"].astype(str).isin(fresh_ids).to_numpy(dtype=bool)]
+            kept = int(len(old))
+            if kept:
+                frame = pd.concat([new.astype({"odds": "object"}), old.astype("object")], ignore_index=True)
+    handle, tmp_name = tempfile.mkstemp(prefix=f".{target.name}.", suffix=".tmp", dir=str(target.parent))
+    os.close(handle)
+    tmp = Path(tmp_name)
+    try:
+        frame.to_csv(tmp, index=False)
+        os.replace(tmp, target)
+    finally:
+        if tmp.exists():
+            tmp.unlink()
+    log.info(
+        "odds history saved",
+        extra={"path": str(target), "rows": int(len(frame)), "new_rows": int(len(new)), "kept_rows": kept, "matches": int(frame["match_id"].nunique()) if len(frame) else 0},
+    )
+    return target
+
+
+def load_odds_history(path: Path | str = ODDS_HISTORY_PATH) -> pd.DataFrame:
+    """Read the odds history written by :func:`save_odds_history` into a validated long frame.
+
+    Columns :data:`ODDS_HISTORY_COLUMNS` (``match_id``, ``bookmaker``,
+    ``market``, ``selection`` as strings, ``odds`` as ``float64``). Rows with
+    an unknown market, a selection that does not belong to its market or odds
+    that are not a number ``> 1`` are dropped, then every ``(match_id,
+    bookmaker, market)`` book whose selections are not exactly the market's
+    :data:`~src.common.schemas.SELECTIONS` (incomplete or duplicated) is dropped
+    too, so every book left is complete and can be de-vigged. A missing or
+    unreadable file yields an empty frame (logged); this function never raises
+    on bad content and never logs a price.
+    """
+    target = Path(path)
+    raw = _read_odds_history_file(target)
+    if raw is None or raw.empty:
+        if raw is None:
+            log.info("odds history not found", extra={"path": str(target)})
+        return _empty_odds_history()
+    frame = raw.copy()
+    for column in ("match_id", "bookmaker", "market", "selection"):
+        frame[column] = frame[column].astype("string").str.strip()
+    frame["odds"] = pd.to_numeric(frame["odds"], errors="coerce").astype("float64")
+    valid_pairs = {(market.value, selection) for market, selections in SELECTIONS.items() for selection in selections}
+    pairs = pd.Series(list(zip(frame["market"].astype(str), frame["selection"].astype(str))), index=frame.index)
+    ok = pairs.isin(valid_pairs) & frame["odds"].gt(1.0).fillna(False) & frame["match_id"].fillna("").ne("") & frame["bookmaker"].fillna("").ne("")
+    bad_rows = int((~ok).sum())
+    frame = frame.loc[ok.to_numpy(dtype=bool)]
+    # every row is a valid (market, selection) pair now: a book is complete when it holds each selection of its
+    # market exactly once (as many rows as distinct selections as the market has)
+    keys = ["match_id", "bookmaker", "market"]
+    grouped = frame.groupby(keys, sort=False)["selection"]
+    expected = frame["market"].astype(str).map({market.value: len(selections) for market, selections in SELECTIONS.items()})
+    complete = (grouped.transform("size") == expected) & (grouped.transform("nunique") == expected)
+    n_books = int(grouped.ngroups)
+    frame = frame.loc[complete.to_numpy(dtype=bool)].reset_index(drop=True)
+    bad_books = n_books - int(frame.groupby(keys, sort=False).ngroups) if len(frame) else n_books
+    if bad_rows or bad_books:
+        log.warning("odds history: invalid rows or incomplete books dropped", extra={"path": str(target), "rows": bad_rows, "books": bad_books})
+    log.info("odds history loaded", extra={"path": str(target), "rows": int(len(frame)), "matches": int(frame["match_id"].nunique())})
+    return frame[list(ODDS_HISTORY_COLUMNS)]
 
 
 # =============================================================================

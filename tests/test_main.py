@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import csv
+import re
 from pathlib import Path
 
 import pandas as pd
@@ -95,8 +96,20 @@ def test_mini_mode_runs_end_to_end(tmp_path: Path, capsys: pytest.CaptureFixture
     risultati = pd.read_csv(out.results_export_path)
     assert list(risultati.columns) == ["AVVISO", *RESULTS_MODEL_COLUMNS] and len(risultati) == 20 and set(risultati["Esito"]) <= {"1", "X", "2"}
     assert giornata["AVVISO"].eq("DATI SIMULATI - NON USARE PER SCOMMETTERE").all() and risultati["AVVISO"].eq("DATI SIMULATI - NON USARE PER SCOMMETTERE").all()
-    assert {p.name for p in tmp_path.iterdir()} == {"DEMO_value.csv", "DEMO_value_selezioni.csv", "DEMO_value_giornata.csv", "DEMO_value_risultati.csv"}
+    # SCHEDINE (on by default): the three slips of the next matchday, after the sections, exported next to the report
+    assert {p.name for p in tmp_path.iterdir()} == {
+        "DEMO_value.csv", "DEMO_value_selezioni.csv", "DEMO_value_giornata.csv", "DEMO_value_risultati.csv", "DEMO_value_schedine.csv",
+    }
     assert f"tabella giornata scritta in: {out.matchday_export_path}" in captured and f"risultati giocati scritti in: {out.results_export_path}" in captured
+    assert "AFFIDABILITÀ MODELLO" not in captured and out.reliability is None, "the backtest is off by default in the simulated modes"
+    assert captured.index("8) SELEZIONI DI GIORNATA") < captured.index("SCHEDINE (")
+    assert [s.kind for s in out.slips] == ["X", "GG", "MISTA"] and out.slips_matchday == out.next_matchday
+    assert [s.n_legs for s in out.slips] == [5, 7, 6], "7 fixtures in the mini demo: the GG slip is short and says so"
+    assert "Solo 7 partite idonee su 10 richieste." in captured and "Le multiple moltiplicano il margine del bookmaker" in captured
+    assert out.slips_export_path == tmp_path / "DEMO_value_schedine.csv" == pipeline.slips_export_path(demo_export)
+    schedine = pd.read_csv(out.slips_export_path)
+    assert list(schedine.columns)[:3] == ["AVVISO", "Giornata", "Schedina"] and len(schedine) == 18
+    assert schedine["AVVISO"].eq("DATI SIMULATI - NON USARE PER SCOMMETTERE").all()
 
 
 def test_format_matchday_console_is_compact_and_handles_missing_prices(tmp_path: Path) -> None:
@@ -377,7 +390,7 @@ def test_console_value_table_names_the_bookmaker(tmp_path: Path, capsys: pytest.
 
 # ============================================================================ sections (--section bc|d|all, --serie-d-demo)
 from src.common.schemas import Girone  # noqa: E402
-from src.dashboard.state import SECTION_BC, SECTION_D, serie_d_gironi  # noqa: E402
+from src.dashboard.state import SECTION_B, SECTION_BC, SECTION_C, SECTION_D, serie_d_gironi  # noqa: E402
 
 SERIE_D = serie_d_gironi()
 needs_serie_d = pytest.mark.skipif(not SERIE_D, reason="no competition of family 'Serie D' in config/competitions.toml")
@@ -424,19 +437,25 @@ def test_section_all_with_the_demo_registry_runs_both_sections_with_suffixed_exp
     export = tmp_path / "value.csv"
     out = pipeline.main([*DEMO_ARGS, "--section", "all", "--export", str(export)])
     console = capsys.readouterr().out
-    assert "Sezioni: Serie B e Serie C, Serie D (--section all)" in console
-    assert console.index("SEZIONE SERIE B E SERIE C -- Perimetro: Serie C 2026/27 Gironi A/B/C + Serie B (80 squadre) · stagione corrente: 160 partite") < console.index("SEZIONE SERIE D -- Perimetro: Serie D 2026/27 Gironi A-I (162 squadre)")
-    assert console.count("3) RANKING FORZA PER COMPETIZIONE") == 2 and console.count("8) SELEZIONI DI GIORNATA") == 2 and console.count("7) EXPORT") == 2
-    assert "--- Girone A (20 squadre) ---" in console and "--- D-I (18 squadre) ---" in console
-    assert list(out.sections) == [SECTION_BC, SECTION_D]
-    bc, d = out.sections[SECTION_BC], out.sections[SECTION_D]
-    assert len(bc.matchday_frame) == 40 and len(d.matchday_frame) == 81 and len(bc.results_frame) == 160 and len(d.results_frame) == 324
-    assert len(bc.draw_picks) == len(d.draw_picks) == 5 and all(p.girone.family != "Serie D" for p in bc.draw_picks) and all(p.girone.family == "Serie D" for p in d.btts_picks)
-    # suffixed CSVs per section, the whole-perimeter value report at --export, no unsuffixed section files
-    assert bc.matchday_export_path == tmp_path / "DEMO_value_bc_giornata.csv" and d.matchday_export_path == tmp_path / "DEMO_value_d_giornata.csv"
-    assert bc.picks_export_path == tmp_path / "DEMO_value_bc_selezioni.csv" and d.results_export_path == tmp_path / "DEMO_value_d_risultati.csv"
+    # one section per league: Serie C (gironi A/B/C), Serie B and Serie D, in the order of config/competitions.toml
+    assert "Sezioni: Serie C, Serie B, Serie D (--section all)" in console
+    c_banner = console.index("SEZIONE SERIE C -- Perimetro: Serie C 2026/27 Gironi A/B/C (60 squadre) · stagione corrente: 120 partite")
+    b_banner = console.index("SEZIONE SERIE B -- Perimetro: Serie B 2026/27")
+    assert c_banner < b_banner < console.index("SEZIONE SERIE D -- Perimetro: Serie D 2026/27 Gironi A-I (162 squadre)")
+    assert console.count("3) RANKING FORZA PER COMPETIZIONE") == 3 and console.count("8) SELEZIONI DI GIORNATA") == 3 and console.count("7) EXPORT") == 3
+    assert "--- Girone A (20 squadre) ---" in console and "--- Serie B (20 squadre) ---" in console and "--- D-I (18 squadre) ---" in console
+    assert list(out.sections) == [SECTION_C, SECTION_B, SECTION_D]
+    c, b, d = out.sections[SECTION_C], out.sections[SECTION_B], out.sections[SECTION_D]
+    assert (len(c.matchday_frame), len(b.matchday_frame), len(d.matchday_frame)) == (30, 10, 81)
+    assert (len(c.results_frame), len(b.results_frame), len(d.results_frame)) == (120, 40, 324)
+    assert len(c.draw_picks) == len(d.draw_picks) == 5 and len(b.draw_picks) == 5 and all(p.girone.family == "Serie C" for p in c.draw_picks)
+    assert all(p.girone == Girone.SB for p in b.btts_picks) and all(p.girone.family == "Serie D" for p in d.btts_picks)
+    # suffixed CSVs per section (c, b, d), the whole-perimeter value report and the slips at --export, nothing unsuffixed
+    assert c.matchday_export_path == tmp_path / "DEMO_value_c_giornata.csv" and d.matchday_export_path == tmp_path / "DEMO_value_d_giornata.csv"
+    assert b.picks_export_path == tmp_path / "DEMO_value_b_selezioni.csv" and d.results_export_path == tmp_path / "DEMO_value_d_risultati.csv"
     assert {p.name for p in tmp_path.iterdir()} == {
-        f"DEMO_value{suffix}.csv" for suffix in ("", "_bc_giornata", "_bc_selezioni", "_bc_risultati", "_d_giornata", "_d_selezioni", "_d_risultati")
+        f"DEMO_value{suffix}.csv"
+        for suffix in ("", "_schedine", *(f"_{slug}_{kind}" for slug in ("c", "b", "d") for kind in ("giornata", "selezioni", "risultati")))
     }
     assert len(pd.read_csv(d.matchday_export_path)) == 81 and pd.read_csv(d.picks_export_path)["Lista"].tolist() == ["X"] * 5 + ["GG"] * 12
     assert f"tabella giornata scritta in: {d.matchday_export_path}" in console and console.count("report CSV scritto in:") == 1
@@ -444,7 +463,11 @@ def test_section_all_with_the_demo_registry_runs_both_sections_with_suffixed_exp
     assert len(out.matchday_frame) == 121 and len(out.results_frame) == 484 and out.next_matchday is not None and out.next_matchday.n_fixtures == 121
     assert len(out.draw_picks) == 5 and out.matchday_export_path is None and out.picks_export_path is None and out.results_export_path is None
     assert out.export_path == tmp_path / "DEMO_value.csv" and out.export_path.exists() and not export.exists()
+    # the slips draw from every section run: the next matchday of the three sections together
+    assert out.slips_matchday is not None and out.slips_matchday.n_fixtures == 121 and [s.n_legs for s in out.slips] == [5, 10, 6]
+    assert {leg.section for s in out.slips for leg in s.legs} <= {SECTION_C, SECTION_B, SECTION_D}
     assert pipeline.section_export_stem(export, SECTION_D, multi=True) == tmp_path / "value_d.csv" and pipeline.section_export_stem(export, SECTION_D, multi=False) == export
+    assert pipeline.section_export_stem(export, SECTION_B, multi=True) == tmp_path / "value_b.csv"
     assert pipeline.section_export_stem(export, None, multi=True) == export
 
 
@@ -465,13 +488,16 @@ def test_section_d_without_initialised_serie_d_prints_the_status_and_the_command
     # --section all (the default) prints the available section and closes with the Serie D note
     out_all = pipeline.main(["--mode", "mini", "--no-export", "--log-level", "ERROR"])
     console_all = capsys.readouterr().out
-    assert "Sezioni: Serie B e Serie C (--section all)" in console_all and list(out_all.sections) == [SECTION_BC]
-    assert console_all.index("8) SELEZIONI DI GIORNATA · Serie B e Serie C") < console_all.index("SEZIONE SERIE D -- non disponibile")
-    assert len(out_all.draw_picks) == 5 and out_all.sections[SECTION_BC].draw_picks == out_all.draw_picks
-    # --section bc never mentions Serie D
+    assert "Sezioni: Serie C (--section all)" in console_all and list(out_all.sections) == [SECTION_C]  # the mini demo has no Serie B
+    assert console_all.index("8) SELEZIONI DI GIORNATA · Serie C") < console_all.index("SEZIONE SERIE D -- non disponibile")
+    assert len(out_all.draw_picks) == 5 and out_all.sections[SECTION_C].draw_picks == out_all.draw_picks
+    assert "SEZIONE SERIE B -- non disponibile" not in console_all, "with --section all only Serie D gets the 'not available' note"
+    # --section bc (legacy alias of Serie C + Serie B) never mentions Serie D; the missing Serie B is named
     pipeline.main(["--mode", "mini", "--no-export", "--log-level", "ERROR", "--section", "bc"])
     console_bc = capsys.readouterr().out
-    assert "SEZIONE SERIE D" not in console_bc and "Sezioni: Serie B e Serie C (--section bc)" in console_bc
+    assert "SEZIONE SERIE D" not in console_bc and "Sezioni: Serie C (--section bc)" in console_bc
+    assert "SEZIONE SERIE B -- non disponibile" in console_bc and "Nessuna squadra del dizionario 2026/27 nelle competizioni di Serie B." in console_bc
+    assert SECTION_BC == "Serie B e Serie C", "the legacy name stays importable"
 
 
 @needs_serie_d
@@ -565,14 +591,24 @@ def test_real_data_console_does_not_depend_on_the_clock_and_marks_nothing_as_dem
     assert out.next_matchday is not None and set(out.next_matchday.rounds.values()) == {13} and out.next_matchday.n_fixtures == len(league.fixtures)
     assert DEMO_WARNING not in console and "già iniziate" not in console
     names = {p.name for p in export.parent.iterdir()}
-    assert names == {"value.csv", "value_selezioni.csv", "value_giornata.csv", "value_risultati.csv"} and not any(n.startswith("DEMO_") for n in names)
+    # real data: Serie C and Serie B are two sections (suffixed CSVs); the reliability section (walk-forward backtest) and
+    # the slips run by default and are exported too
+    assert names == {
+        "value.csv", "value_affidabilita.csv", "value_schedine.csv",
+        *(f"value_{slug}_{kind}.csv" for slug in ("c", "b") for kind in ("selezioni", "giornata", "risultati")),
+    } and not any(n.startswith("DEMO_") for n in names)
     for name in names:
         assert "AVVISO" not in pd.read_csv(export.parent / name).columns, name
+    assert "AFFIDABILITÀ MODELLO" in console and out.reliability is not None and out.reliability.result.n_matches > 0
+    assert console.index("2) STIMA DIXON-COLES") < console.index("AFFIDABILITÀ MODELLO") < console.index("3) RANKING")
+    affidabilita = pd.read_csv(export.parent / "value_affidabilita.csv")
+    assert affidabilita["Sezione"].iloc[0] == "Tutte le sezioni" and "match_id" not in affidabilita.columns
     # the day after the round (fixtures dated 15/11 without a time): nothing left to bet on, the quotes are excluded
     after = pipeline.main([*base, "--as-of", "2026-11-16", "--no-export"])
     console = capsys.readouterr().out
     assert after.next_matchday is None and len(after.opportunities) == len(out.opportunities)
-    assert "quote valutate: 0 " in console and f"{len(out.opportunities)} quote di partite già iniziate (o rinviate) escluse" in console
+    excluded = [int(n) for n in re.findall(r"(\d+) quote di partite già iniziate \(o rinviate\) escluse", console)]
+    assert "quote valutate: 0 " in console and len(excluded) == 2 and sum(excluded) == len(out.opportunities), "one line per section (Serie C, Serie B)"
 
 
 def test_footystats_flag_downloads_first_then_runs_on_the_real_data(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:

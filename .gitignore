@@ -20,6 +20,8 @@ data/processed/*
 data/odds/*
 !data/odds/.gitkeep
 data/*.json
+# walk-forward backtest cache of the reliability tab (out-of-sample probabilities of the user's own data)
+data/*.parquet
 # local output of the calendar check (python -m src.ingestion.calendar_snapshot / the CI step)
 ci/
 snapshot/

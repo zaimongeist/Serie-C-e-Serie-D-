@@ -2,8 +2,9 @@
 #
 # Il repository è PUBBLICO e i dati FootyStats sono concessi in licenza al titolare della chiave:
 # questo workflow NON scrive nulla nel repository, NON carica artifact e NON stampa quote né
-# statistiche. Nel log (e nel riepilogo del run) compaiono solo fatti di calendario: squadre,
-# giornate, orari, stato delle partite e risultati finali.
+# statistiche di singole partite. Nel log (e nel riepilogo del run) compaiono solo fatti di
+# calendario (squadre, giornate, orari, stato delle partite e risultati finali) e, al passo 3,
+# metriche AGGREGATE del backtest (conteggi, log loss, Brier, fasce di taratura, hit rate, ROI medio).
 #
 # Passo 1 - istantanea: calendario della stagione corrente di ogni competizione, anomalie,
 #           partite rinviate, giornata corrente e prova a secco della sincronizzazione del dizionario.
@@ -11,9 +12,15 @@
 #           (python -m src.ingestion.footystats, tutte le competizioni, 3 stagioni) in una cartella
 #           temporanea ci/ FUORI da data/, con la sincronizzazione del dizionario nella copia di lavoro
 #           (mai committata); poi la giornata corrente di ogni competizione come la mostra il prodotto.
+# Passo 3 - affidabilità del modello: il backtest walk-forward della tab «Affidabilità modello» sui
+#           CSV del passo 2 (stagione corrente e precedente, quote pre-partita dallo storico): per
+#           sezione e mercato partite valutate, log loss modello / mercato / base, Brier, fasce di
+#           taratura con i conteggi, hit rate di liste e schedine, ROI aggregato e decisione sulla
+#           ricalibrazione. MAI partite singole né quote.
 #
 # Parte da solo quando cambiano lo script di verifica, l'ingestion FootyStats, l'helper del
-# calendario o la configurazione sul branch di lavoro, oppure a mano (Run workflow).
+# calendario, il motore (backtest, calibrazione, schedine, gruppi di stima), lo stato della
+# dashboard o la configurazione sul branch di lavoro, oppure a mano (Run workflow).
 name: Verifica calendari FootyStats
 
 on:
@@ -24,6 +31,11 @@ on:
       - src/ingestion/calendar_snapshot.py
       - src/ingestion/footystats.py
       - src/engine/calendar.py
+      - src/engine/backtest.py
+      - src/engine/calibration.py
+      - src/engine/slips.py
+      - src/engine/fitgroups.py
+      - src/dashboard/state.py
       - config/competitions.toml
       - config/teams_2026_27.json
   workflow_dispatch:
@@ -78,8 +90,9 @@ jobs:
         run: |
           mkdir -p ci
           set +e
-          python -m src.ingestion.footystats --seasons 3 --no-odds \
+          python -m src.ingestion.footystats --seasons 3 \
             --out ci/matches.csv --fixtures-out ci/fixtures.csv --odds-out ci/odds.csv \
+            --odds-history-out ci/history/odds_history.csv \
             --cache-dir ci/raw --mapping ci/footystats_teams.json > ci/raccolta.txt 2> ci/raccolta-errori.txt
           status=$?
           set -e
@@ -95,6 +108,21 @@ jobs:
           if [ -f ci/giornate.md ]; then cat ci/giornate.md >> "$GITHUB_STEP_SUMMARY"; fi
           echo "Dizionario sincronizzato nella copia di lavoro (non committato):"
           git diff --stat -- config/ || true
+          exit $status
+
+      - name: Affidabilità del modello (backtest walk-forward, solo metriche aggregate)
+        if: always()
+        run: |
+          if [ ! -f ci/matches.csv ]; then
+            echo "Nessun ci/matches.csv: la raccolta del passo precedente non è riuscita, backtest saltato." | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          set +e
+          python -m src.ingestion.calendar_snapshot --reliability --matches ci/matches.csv \
+            --odds-history ci/history/odds_history.csv --summary ci/affidabilita.md --log-level ERROR > /dev/null
+          status=$?
+          set -e
+          if [ -f ci/affidabilita.md ]; then cat ci/affidabilita.md | tee -a "$GITHUB_STEP_SUMMARY"; fi
           exit $status
 
       - name: Pulizia (nessun dato FootyStats resta sul runner)

@@ -485,7 +485,7 @@ def test_legend_covers_the_terms_a_bettor_needs() -> None:
     terms = legend_terms()
     text = legend_markdown()
     assert text.startswith(f"## {LEGEND_TITLE}\n") and text.endswith("\n")
-    assert len(LEGEND) == 9 and all(isinstance(s, LegendSection) and all(isinstance(e, LegendEntry) for e in s.entries) for s in LEGEND)
+    assert len(LEGEND) == 11 and all(isinstance(s, LegendSection) and all(isinstance(e, LegendEntry) for e in s.entries) for s in LEGEND)
     titles = [s.title for s in LEGEND]
     assert titles[0].startswith("Parametri del modello") and titles[-1] == "Regole di buon senso"
     for needle in (
@@ -497,6 +497,11 @@ def test_legend_covers_the_terms_a_bettor_needs() -> None:
         "Prime giornate", "Bankroll fisso", "Mai inseguire le perdite", "Campione minimo", "quote di chiusura",
         "Giornata corrente", "Calcio d'inizio", "Stato · giocata", "Recuperi e rinvii", "Giornata n.",
         "Aggiornamento dei dati FootyStats", "Chiave FootyStats e dati locali",
+        # sections, slips and the walk-forward reliability (tabs Schedine and Affidabilità modello)
+        "Sezioni", "Abilitare Serie A o un campionato europeo", "Schedina X", "Schedina GG", "Schedina mista",
+        "Probabilità della schedina", "Margine composto", "Partite vincenti attese", "Stake suggerito della schedina",
+        "Backtest walk-forward", "Log loss", "Brier", "Base e Skill vs base", "Mercato e Skill vs mercato",
+        "Grafico di affidabilità", "Hit rate, IC 95% e ROI", "Poche vincite non sono una prova", "Ricalibrazione validata",
     ):
         assert any(needle in term for term in terms), needle
     # the rules and numbers quoted match the engine

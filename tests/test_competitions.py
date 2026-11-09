@@ -18,6 +18,7 @@ import pytest
 import main as pipeline
 from src.common import competitions as competitions_module
 from src.common.competitions import (
+    ALL_COMPETITIONS,
     COMPETITIONS,
     COMPETITIONS_PATH,
     DEFAULT_COMPETITIONS,
@@ -140,10 +141,13 @@ def sim_state():
 def test_shipped_toml_defines_the_thirteen_competitions_in_display_order() -> None:
     assert COMPETITIONS_PATH == Path(competitions_module.CONFIG_DIR) / "competitions.toml" and COMPETITIONS_PATH.is_file()
     loaded = load_competitions(COMPETITIONS_PATH)
-    assert loaded == COMPETITIONS == DEFAULT_COMPETITIONS, "the file and the built-in fallback must agree"
+    assert loaded == ALL_COMPETITIONS == DEFAULT_COMPETITIONS, "the file and the built-in fallback must agree"
+    assert COMPETITIONS == tuple(c for c in loaded if c.enabled), "COMPETITIONS holds the enabled tables only"
     assert [c.code for c in COMPETITIONS] == ["A", "B", "C", "SB", "DA", "DB", "DC", "DD", "DE", "DF", "DG", "DH", "DI"]
+    assert [c.code for c in loaded if not c.enabled] == ["SA", "EPL", "LL", "BL", "L1", "ERE", "PL1"]
     sb = competition("SB")
     assert sb == competition("sb") == Competition("SB", "Serie B", "Serie B", "Italy", "Italy Serie B", 53, 2, "Serie B", {"2024/25": 12621, "2025/26": 15632, "2026/27": 17404})
+    assert sb.enabled and sb.section == "Serie B" and sb.fit_group == "Italy"
     assert sb.to_dict()["footystats_name"] == "Italy Serie B" and sb.tier == 2
     assert competition("A").sofascore_tournament_id == 141 and competition("C").footystats_name == "Italy Serie C Group C"
     with pytest.raises(KeyError):
@@ -223,13 +227,14 @@ def test_loading_the_shipped_file_is_silent_at_info_level(caplog: pytest.LogCapt
     Only the missing/invalid-file fallbacks stay at INFO/ERROR."""
     caplog.clear()
     with caplog.at_level(logging.INFO, logger="src.common.competitions"):
-        assert competitions_module._load_or_default(COMPETITIONS_PATH) == COMPETITIONS
+        assert competitions_module._load_or_default(COMPETITIONS_PATH) == ALL_COMPETITIONS
     assert [r.getMessage() for r in caplog.records] == []
     caplog.clear()
     with caplog.at_level(logging.DEBUG, logger="src.common.competitions"):
         competitions_module._load_or_default(COMPETITIONS_PATH)
     debug = [r for r in caplog.records if r.getMessage() == "competitions loaded"]
     assert len(debug) == 1 and debug[0].levelno == logging.DEBUG and debug[0].__dict__["codes"] == [c.code for c in COMPETITIONS]
+    assert debug[0].__dict__["disabled"] == ["SA", "EPL", "LL", "BL", "L1", "ERE", "PL1"]
 
 
 # ----------------------------------------------------------------------------- dynamic enum

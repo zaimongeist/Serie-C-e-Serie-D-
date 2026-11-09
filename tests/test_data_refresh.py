@@ -381,3 +381,55 @@ def test_stale_and_kept_data_warnings_age_text(tmp_path: Path) -> None:
     assert kept_data_warnings(processed) == [
         "Serie B: non aggiornata all'ultimo download (lega non scelta): restano i dati del download precedente (30 partite, 10 in calendario)."
     ]
+
+
+# ----------------------------------------------------------------------------- odds history
+def _history_for(matches: pd.DataFrame) -> list[OddsQuote]:
+    """A complete 1X2 and GG/NG book for every played match (what FootyStats keeps on completed matches)."""
+    from src.common.schemas import Market
+
+    quotes: list[OddsQuote] = []
+    for match_id in matches["match_id"].astype(str):
+        quotes.append(OddsQuote(match_id, "FootyStats", Market.MATCH_ODDS, {"1": 2.2, "X": 3.25, "2": 3.4}))
+        quotes.append(OddsQuote(match_id, "FootyStats", Market.BTTS, {"GG": 1.9, "NG": 1.9}))
+    return quotes
+
+
+def test_refresh_writes_the_odds_history_apart_from_the_current_prices(tmp_path: Path, league) -> None:
+    from src.dashboard.data_refresh import odds_history_file
+    from src.dashboard.state import load_odds_quotes
+    from src.ingestion.harvester import load_odds_history
+
+    processed, odds_dir = tmp_path / "processed", tmp_path / "odds"
+    result = FakeResult(league.matches, list(league.fixtures), list(league.odds))
+    result.odds_history = _history_for(league.matches)  # type: ignore[attr-defined]
+    first = refresh(processed, odds_dir, competitions=["A", "B", "C", "SB"], key=SECRET, provider_factory=factory_for(ScriptedProvider(result), {}))
+    path = odds_history_file(odds_dir)
+    assert path == odds_dir / "history" / "odds_history.csv" and path.is_file()
+    assert first.n_odds_history == 2 * len(league.matches) and last_refresh(processed)["n_odds_history"] == first.n_odds_history
+    history = load_odds_history(path)
+    assert len(history) == 5 * len(league.matches) and set(history["match_id"]) == set(league.matches["match_id"].astype(str))
+    # the current prices are unchanged: the history never reaches the value engine
+    assert {q.match_id for q in load_odds_quotes(odds_dir)} == {q.match_id for q in league.odds}
+    assert not list(path.parent.glob(".*.tmp")) and SECRET not in path.read_text(encoding="utf-8")
+    # next run: Serie B is refused -> its history rows are kept, the others rewritten
+    second_result = FakeResult(
+        league.matches[league.matches["girone"] != "SB"].reset_index(drop=True),
+        [f for f in league.fixtures if f.girone.value != "SB"],
+        [q for q in league.odds if not q.match_id.startswith("SIM-SB")],
+        skipped={"SB": "league 'Italy Serie B' is not among the leagues chosen"},
+        not_chosen={"SB": "Italy Serie B"},
+    )
+    second_result.odds_history = _history_for(second_result.matches)  # type: ignore[attr-defined]
+    second = refresh(processed, odds_dir, competitions=["A", "B", "C", "SB"], key=SECRET, provider_factory=factory_for(ScriptedProvider(second_result), {}))
+    assert second.written and set(second.errors) == {"SB"} and second.n_odds_history == 2 * len(second_result.matches)
+    assert set(load_odds_history(path)["match_id"]) == set(league.matches["match_id"].astype(str))
+
+
+def test_refresh_without_odds_history_leaves_no_history_file(tmp_path: Path, league) -> None:
+    from src.dashboard.data_refresh import odds_history_file
+
+    processed, odds_dir = tmp_path / "processed", tmp_path / "odds"
+    result = refresh(processed, odds_dir, competitions=["A", "B", "C", "SB"], key=SECRET, provider_factory=factory_for(FakeProvider(league), {}))
+    assert result.ok and result.n_odds_history == 0 and not odds_history_file(odds_dir).exists() and not (odds_dir / "history").exists()
+    assert last_refresh(processed)["n_odds_history"] == 0

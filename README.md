@@ -126,9 +126,13 @@ python -m src.ingestion.footystats --sync-registry
 #    fallback manuale per i soli gironi di Serie C: SofaScore (senza chiave, solo dal proprio PC: vedi "Ingestion")
 python -m src.ingestion.harvester --gironi A B C --seasons 3 --providers sofascore
 
-# 4) pipeline sui dati reali con quote bookmaker in data/odds/*.csv (--section bc|d|all sceglie le sezioni stampate)
+# 4) pipeline sui dati reali con quote bookmaker in data/odds/*.csv (--section all | "Serie C" | serie-b | d | c,d ...
+#    sceglie le sezioni stampate); con i dati reali stampa anche AFFIDABILITÀ MODELLO (backtest walk-forward,
+#    --no-backtest per saltarla) e SCHEDINE (le 3 schedine della prossima giornata, --no-slips per saltarla)
 python main.py --processed data/processed/matches.csv --fixtures data/processed/fixtures.csv --odds data/odds
+python main.py --processed data/processed/matches.csv --odds data/odds --section serie-b --slip-mixed 8
 python main.py --mode full --rounds 6 --history 0 --serie-d-demo --section d   # la sezione Serie D su dati sintetici
+python main.py --mode full --history 1 --backtest                              # demo con la sezione AFFIDABILITÀ MODELLO
 
 # 5) dashboard interattiva sui dati reali di data/processed (scaricati con la tua chiave); senza dati mostra la pagina
 #    iniziale che spiega come configurare la chiave, MAI una lega simulata al loro posto
@@ -136,6 +140,7 @@ streamlit run src/dashboard/app.py
 #    demo esplicita su dati inventati (banner rosso su ogni pagina, mai per scommettere): SERIEC_DEMO=1
 #    (SERIEC_FORCE_SIMULATE=1 è l'alias deprecato); altre variabili: SERIEC_SEASON=2026_27  SERIEC_HISTORY=2
 #    SERIEC_AS_OF=2026-11-06  SERIEC_SIM_ROUNDS=15 (solo demo: giornate fisse invece del calendario)  SERIEC_SEED=7
+#    SERIEC_BACKTEST=auto|manual|off (backtest della tab Affidabilità modello: all'avvio, su richiesta o mai)
 
 # test
 python -m pytest -q
@@ -200,6 +205,32 @@ simulatore, console e dashboard iterano l'enum, mai una lista A/B/C.
 Ogni riga porta anche i season id FootyStats 2024/25–2026/27 (`[competition.season_ids]`, verificati il 6 novembre
 2026); `–` = `sofascore_tournament_id = 0`, la competizione non è servita da SofaScore
 (`Competition.supports_provider('sofascore')` è falso).
+
+### Sezioni, gruppi di stima e campionati da abilitare (Serie A, Europa)
+
+Ogni `[[competition]]` ha due chiavi facoltative: `enabled = true|false` (default `true`) e `section = "..."` (default:
+la `family`). Le **sezioni** sono le pagine della dashboard e della console, nell'ordine in cui compaiono nel file:
+con il file distribuito `Serie C` (gironi A, B, C), `Serie B` e `Serie D` (gironi A-I), ognuna con la propria pagina
+(la vecchia pagina unica «Serie B e Serie C» è divisa in due; il nome resta accettato come alias, per esempio
+`main.py --section bc`). Il **gruppo di stima** è il `country`: le competizioni dello stesso paese sono stimate
+**insieme** da un solo modello Dixon-Coles (Serie B, C e D sono collegate dalle squadre promosse e retrocesse), paesi
+diversi **separatamente** (`src/engine/fitgroups.py`, `fit_by_group`; ottimizzatore L-BFGS-B di default, circa 40
+volte più veloce di SLSQP a parità di ottimo; SLSQP resta selezionabile in *Opzioni del modello* e con `--method SLSQP`).
+
+Il file contiene già, **disabilitati**, Serie A (`SA`, primo nel file: abilitata diventa la prima sezione ed entra nel
+gruppo `Italy`), Premier League (`EPL`), La Liga (`LL`), Bundesliga (`BL`), Ligue 1 (`L1`), Eredivisie (`ERE`) e
+Primeira Liga (`PL1`). Una competizione disabilitata non esiste per il resto del codice (niente enum, raccolta, sezione,
+gruppo di stima; la sua chiave nel dizionario squadre viene ignorata con una riga di log). **Per abilitarne una**:
+
+1. metti `enabled = true` nella sua tabella di `config/competitions.toml`;
+2. scegli la lega sull'account footystats.org (*Choose leagues*: l'API rifiuta i dati di una lega non scelta e i piani
+   limitano il numero di leghe);
+3. premi **Aggiorna dati ora** nella dashboard (o lancia `python -m src.ingestion.footystats`): la sincronizzazione del
+   dizionario riempie le sue squadre in `config/teams_<stagione>.json` da `/league-teams`, poi ne vengono scaricate
+   partite, calendario e quote. Al riavvio compare la nuova sezione (un campionato estero ha il suo gruppo di stima).
+
+`enabled = false` lo spegne di nuovo, in modo reversibile. Per un campionato non elencato aggiungi una tabella con le
+stesse chiavi e segui i passi 2 e 3.
 
 ### Serie D (Gironi A–I)
 
@@ -502,25 +533,68 @@ python -m src.ingestion.harvester --season 2026_27 --season-id 77031
   risolto a ogni esecuzione) risultano giocate, la prima successiva è il turno da prevedere; `SERIEC_SIM_ROUNDS=N`
   fissa le giornate giocate, `SERIEC_HISTORY` (0-2, default 2) aggiunge stagioni sintetiche precedenti, `SERIEC_SEED`
   il seme. Con il dizionario reale completo (Serie B, Serie C e Serie D, 242 squadre) la prima stima della demo
-  richiede alcuni minuti; poi resta in cache. Le cartelle dei dati reali si cambiano con `SERIEC_PROCESSED_DIR` /
+  richiede qualche secondo (più il backtest della tab Affidabilità modello); poi resta in cache. Le cartelle dei dati reali si cambiano con `SERIEC_PROCESSED_DIR` /
   `SERIEC_ODDS_DIR`.
 - **Perimetro sempre dichiarato**: badge della sidebar e sottotitolo della pagina riportano il perimetro derivato da
   `config/competitions.toml` e dal dizionario, mai cablato (`Perimetro: Serie C 2026/27 Gironi A/B/C + Serie B (80
-  squadre) · N partite stagione corrente · M partite storiche (2024/25-2025/26)` per la sezione Serie B e Serie C); la
+  squadre) · N partite stagione corrente · M partite storiche (2024/25-2025/26)` per l'intero perimetro, ristretto alla sezione scelta nella dashboard); la
   console di `main.py` apre con la stessa frase e stampa il riepilogo per stagione (partite, squadre attuali e storiche).
-- **Sezione Serie D (esclusiva)**: la sidebar apre con il selettore **Sezione** (`Serie B e Serie C`, default, oppure
-  `Serie D`). La stima Dixon-Coles resta **una sola** per tutto il perimetro (B + C + D: le squadre promosse e
-  retrocesse collegano le divisioni, il fattore campo e il vincolo Σα = 0 per competizione tengono i gironi
-  confrontabili), ma tutto ciò che si vede è della sezione scelta: titoli dei tab (`Classifica di forza · Serie D`),
-  selettore Competizione (`Tutti` + `D-A` … `D-I`), tabella giornata, risultati, pannello valore, alert
+- **Sezioni**: la sidebar apre con il selettore **Sezione**: una pagina per campionato, dalle sezioni di
+  `config/competitions.toml` (`Serie C` di default, `Serie B`, `Serie D`, e ogni campionato abilitato: vedi «Sezioni,
+  gruppi di stima e campionati da abilitare»). La stima Dixon-Coles è **una per paese** (Serie B, C e D insieme: le
+  squadre promosse e retrocesse collegano le divisioni, il fattore campo e il vincolo Σα = 0 per competizione tengono i
+  gironi confrontabili), ma tutto ciò che si vede è della sezione scelta: titoli dei tab (`Classifica di forza · Serie
+  D`), selettore Competizione (`Tutti` + `D-A` … `D-I`), tabella giornata, risultati, pannello valore, alert
   REGRESSION_TRAP, selezioni (le 5 X / 12 GG sono calcolate **dentro** la sezione), export e la frase del perimetro
-  (`Perimetro: Serie D 2026/27 Gironi A-I (162 squadre) · …`). Le giornate di Serie D sono costruite dalle sue giornate
-  ufficiali e non spostano quelle di Serie B / Serie C; la giornata, la partita e i filtri scelti sono per sezione
-  (`st.session_state["matchday_d"]`, `fixture_d`, …). Le liste squadre dei nove gironi vengono da FootyStats e si
-  riallineano a ogni aggiornamento; finché non ci sono partite di Serie D nei dati ogni tab mostra un solo avviso con lo
-  stato e il comando di raccolta. Le statistiche di Serie D su FootyStats sono più povere e tutto degrada senza errori:
-  xG e tiri spesso mancano (colonne `-`, λ e μ stimati dai gol), senza xG il filtro REGRESSION_TRAP non scatta,
-  le quote coprono meno partite (pannello valore in parte vuoto, con una nota).
+  (`Perimetro: Serie D 2026/27 Gironi A-I (162 squadre) · …`). Le giornate di ogni sezione sono costruite dalle sue
+  giornate ufficiali; la giornata, la partita e i filtri scelti sono per sezione (`st.session_state["matchday_d"]`,
+  `fixture_b`, …). Una sezione configurata ma senza dati (Serie D prima della prima raccolta, un campionato appena
+  abilitato) mostra in ogni tab un solo avviso con lo stato e come scaricarla. Le statistiche di Serie D su FootyStats
+  sono più povere e tutto degrada senza errori: xG e tiri spesso mancano (colonne `-`, λ e μ stimati dai gol), senza
+  xG il filtro REGRESSION_TRAP non scatta, le quote coprono meno partite (pannello valore in parte vuoto, con una nota).
+- **Affidabilità modello** (tab, `src/engine/backtest.py`, `src/engine/calibration.py`): quanto le probabilità del
+  modello hanno «preso» i risultati, misurato **fuori campione**: un **backtest walk-forward** prevede ogni giornata
+  passata (blocco della settimana) con un modello stimato **solo** sulle partite giocate prima (stesso decadimento,
+  stessa prior, storico incluso, L-BFGS-B ripartendo dalla stima della settimana prima); le probabilità della stima di
+  produzione, che ha già visto quei risultati, non sono mai usate per giudicare. Di default stagione corrente e
+  precedente (selettore *Stagioni valutate*), per la sezione della sidebar o *Tutte le sezioni*: riquadri (partite
+  valutate, log loss modello contro le frequenze di base, *Modello vs mercato* con le due log loss sulle **stesse**
+  partite con quote, Brier, accuratezza), tabella per mercato (1X2, GG/NG, Over/Under 1.5/2.5/3.5) con le frequenze di
+  base del campionato e le probabilità **senza margine** del bookmaker (quote pre-partita delle partite giocate,
+  `data/odds/history/odds_history.csv`). Il mercato si misura solo sulle *Partite con quote*: accanto alle sue colonne
+  ci sono *Log loss modello (partite con quote)* e *Brier modello (partite con quote)*, gli unici numeri del modello
+  confrontabili con il bookmaker (la copertura delle quote cambia da campionato a campionato); lo stesso vale per
+  l'export, la console e il riepilogo CI. Poi il grafico di affidabilità (probabilità prevista contro frequenza osservata
+  con le barre di Wilson al 95%, selettore dell'esito), la tabella per competizione, il track record delle liste top 5
+  X / top 12 GG, delle **multiple top-k** (le prime 2-5 partite della lista di ogni giornata giocate insieme, con il
+  dettaglio giornata per giornata), delle tre schedine e delle singole di valore (hit rate con intervallo di Wilson, ROI
+  alle quote reali con intervallo al 95%, numero di giornate) e la spiegazione del perché poche vincite non sono una
+  prova. Il backtest gira una volta per versione dei dati (barra di avanzamento), resta in memoria ed è salvato in
+  `data/backtest.parquet` / `data/backtest.json` (esclusi da git), insieme alla ricalibrazione giornata per giornata
+  (`data/backtest_rolling.*`, calcolata subito dopo il backtest e riletta al riavvio); la chiave della cache contiene la
+  versione della logica e la configurazione delle competizioni, quindi spegnere o spostare un campionato in
+  `config/competitions.toml` lo fa ricalcolare (le righe di un campionato disattivato non arrivano mai alle viste).
+  `SERIEC_BACKTEST=manual` lo calcola solo con il pulsante, `off` mai. Scarica i punteggi aggregati in CSV.
+- **Ricalibrazione validata** («imparare dal differenziale»): sullo stesso backtest una piccola correzione per mercato
+  (Platt su GG/NG e Over/Under, temperatura multinomiale sull'1X2, penalità verso l'identità; parametri propri per
+  famiglia solo con abbastanza partite) è stimata sulle giornate più vecchie e giudicata sulle più recenti; si applica
+  **solo** ai mercati in cui la log loss fuori campione migliora almeno dello 0,5%. Il tab dice *Calibrazione
+  applicata: sì/no* con il miglioramento per mercato; l'interruttore **Usa probabilità ricalibrate** (acceso di default
+  solo se un mercato ha superato la verifica) la applica a Giornata (con la probabilità originale accanto, colonne
+  `orig.`), Opportunità di Valore, Selezioni e Schedine, ed è reversibile. Facoltativa e lenta, l'ottimizzazione di ξ e
+  della forza della prior (9 combinazioni, log loss walk-forward) sceglie la combinazione sulle giornate più vecchie
+  della stagione e la conferma sul 30% più recente: il secondo interruttore che la applica si accende solo se lì batte la
+  configurazione standard di almeno lo 0,5%, e con la combinazione applicata la tab avvisa che le giornate della scelta
+  non sono più del tutto fuori campione.
+- **Schedine** (tab): per la giornata scelta (segue quella degli altri tab) e le sezioni scelte (di default tutte quelle
+  con dati), fra le partite non ancora iniziate, tre schedine: **X** (5 partite con la X più probabile), **GG** (10
+  partite con il GG più probabile) e **mista** (per ogni partita il segno più probabile fra 1, 2, GG e Over 2.5, poi le
+  6 partite — da 3 a 10 — in cui quel segno è più probabile). Lunghezze, probabilità minima per partita e «solo partite
+  quotate» sono regolabili. Per ogni schedina: partite, probabilità (prodotto, ipotesi di indipendenza dichiarata),
+  quota fair, quota book (prodotto delle migliori quote, solo se tutte quotate), EV, partite vincenti attese, stake
+  suggerito (Kelly frazionario sulla schedina con tetto di 1 unità, «non consigliata» con EV ≤ 0) e l'avviso che le
+  multiple moltiplicano il margine del bookmaker; CSV con le tre schedine e, sotto, come sarebbero andate le stesse
+  schedine nelle giornate passate del backtest.
 - **Selettore Competizione**: `Tutti` + l'etichetta breve di ogni competizione configurata della sezione (`Girone A`,
   `Girone B`, `Girone C`, `Serie B`; `D-A` … `D-I` in Serie D); filtra classifica, partite e opportunità.
 - **Classifica Forza**: solo le squadre correnti del dizionario, colonna *Competizione* = competizione del dizionario
@@ -583,7 +657,7 @@ python -m src.ingestion.harvester --season 2026_27 --season-id 77031
 - **Selezioni di giornata** (tab omonimo e sezione `8) SELEZIONI DI GIORNATA` della console): per la giornata scelta,
   fra le sole partite **ancora da giocare** (calcio d'inizio non ancora passato: una partita iniziata esce dalle liste,
   dal pannello valore e dall'export delle previsioni), le **5 partite più probabili da X** e le **12 partite più probabili da GG**
-  fra le competizioni della sezione (Serie B e Serie C gironi A/B/C insieme, oppure i nove gironi di Serie D insieme),
+  fra le competizioni della sezione (i tre gironi di Serie C insieme, la Serie B, oppure i nove gironi di Serie D insieme),
   ordinate solo per probabilità del modello, con quota fair, miglior quota book, bookmaker, EV e flag quando una
   quota esiste, più una nota («lambda e mu vicini», «pochi gol attesi», «xG attese alte», «entrambi gli attacchi sopra
   1.2 gol attesi»). Le dimensioni si cambiano con i controlli *N risultati X* / *N partite GG* (console: `--n-draws`,
@@ -604,13 +678,21 @@ python -m src.ingestion.harvester --season 2026_27 --season-id 77031
   rinviate (la sezione 5 esclude le quote delle partite già iniziate); con
   `--export` scrive anche la tabella completa in `<export>_giornata.csv` e i risultati giocati della stagione corrente
   (con P esito e Sorpresa) in `<export>_risultati.csv`, accanto al report valore e alle selezioni.
-  **Sezioni a console**: `--section bc|d|all` (default `all`). Le fasi 1-2 (dataset, stima) sono uniche per tutto il
-  perimetro; le fasi 3-8 (ranking per competizione, tabella giornata, valore, alert, selezioni 5 X / 12 GG calcolate
-  dentro la sezione) sono stampate **una volta per sezione**, ognuna con il proprio banner (`SEZIONE SERIE D --
-  Perimetro: Serie D 2026/27 Gironi A-I (162 squadre) · …`). Corrono solo le sezioni con squadre; con più sezioni i CSV
-  portano il suffisso della sezione (`<export>_bc_giornata.csv`, `<export>_d_giornata.csv`, `_d_selezioni.csv`,
-  `_d_risultati.csv`), il report valore in `--export` copre sempre tutto il perimetro. `--serie-d-demo` (solo
-  `--mode full` simulato) aggiunge un dizionario sintetico di Serie D (9 gironi × 18 squadre, `Squadra DA 01` …).
+  **Sezioni a console**: `--section` (default `all`) accetta `all`, il nome o la sigla di una sezione o un elenco
+  separato da virgole (`"Serie C"`, `serie-b`, `b`, `c,d`) e gli alias `bc` (Serie C e Serie B) e `d`. Le fasi 1-2
+  (dataset, stima per paese) sono uniche; le fasi 3-8 (ranking per competizione, tabella giornata, valore, alert,
+  selezioni 5 X / 12 GG calcolate dentro la sezione) sono stampate **una volta per sezione**, ognuna con il proprio
+  banner (`SEZIONE SERIE D -- Perimetro: Serie D 2026/27 Gironi A-I (162 squadre) · …`). Corrono solo le sezioni con
+  squadre; con più sezioni i CSV portano la sigla della sezione (`<export>_c_giornata.csv`, `<export>_b_giornata.csv`,
+  `<export>_d_selezioni.csv`, …), il report valore in `--export` copre sempre tutto il perimetro. `--serie-d-demo`
+  (solo `--mode full` simulato) aggiunge un dizionario sintetico di Serie D (9 gironi × 18 squadre, `Squadra DA 01` …).
+  **AFFIDABILITÀ MODELLO** (dopo la stima; di default con i dati reali, `--backtest` / `--no-backtest`,
+  `--backtest-seasons 1|2|3`): il backtest walk-forward con i punteggi aggregati per sezione e mercato (il modello
+  accanto al mercato sulle stesse partite con quote), il track record di liste, multiple top-k delle liste per sezione
+  e schedine e la decisione sulla ricalibrazione, applicata alle probabilità delle fasi seguenti solo se
+  migliora fuori campione (`--no-recalibration` per le probabilità originali); CSV `<export>_affidabilita.csv`.
+  **SCHEDINE** (alla fine, `--slips` / `--no-slips`, lunghezze `--slip-x 5`, `--slip-gg 10`, `--slip-mixed 6`): le tre
+  schedine della prossima giornata delle sezioni stampate; CSV `<export>_schedine.csv`.
 - **Legenda** (tab omonimo, ultimo): il glossario qui sotto, generato da `src/dashboard/legend.py`
   (`legend_markdown()`), con un esempio svolto («Come leggere una riga del pannello valore») su una riga del pannello
   valore così come è filtrato in quel momento (giornata scelta o tutte, competizione della sidebar, soglia EV): la
@@ -629,9 +711,9 @@ Glossario di tutti i numeri mostrati da dashboard, console ed export, scritto pe
 ### Parametri del modello (tab Classifica Forza)
 
 - **α (alfa) · Forza offensiva** — quanto una squadra segna più o meno della media della sua competizione, su scala logaritmica: 0 = attacco medio del girone, +0.3 ≈ 35% di gol in più (exp(0.3) = 1.35), −0.3 ≈ 26% in meno. È centrata per competizione (la somma degli α di un girone è zero): confronta gli α solo dentro la stessa competizione, un +0.2 in Serie B e un +0.2 nel girone C non misurano la stessa cosa.
-- **β (beta) · Solidità difensiva** — quanto una squadra fa segnare meno della media: più alto = subisce meno (β = +0.3 ≈ 26% di gol subiti in meno, β negativo = difesa che concede più della media). Entra nei gol attesi dell'avversario con il segno meno (λ = exp(α_casa − β_ospite + γ)).
+- **β (beta) · Solidità difensiva** — quanto una squadra fa segnare poco gli avversari: più alto = subisce meno. Entra nei gol attesi dell'avversario con il segno meno (λ = exp(α_casa − β_ospite + γ)). A differenza di α, β NON è centrata su zero: la media dei β di una competizione fa da livello base dei gol di quel campionato, quindi il valore assoluto non dice nulla e β = 0 non significa "difesa media". Leggila in confronto: 0.3 di β in più di un'altra squadra della stessa competizione ≈ 26% di gol subiti in meno (exp(−0.3) = 0.74); sopra la media dei β del girone = difesa migliore della media, sotto = peggiore.
 - **γ (gamma) · Vantaggio casa** — fattore campo stimato per ogni competizione (uno per girone, uno per la Serie B), non per squadra: i gol attesi della squadra di casa sono moltiplicati per exp(γ). γ = 0.25 ⇒ ×1.28, cioè circa il 28% di gol in più di quanti ne farebbe in campo neutro. Valori tipici 0.15-0.35.
-- **Indice Attacco / Indice Difesa** — exp(α) ed exp(β): gli stessi parametri in scala moltiplicativa, 1.00 = media del girone, 1.20 = +20%, 0.85 = −15%. Più comodi di α e β per farsi un'idea veloce.
+- **Indice Attacco / Indice Difesa** — exp(α) ed exp(β): gli stessi parametri in scala moltiplicativa. Indice Attacco 1.00 = attacco medio del girone, 1.20 = +20%, 0.85 = −15%. L'Indice Difesa non ha 1.00 come media (β non è centrata): si legge per rapporto, se una squadra ha indice difesa 1.20 volte quello di un'altra della stessa competizione, a parità di avversario subisce circa 1/1.20 ≈ 17% di gol in meno.
 - **ρ (rho) · Correlazione bassi punteggi** — correzione di Dixon-Coles ai risultati 0-0, 1-0, 0-1 e 1-1. Con ρ negativo (tipico, tra −0.05 e −0.15) il modello prevede più 0-0 e 1-1 (e meno 1-0 / 0-1) di due Poisson indipendenti: i pareggi a basso punteggio salgono, con ρ = −0.10 la X guadagna circa 2-3 punti percentuali. ρ = 0 equivale a gol di casa e ospiti indipendenti. È unico per tutto il perimetro.
 - **ξ (xi) · Decadimento temporale** — peso delle partite nel tempo: ogni gara pesa exp(−ξ·giorni trascorsi). Con ξ = 0.0018 una partita di un anno fa vale circa il 52% di una di oggi, una di due anni fa il 27%: lo storico delle tre stagioni aiuta la stima ma conta sempre meno della stagione in corso. ξ = 0 (dati simulati) pesa tutto allo stesso modo.
 - **Prior gaussiana · Stima MAP** — a inizio stagione ci sono poche partite e la stima «pura» (massima verosimiglianza, MLE) esagera: una squadra con due vittorie 4-0 sembrerebbe imbattibile. La prior tira i parametri verso valori normali (α verso 0 e β verso la media del suo girone, entrambi con deviazione standard 0.30, γ verso 0.25 ± 0.15, ρ verso 0 ± 0.10) e la stima diventa «MAP» (massimo a posteriori). Si attiva da sola finché la competizione meno coperta ha meno di 15 partite giocate per squadra nella stagione corrente (con 20 squadre per girone: fino alla 14ª giornata inclusa); il badge della sidebar dice se è attiva. Con una stagione intera i dati dominano e MAP ≈ MLE.
@@ -692,11 +774,38 @@ Glossario di tutti i numeri mostrati da dashboard, console ed export, scritto pe
 
 ### Selezioni di giornata (tab Selezioni di giornata)
 
-- **Giornata** — la giornata corrente di ogni competizione della sezione scelta (Serie B e i tre gironi di Serie C, oppure i nove gironi di Serie D), messe insieme qualunque sia il loro numero (Serie B all'11ª, gironi di Serie C alla 13ª) e con le partite già giocate incluse; le giornate successive raggruppano i turni seguenti giocati nello stesso blocco della settimana calcistica: fine settimana (venerdì-lunedì) oppure turno infrasettimanale (martedì-giovedì). Una competizione che in quel blocco non gioca (Serie B in sosta per le nazionali) manca dall'etichetta. Le liste X e GG considerano solo le partite ancora da giocare (calcio d'inizio non ancora passato: una partita iniziata esce dalle liste e dal pannello valore); rinvii e recuperi fuori turno non spostano la giornata (sono in «Recuperi e rinvii»). Le giornate di Serie D sono raggruppate a parte, dal suo calendario: non spostano quelle di Serie B e Serie C.
-- **Le 5 partite più probabili da X** — fra tutte le partite della giornata della sezione scelta (Serie B e Serie C gironi A, B e C insieme, oppure i nove gironi di Serie D insieme), le cinque con la probabilità di pareggio più alta secondo il modello. Ordinate **solo per probabilità**, non per valore: una X al 33% a quota 2.90 (EV −4%) sta in lista anche se non conviene. Nota «lambda e mu vicini» = squadre equilibrate, «pochi gol attesi» = gara chiusa: entrambe spingono il pareggio.
+- **Giornata** — la giornata corrente di ogni competizione della sezione scelta (i tre gironi di Serie C, la Serie B, i nove gironi di Serie D o un campionato abilitato), messe insieme qualunque sia il loro numero (gironi di Serie C alla 13ª, D-A alla 12ª) e con le partite già giocate incluse; le giornate successive raggruppano i turni seguenti giocati nello stesso blocco della settimana calcistica: fine settimana (venerdì-lunedì) oppure turno infrasettimanale (martedì-giovedì). Una competizione che in quel blocco non gioca (Serie B in sosta per le nazionali) manca dall'etichetta. Le liste X e GG considerano solo le partite ancora da giocare (calcio d'inizio non ancora passato: una partita iniziata esce dalle liste e dal pannello valore); rinvii e recuperi fuori turno non spostano la giornata (sono in «Recuperi e rinvii»). Ogni sezione raggruppa le giornate dal proprio calendario: le 34 giornate di Serie D non spostano quelle di Serie C o di Serie B.
+- **Le 5 partite più probabili da X** — fra tutte le partite della giornata della sezione scelta (i tre gironi di Serie C insieme, la Serie B, oppure i nove gironi di Serie D insieme), le cinque con la probabilità di pareggio più alta secondo il modello. Ordinate **solo per probabilità**, non per valore: una X al 33% a quota 2.90 (EV −4%) sta in lista anche se non conviene. Nota «lambda e mu vicini» = squadre equilibrate, «pochi gol attesi» = gara chiusa: entrambe spingono il pareggio.
 - **Le 12 partite più probabili da GG** — le dodici partite della giornata, su tutte le competizioni della sezione, con la probabilità più alta che entrambe le squadre segnino. Stesso criterio: solo probabilità del modello. Nota «xG attese alte» = tanti gol attesi in totale, «entrambi gli attacchi sopra 1.2 gol attesi» = nessuna delle due dovrebbe restare a secco.
 - **«Più probabile» non è «conveniente»** — la probabilità dice quante volte l'esito accade, la quota dice quanto paga: un GG al 65% pagato 1.45 (fair 1.54) perde soldi nel lungo periodo, un GG al 55% pagato 2.00 (fair 1.82) li guadagna. Le colonne Quota Fair, Quota Book ed EV sono lì per questo: incrocia sempre la lista con la quota e con l'EV prima di puntare, e dà la precedenza alle righe che compaiono anche nel pannello valore.
 - **Nessuna quota in lista** — se Quota Book, Bookmaker ed EV sono vuoti nessun bookmaker nei dati quota quella selezione: la lista resta utile per sapere dove guardare, il prezzo va cercato a mano.
+
+### Schedine (tab Schedine)
+
+- **Schedina X** — le 5 partite della giornata (5 di default, regolabile) con la probabilità di pareggio più alta secondo il modello, fra le sezioni scelte e solo fra le partite non ancora iniziate; una partita entra al massimo una volta per schedina. Stesso criterio della lista X: probabilità, non valore.
+- **Schedina GG** — le 10 partite (default) con la probabilità più alta che entrambe le squadre segnino.
+- **Schedina mista** — per ogni partita il segno più probabile fra 1, 2, GG e Over 2.5 secondo il modello, poi le 6 partite (da 3 a 10) in cui quel segno è più probabile: integra le partite con la probabilità più alta per il loro segno. Con «Solo partite quotate» il segno si sceglie fra quelli che hanno una quota; «P minima» esclude i segni sotto la soglia.
+- **Probabilità della schedina** — il prodotto delle probabilità delle singole partite, nell'ipotesi che le partite siano indipendenti (un'ipotesi, non un fatto: due gare dello stesso girone con lo stesso arbitro o lo stesso meteo non lo sono del tutto). Cinque X al 35% fanno 0,35⁵ ≈ 0,5%: una schedina su 190. Quota fair = 1 / probabilità.
+- **Quota book ed EV della schedina** — la quota book è il prodotto delle migliori quote delle partite, solo quando tutte sono quotate; EV = probabilità × quota book − 1. Se una partita non ha quota, quota book ed EV restano vuoti.
+- **Margine composto** — una multipla moltiplica il margine del bookmaker: con il 5% per partita, 5 partite cedono circa il 22% della vincita equa e 10 partite quasi il 39%. Per questo una schedina lunga ha quasi sempre EV negativo anche quando ogni partita è «probabile»: le singole di valore (tab Opportunità) sono il modo più efficiente di sfruttare un vantaggio.
+- **Partite vincenti attese** — la somma delle probabilità delle partite: quante ne indovini in media. Con 10 GG al 62% sono circa 6, e la schedina intera si vince solo se sono 10.
+- **Stake suggerito della schedina** — Kelly frazionario sulla schedina intera (la frazione della sidebar), con un tetto di 1 unità; «non consigliata» quando l'EV è negativo o manca una quota. È volutamente piccolo: la varianza di una multipla è enorme.
+- **Track record delle schedine** — le stesse tre schedine ricostruite per ogni giornata passata con le probabilità fuori campione del backtest: giornate, schedine vinte contro quelle attese, percentuale di gambe vinte e ROI alle quote reali quando ci sono, con intervallo di confidenza al 95%.
+
+### Affidabilità del modello (tab Affidabilità modello)
+
+- **Backtest walk-forward** — ogni giornata passata (blocco della settimana calcistica) è prevista da un modello stimato solo sulle partite giocate prima del suo calcio d'inizio, con lo stesso decadimento, la stessa prior e lo storico di produzione. Sono le probabilità che il modello avrebbe pubblicato allora: la stima di produzione ha già visto quei risultati e non va mai usata per giudicare la precisione. Di default si valutano la stagione corrente e la precedente.
+- **Log loss** — −ln della probabilità data all'esito avvenuto, in media: più bassa è meglio. Un modello che dà sempre 1/3 a 1, X e 2 fa 1,099; le frequenze di base di un campionato intorno a 1,07-1,09; un buon modello e i bookmaker fra 0,98 e 1,03 sull'1X2. Punisce molto le sicurezze sbagliate (un 90% che non esce costa più di dieci 55% sbagliati).
+- **Brier** — errore quadratico medio fra probabilità ed esito (1X2 da 0 a 2, mercati a due esiti da 0 a 1): più basso è meglio, meno severo della log loss con gli errori rari.
+- **Accuratezza (%)** — quante volte l'esito più probabile secondo il modello è avvenuto. Utile ma ingannevole: sull'1X2 il segno 1 vince spesso anche senza modello; conta che le probabilità siano giuste, non solo il favorito.
+- **Base e Skill vs base** — la base sono le frequenze di 1/X/2, GG e Over del campionato nei 365 giorni precedenti (quello che sa chi non ha un modello). Skill vs base = 1 − log loss modello / log loss base: positiva = il modello batte le frequenze di base. È il primo esame da superare.
+- **Mercato e Skill vs mercato** — le probabilità del bookmaker senza margine (quote pre-partita delle partite giocate, dallo storico FootyStats), valutate solo sulle «Partite con quote». Il modello va confrontato con il mercato sulle stesse partite: le colonne «Log loss modello (partite con quote)» e «Brier modello (partite con quote)» e il riquadro «Modello vs mercato»; «Log loss modello» copre tutte le partite valutate, anche quelle senza quote (la copertura cambia da campionato a campionato), e non è confrontabile con il mercato. Skill vs mercato = 1 − log loss modello / log loss mercato sulle stesse partite: battere il mercato è raro; un valore negativo di poco è normale e non impedisce di trovare singole di valore, uno molto negativo invita alla prudenza sugli EV.
+- **Grafico di affidabilità** — le partite sono raggruppate per probabilità prevista (fasce di 10 punti): in orizzontale la probabilità media della fascia, in verticale quante volte l'esito è avvenuto, con la barra dell'intervallo di Wilson al 95%. Sulla diagonale il modello è tarato; sopra la diagonale è troppo prudente (l'esito accade più spesso), sotto è troppo sicuro. Una fascia con poche partite ha la barra lunga: non trarne conclusioni.
+- **Hit rate, IC 95% e ROI** — hit rate = selezioni vinte / selezioni, con l'intervallo di Wilson al 95%; va confrontato con la «P media» del modello (se coincidono, il modello è tarato). ROI = profitto / puntate a puntata fissa sulla miglior quota pre-partita, con un intervallo al 95% (approssimazione normale): finché l'intervallo contiene lo zero il guadagno non si distingue dalla fortuna.
+- **Multiple top-k delle liste** — le prime k partite (da 2 a 5) della lista X o GG di ogni giornata passata giocate insieme, per sezione o per tutte le sezioni: è la giocata «le prime 2 GG della Serie C» ripetuta su ogni giornata. Giornate, multiple vinte contro quelle attese (somma dei prodotti delle probabilità, indipendenza ipotizzata), win rate con intervallo di Wilson e ROI alle quote reali; il dettaglio giornata per giornata è in «Liste giornata per giornata».
+- **Poche vincite non sono una prova** — una domenica con la schedina vinta (100 € con 5 €) o due GG azzeccati capitano anche senza alcun vantaggio: contano il numero di giornate e di partite valutate e gli intervalli di confidenza, non l'aneddoto.
+- **Ricalibrazione validata** — imparare dal differenziale fra previsioni ed esiti: per ogni mercato una piccola correzione (Platt su GG/NG e Over/Under, temperatura multinomiale sull'1X2, con penalità verso «nessuna correzione»; parametri propri per Serie B, C o D solo con abbastanza partite) è stimata sulle giornate più vecchie del backtest e giudicata su quelle più recenti. Si applica solo ai mercati in cui la log loss fuori campione migliora almeno dello 0,5%; altrimenti restano le probabilità originali. «Calibrazione applicata: sì/no, miglioramento log loss X%» lo dice; l'interruttore «Usa probabilità ricalibrate» la accende o la spegne (è reversibile: il modello non viene toccato) e la tabella Giornata mostra accanto la probabilità originale («orig.»).
+- **Ottimizzazione di xi e prior** — facoltativa: ripete il backtest della stagione corrente per 9 combinazioni di decadimento (ξ 0,001 / 0,0018 / 0,003) e forza della prior. La combinazione è scelta sulle giornate più vecchie e confermata sul 30% più recente, che la scelta non ha visto: si può applicare con l'interruttore dedicato solo se lì batte la configurazione standard di almeno lo 0,5% (la soglia della ricalibrazione), altrimenti il guadagno è rumore. Quando è applicata, la tab Affidabilità avvisa che le giornate su cui è stata scelta non sono più del tutto fuori campione. Si torna indietro spegnendo l'interruttore.
 
 ### Dati e limiti
 
@@ -705,7 +814,9 @@ Glossario di tutti i numeri mostrati da dashboard, console ed export, scritto pe
 - **Chiave FootyStats e dati locali** — la chiave non va mai pubblicata: in locale sta nel file .env (FOOTYSTATS_API_KEY=...), su Streamlit Cloud in App settings → Secrets (FOOTYSTATS_API_KEY = "..."). I dati scaricati restano solo in data/processed e data/odds sul tuo computer o sul server dell'app: non sono nel repository pubblico, perché i dati FootyStats sono in licenza al tuo account.
 - **Storico di 3 stagioni** — il modello è stimato sulla stagione in corso più le due precedenti; le partite vecchie contano meno (ξ). Le squadre presenti solo nello storico (retrocesse, promosse, escluse) restano nella stima come avversarie ma non compaiono in classifica, previsioni e valore.
 - **Squadre storiche e perimetro** — il perimetro è il dizionario squadre della stagione (config/teams_<stagione>.json), allineato alle liste squadre di FootyStats a ogni aggiornamento: le 80 squadre di Serie C A/B/C e Serie B più le 162 dei nove gironi di Serie D. Una partita in programma con una squadra fuori perimetro o datata in un'altra stagione viene saltata e segnalata in «Dettagli pipeline».
-- **Serie D (sezione dedicata)** — il selettore «Sezione» della sidebar separa Serie B e Serie C da Serie D: nove gironi (A-I) di 18 squadre, 34 giornate ciascuno, codici DA-DI. La stima Dixon-Coles è unica per tutto il perimetro (le squadre promosse e retrocesse collegano le divisioni; fattore campo e Σα = 0 per competizione tengono i gironi confrontabili), ma classifica, giornate, risultati, valore, selezioni ed export mostrano solo la sezione scelta e le liste X / GG sono calcolate dentro la sezione. Le liste squadre dei gironi vengono da FootyStats e si riallineano a ogni aggiornamento dei dati; finché non ci sono partite di Serie D nei dati la sezione mostra solo un avviso con il comando di raccolta (python -m src.ingestion.footystats --competitions DA DB DC DD DE DF DG DH DI --seasons 3). Le statistiche di Serie D su FootyStats sono più povere: xG e tiri spesso mancano (colonne «-», λ e μ restano stimati dai gol), senza xG il filtro REGRESSION_TRAP non può scattare, e le quote coprono meno partite (pannello valore in parte vuoto): leggi gli EV di Serie D con prudenza ancora maggiore.
+- **Sezioni** — il selettore «Sezione» della sidebar ha una pagina per campionato: Serie C (gironi A, B, C), Serie B, Serie D (gironi A-I) e ogni campionato abilitato in config/competitions.toml. La stima Dixon-Coles è una per paese: Serie B, C e D sono stimate insieme (le squadre promosse e retrocesse collegano le divisioni; fattore campo e Σα = 0 per competizione tengono i gironi confrontabili), un campionato estero a parte. Classifica, giornate, risultati, valore, selezioni ed export mostrano solo la sezione scelta; le schedine e l'affidabilità possono unire più sezioni.
+- **Abilitare Serie A o un campionato europeo** — Serie A, Premier League, La Liga, Bundesliga, Ligue 1, Eredivisie e Primeira Liga sono già configurati in config/competitions.toml con enabled = false: per accenderne uno metti enabled = true, sceglilo sull'account footystats.org («Choose leagues», il piano limita il numero di leghe) e premi «Aggiorna dati ora». La raccolta riempie le sue squadre nel dizionario e ne scarica partite, calendario e quote; il campionato diventa una sezione nuova (la Serie A entra nella stima italiana, un campionato estero ha la sua). enabled = false lo spegne di nuovo.
+- **Serie D (sezione dedicata)** — nove gironi (A-I) di 18 squadre, 34 giornate ciascuno, codici DA-DI, nella stessa stima di Serie B e Serie C; classifica, giornate, risultati, valore, selezioni ed export mostrano solo la sezione e le liste X / GG sono calcolate dentro la sezione. Le liste squadre dei gironi vengono da FootyStats e si riallineano a ogni aggiornamento dei dati; finché non ci sono partite di Serie D nei dati la sezione mostra solo un avviso con il comando di raccolta (python -m src.ingestion.footystats --competitions DA DB DC DD DE DF DG DH DI --seasons 3). Le statistiche di Serie D su FootyStats sono più povere: xG e tiri spesso mancano (colonne «-», λ e μ restano stimati dai gol), senza xG il filtro REGRESSION_TRAP non può scattare, e le quote coprono meno partite (pannello valore in parte vuoto): leggi gli EV di Serie D con prudenza ancora maggiore.
 - **Copertura minima** — sotto le 15 partite giocate per squadra nella competizione meno coperta la prior resta attiva; sotto le 5-6 le stime sono comunque fragili e gli EV vanno letti con sospetto (le quote dei book incorporano già informazioni che il modello non ha ancora visto).
 - **Prime giornate** — nelle prime 3-4 giornate il modello si regge quasi solo sullo storico e sulla prior: usalo per orientarti (gol attesi, squadre equilibrate), punta poco o niente sulle sole indicazioni di valore e aspetta che la copertura cresca. Il filtro REGRESSION_TRAP ha bisogno di 3 gare giocate per squadra.
 - **Quote e tempi** — le quote cambiano fino al calcio d'inizio: un EV calcolato su quote di ieri può non esistere più oggi. Confronta la quota presa con quella di chiusura (closing line): batterla stabilmente è il segnale più affidabile che il modello vede qualcosa.

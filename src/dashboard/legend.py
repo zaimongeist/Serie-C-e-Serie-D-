@@ -108,9 +108,12 @@ LEGEND: Final[tuple[LegendSection, ...]] = (
             ),
             _e(
                 "β (beta) · Solidità difensiva",
-                "quanto una squadra fa segnare meno della media: più alto = subisce meno (β = +0.3 ≈ 26% di gol subiti in "
-                "meno, β negativo = difesa che concede più della media). Entra nei gol attesi dell'avversario con il segno "
-                "meno (λ = exp(α_casa − β_ospite + γ)).",
+                "quanto una squadra fa segnare poco gli avversari: più alto = subisce meno. Entra nei gol attesi "
+                "dell'avversario con il segno meno (λ = exp(α_casa − β_ospite + γ)). A differenza di α, β NON è centrata "
+                "su zero: la media dei β di una competizione fa da livello base dei gol di quel campionato, quindi il "
+                "valore assoluto non dice nulla e β = 0 non significa \"difesa media\". Leggila in confronto: 0.3 di β in "
+                "più di un'altra squadra della stessa competizione ≈ 26% di gol subiti in meno (exp(−0.3) = 0.74); sopra "
+                "la media dei β del girone = difesa migliore della media, sotto = peggiore.",
             ),
             _e(
                 "γ (gamma) · Vantaggio casa",
@@ -120,8 +123,10 @@ LEGEND: Final[tuple[LegendSection, ...]] = (
             ),
             _e(
                 "Indice Attacco / Indice Difesa",
-                "exp(α) ed exp(β): gli stessi parametri in scala moltiplicativa, 1.00 = media del girone, 1.20 = +20%, "
-                "0.85 = −15%. Più comodi di α e β per farsi un'idea veloce.",
+                "exp(α) ed exp(β): gli stessi parametri in scala moltiplicativa. Indice Attacco 1.00 = attacco medio del "
+                "girone, 1.20 = +20%, 0.85 = −15%. L'Indice Difesa non ha 1.00 come media (β non è centrata): si legge "
+                "per rapporto, se una squadra ha indice difesa 1.20 volte quello di un'altra della stessa competizione, "
+                "a parità di avversario subisce circa 1/1.20 ≈ 17% di gol in meno.",
             ),
             _e(
                 "ρ (rho) · Correlazione bassi punteggi",
@@ -433,19 +438,19 @@ LEGEND: Final[tuple[LegendSection, ...]] = (
         (
             _e(
                 "Giornata",
-                "la giornata corrente di ogni competizione della sezione scelta (Serie B e i tre gironi di Serie C, oppure i "
-                "nove gironi di Serie D), messe insieme qualunque sia il loro numero (Serie B all'11ª, gironi di Serie C alla 13ª) "
+                "la giornata corrente di ogni competizione della sezione scelta (i tre gironi di Serie C, la Serie B, i nove "
+                "gironi di Serie D o un campionato abilitato), messe insieme qualunque sia il loro numero (gironi di Serie C alla 13ª, D-A alla 12ª) "
                 "e con le partite già giocate incluse; le giornate successive raggruppano i turni seguenti giocati nello stesso "
                 "blocco della settimana calcistica: fine settimana (venerdì-lunedì) oppure turno infrasettimanale "
                 "(martedì-giovedì). Una competizione che in quel blocco non gioca (Serie B in sosta per le nazionali) manca "
                 "dall'etichetta. Le liste X e GG considerano solo le partite ancora da giocare (calcio d'inizio non ancora "
                 "passato: una partita iniziata esce dalle liste e dal pannello valore); rinvii e recuperi fuori turno "
-                "non spostano la giornata (sono in «Recuperi e rinvii»). Le giornate di Serie D sono raggruppate a parte, dal suo "
-                "calendario: non spostano quelle di Serie B e Serie C.",
+                "non spostano la giornata (sono in «Recuperi e rinvii»). Ogni sezione raggruppa le giornate dal proprio "
+                "calendario: le 34 giornate di Serie D non spostano quelle di Serie C o di Serie B.",
             ),
             _e(
                 "Le 5 partite più probabili da X",
-                "fra tutte le partite della giornata della sezione scelta (Serie B e Serie C gironi A, B e C insieme, oppure "
+                "fra tutte le partite della giornata della sezione scelta (i tre gironi di Serie C insieme, la Serie B, oppure "
                 "i nove gironi di Serie D insieme), le cinque con la probabilità "
                 "di pareggio più alta secondo il modello. Ordinate **solo per probabilità**, non per valore: una X al 33% "
                 "a quota 2.90 (EV −4%) sta in lista anche se non conviene. Nota «lambda e mu vicini» = squadre equilibrate, "
@@ -469,6 +474,151 @@ LEGEND: Final[tuple[LegendSection, ...]] = (
                 "Nessuna quota in lista",
                 "se Quota Book, Bookmaker ed EV sono vuoti nessun bookmaker nei dati quota quella selezione: la lista "
                 "resta utile per sapere dove guardare, il prezzo va cercato a mano.",
+            ),
+        ),
+    ),
+    LegendSection(
+        "Schedine (tab Schedine)",
+        (
+            _e(
+                "Schedina X",
+                "le 5 partite della giornata (5 di default, regolabile) con la probabilità di pareggio più alta secondo il modello, "
+                "fra le sezioni scelte e solo fra le partite non ancora iniziate; una partita entra al massimo una volta per "
+                "schedina. Stesso criterio della lista X: probabilità, non valore.",
+            ),
+            _e(
+                "Schedina GG",
+                "le 10 partite (default) con la probabilità più alta che entrambe le squadre segnino.",
+            ),
+            _e(
+                "Schedina mista",
+                "per ogni partita il segno più probabile fra 1, 2, GG e Over 2.5 secondo il modello, poi le 6 partite (da 3 a "
+                "10) in cui quel segno è più probabile: integra le partite con la probabilità più alta per il loro segno. Con "
+                "«Solo partite quotate» il segno si sceglie fra quelli che hanno una quota; «P minima» esclude i segni sotto la "
+                "soglia.",
+            ),
+            _e(
+                "Probabilità della schedina",
+                "il prodotto delle probabilità delle singole partite, nell'ipotesi che le partite siano indipendenti (un'ipotesi, "
+                "non un fatto: due gare dello stesso girone con lo stesso arbitro o lo stesso meteo non lo sono del tutto). "
+                "Cinque X al 35% fanno 0,35⁵ ≈ 0,5%: una schedina su 190. Quota fair = 1 / probabilità.",
+            ),
+            _e(
+                "Quota book ed EV della schedina",
+                "la quota book è il prodotto delle migliori quote delle partite, solo quando tutte sono quotate; EV = probabilità × "
+                "quota book − 1. Se una partita non ha quota, quota book ed EV restano vuoti.",
+            ),
+            _e(
+                "Margine composto",
+                "una multipla moltiplica il margine del bookmaker: con il 5% per partita, 5 partite cedono circa il 22% della "
+                "vincita equa e 10 partite quasi il 39%. Per questo una schedina lunga ha quasi sempre EV negativo anche quando "
+                "ogni partita è «probabile»: le singole di valore (tab Opportunità) sono il modo più efficiente di sfruttare un "
+                "vantaggio.",
+            ),
+            _e(
+                "Partite vincenti attese",
+                "la somma delle probabilità delle partite: quante ne indovini in media. Con 10 GG al 62% sono circa 6, e la "
+                "schedina intera si vince solo se sono 10.",
+            ),
+            _e(
+                "Stake suggerito della schedina",
+                "Kelly frazionario sulla schedina intera (la frazione della sidebar), con un tetto di 1 unità; «non consigliata» "
+                "quando l'EV è negativo o manca una quota. È volutamente piccolo: la varianza di una multipla è enorme.",
+            ),
+            _e(
+                "Track record delle schedine",
+                "le stesse tre schedine ricostruite per ogni giornata passata con le probabilità fuori campione del backtest: "
+                "giornate, schedine vinte contro quelle attese, percentuale di gambe vinte e ROI alle quote reali quando ci sono, "
+                "con intervallo di confidenza al 95%.",
+            ),
+        ),
+    ),
+    LegendSection(
+        "Affidabilità del modello (tab Affidabilità modello)",
+        (
+            _e(
+                "Backtest walk-forward",
+                "ogni giornata passata (blocco della settimana calcistica) è prevista da un modello stimato solo sulle partite "
+                "giocate prima del suo calcio d'inizio, con lo stesso decadimento, la stessa prior e lo storico di produzione. "
+                "Sono le probabilità che il modello avrebbe pubblicato allora: la stima di produzione ha già visto quei risultati "
+                "e non va mai usata per giudicare la precisione. Di default si valutano la stagione corrente e la precedente.",
+            ),
+            _e(
+                "Log loss",
+                "−ln della probabilità data all'esito avvenuto, in media: più bassa è meglio. Un modello che dà sempre 1/3 a 1, X "
+                "e 2 fa 1,099; le frequenze di base di un campionato intorno a 1,07-1,09; un buon modello e i bookmaker fra 0,98 "
+                "e 1,03 sull'1X2. Punisce molto le sicurezze sbagliate (un 90% che non esce costa più di dieci 55% sbagliati).",
+            ),
+            _e(
+                "Brier",
+                "errore quadratico medio fra probabilità ed esito (1X2 da 0 a 2, mercati a due esiti da 0 a 1): più basso è "
+                "meglio, meno severo della log loss con gli errori rari.",
+            ),
+            _e(
+                "Accuratezza (%)",
+                "quante volte l'esito più probabile secondo il modello è avvenuto. Utile ma ingannevole: sull'1X2 il segno 1 "
+                "vince spesso anche senza modello; conta che le probabilità siano giuste, non solo il favorito.",
+            ),
+            _e(
+                "Base e Skill vs base",
+                "la base sono le frequenze di 1/X/2, GG e Over del campionato nei 365 giorni precedenti (quello che sa chi non ha "
+                "un modello). Skill vs base = 1 − log loss modello / log loss base: positiva = il modello batte le frequenze di "
+                "base. È il primo esame da superare.",
+            ),
+            _e(
+                "Mercato e Skill vs mercato",
+                "le probabilità del bookmaker senza margine (quote pre-partita delle partite giocate, dallo storico FootyStats), "
+                "valutate solo sulle «Partite con quote». Il modello va confrontato con il mercato sulle stesse partite: le "
+                "colonne «Log loss modello (partite con quote)» e «Brier modello (partite con quote)» e il riquadro «Modello vs "
+                "mercato»; «Log loss modello» copre tutte le partite valutate, anche quelle senza quote (la copertura cambia da "
+                "campionato a campionato), e non è confrontabile con il mercato. Skill vs mercato = 1 − log loss modello / log "
+                "loss mercato sulle stesse partite: battere il mercato è raro; un valore negativo di poco è normale e non "
+                "impedisce di trovare singole di valore, uno molto negativo invita alla prudenza sugli EV.",
+            ),
+            _e(
+                "Grafico di affidabilità",
+                "le partite sono raggruppate per probabilità prevista (fasce di 10 punti): in orizzontale la probabilità media "
+                "della fascia, in verticale quante volte l'esito è avvenuto, con la barra dell'intervallo di Wilson al 95%. "
+                "Sulla diagonale il modello è tarato; sopra la diagonale è troppo prudente (l'esito accade più spesso), sotto è "
+                "troppo sicuro. Una fascia con poche partite ha la barra lunga: non trarne conclusioni.",
+            ),
+            _e(
+                "Hit rate, IC 95% e ROI",
+                "hit rate = selezioni vinte / selezioni, con l'intervallo di Wilson al 95%; va confrontato con la «P media» del "
+                "modello (se coincidono, il modello è tarato). ROI = profitto / puntate a puntata fissa sulla miglior quota "
+                "pre-partita, con un intervallo al 95% (approssimazione normale): finché l'intervallo contiene lo zero il "
+                "guadagno non si distingue dalla fortuna.",
+            ),
+            _e(
+                "Multiple top-k delle liste",
+                "le prime k partite (da 2 a 5) della lista X o GG di ogni giornata passata giocate insieme, per sezione o per "
+                "tutte le sezioni: è la giocata «le prime 2 GG della Serie C» ripetuta su ogni giornata. Giornate, multiple "
+                "vinte contro quelle attese (somma dei prodotti delle probabilità, indipendenza ipotizzata), win rate con "
+                "intervallo di Wilson e ROI alle quote reali; il dettaglio giornata per giornata è in «Liste giornata per giornata».",
+            ),
+            _e(
+                "Poche vincite non sono una prova",
+                "una domenica con la schedina vinta (100 € con 5 €) o due GG azzeccati capitano anche senza alcun vantaggio: "
+                "contano il numero di giornate e di partite valutate e gli intervalli di confidenza, non l'aneddoto.",
+            ),
+            _e(
+                "Ricalibrazione validata",
+                "imparare dal differenziale fra previsioni ed esiti: per ogni mercato una piccola correzione (Platt su GG/NG e "
+                "Over/Under, temperatura multinomiale sull'1X2, con penalità verso «nessuna correzione»; parametri propri per "
+                "Serie B, C o D solo con abbastanza partite) è stimata sulle giornate più vecchie del backtest e giudicata su "
+                "quelle più recenti. Si applica solo ai mercati in cui la log loss fuori campione migliora almeno dello 0,5%; "
+                "altrimenti restano le probabilità originali. «Calibrazione applicata: sì/no, miglioramento log loss X%» lo dice; "
+                "l'interruttore «Usa probabilità ricalibrate» la accende o la spegne (è reversibile: il modello non viene "
+                "toccato) e la tabella Giornata mostra accanto la probabilità originale («orig.»).",
+            ),
+            _e(
+                "Ottimizzazione di xi e prior",
+                "facoltativa: ripete il backtest della stagione corrente per 9 combinazioni di decadimento (ξ 0,001 / 0,0018 / "
+                "0,003) e forza della prior. La combinazione è scelta sulle giornate più vecchie e confermata sul 30% più "
+                "recente, che la scelta non ha visto: si può applicare con l'interruttore dedicato solo se lì batte la "
+                "configurazione standard di almeno lo 0,5% (la soglia della ricalibrazione), altrimenti il guadagno è rumore. "
+                "Quando è applicata, la tab Affidabilità avvisa che le giornate su cui è stata scelta non sono più del tutto "
+                "fuori campione. Si torna indietro spegnendo l'interruttore.",
             ),
         ),
     ),
@@ -517,12 +667,27 @@ LEGEND: Final[tuple[LegendSection, ...]] = (
                 "con una squadra fuori perimetro o datata in un'altra stagione viene saltata e segnalata in «Dettagli pipeline».",
             ),
             _e(
+                "Sezioni",
+                "il selettore «Sezione» della sidebar ha una pagina per campionato: Serie C (gironi A, B, C), Serie B, Serie D "
+                "(gironi A-I) e ogni campionato abilitato in config/competitions.toml. La stima Dixon-Coles è una per paese: "
+                "Serie B, C e D sono stimate insieme (le squadre promosse e retrocesse collegano le divisioni; fattore campo e "
+                "Σα = 0 per competizione tengono i gironi confrontabili), un campionato estero a parte. Classifica, giornate, "
+                "risultati, valore, selezioni ed export mostrano solo la sezione scelta; le schedine e l'affidabilità possono "
+                "unire più sezioni.",
+            ),
+            _e(
+                "Abilitare Serie A o un campionato europeo",
+                "Serie A, Premier League, La Liga, Bundesliga, Ligue 1, Eredivisie e Primeira Liga sono già configurati in "
+                "config/competitions.toml con enabled = false: per accenderne uno metti enabled = true, sceglilo sull'account "
+                "footystats.org («Choose leagues», il piano limita il numero di leghe) e premi «Aggiorna dati ora». La raccolta "
+                "riempie le sue squadre nel dizionario e ne scarica partite, calendario e quote; il campionato diventa una sezione "
+                "nuova (la Serie A entra nella stima italiana, un campionato estero ha la sua). enabled = false lo spegne di nuovo.",
+            ),
+            _e(
                 "Serie D (sezione dedicata)",
-                "il selettore «Sezione» della sidebar separa Serie B e Serie C da Serie D: nove gironi (A-I) di 18 squadre, "
-                "34 giornate ciascuno, codici DA-DI. La stima Dixon-Coles è unica per tutto il perimetro (le squadre promosse e "
-                "retrocesse collegano le divisioni; fattore campo e Σα = 0 per competizione tengono i gironi confrontabili), ma "
-                "classifica, giornate, risultati, valore, selezioni ed export mostrano solo la sezione scelta e le liste X / GG "
-                "sono calcolate dentro la sezione. Le liste squadre dei gironi vengono da FootyStats e si riallineano a ogni "
+                "nove gironi (A-I) di 18 squadre, 34 giornate ciascuno, codici DA-DI, nella stessa stima di Serie B e Serie C; "
+                "classifica, giornate, risultati, valore, selezioni ed export mostrano solo la sezione e le liste X / GG sono "
+                "calcolate dentro la sezione. Le liste squadre dei gironi vengono da FootyStats e si riallineano a ogni "
                 "aggiornamento dei dati; finché non ci sono partite di Serie D nei dati la sezione mostra solo un avviso con il "
                 "comando di raccolta (python -m src.ingestion.footystats --competitions DA DB DC DD DE DF DG DH DI --seasons 3). "
                 "Le statistiche di "

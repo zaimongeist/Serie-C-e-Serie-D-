@@ -353,8 +353,13 @@ def test_verifica_calendari_text_never_echoes_the_key_nor_writes_to_the_reposito
     text = WORKFLOW.read_text(encoding="utf-8")
     for path in ("src/ingestion/calendar_snapshot.py", "src/ingestion/footystats.py", "src/engine/calendar.py"):
         assert f"- {path}" in text, path
-    for option in ("--no-odds", "--out ci/matches.csv", "--fixtures-out ci/fixtures.csv", "--odds-out ci/odds.csv", "--cache-dir ci/raw", "--mapping ci/footystats_teams.json"):
+    # the product path now keeps the pre-match odds of the played matches (inside ci/, deleted at the end) for the
+    # aggregated model-vs-market metrics of the reliability step, which never prints a match or a price
+    for option in ("--odds-history-out ci/history/odds_history.csv", "--out ci/matches.csv", "--fixtures-out ci/fixtures.csv", "--odds-out ci/odds.csv", "--cache-dir ci/raw", "--mapping ci/footystats_teams.json"):
         assert option in text, option
+    assert "--reliability --matches ci/matches.csv" in text and "--odds-history ci/history/odds_history.csv" in text
+    for path in ("src/engine/backtest.py", "src/engine/calibration.py", "src/engine/slips.py", "src/engine/fitgroups.py", "src/dashboard/state.py"):
+        assert f"- {path}" in text, path
     assert "rm -rf ci" in text and "upload-artifact" not in text
     for line in text.splitlines():
         if "FOOTYSTATS_API_KEY" in line and "echo" in line:
@@ -380,10 +385,15 @@ def test_verifica_calendari_runs_the_snapshot_and_the_product_path_without_writi
     snapshot = steps["Istantanea dei calendari"]["run"]
     assert "python -m src.ingestion.calendar_snapshot" in snapshot and "--summary ci/riepilogo.md" in snapshot
     product = steps["Percorso del prodotto (raccolta FootyStats + sincronizzazione del dizionario)"]["run"]
-    assert "python -m src.ingestion.footystats --seasons 3 --no-odds" in product and "--competitions" not in product
-    for option in ("--out ci/matches.csv", "--fixtures-out ci/fixtures.csv", "--odds-out ci/odds.csv", "--cache-dir ci/raw", "--mapping ci/footystats_teams.json"):
+    assert "python -m src.ingestion.footystats --seasons 3" in product and "--competitions" not in product
+    for option in ("--out ci/matches.csv", "--fixtures-out ci/fixtures.csv", "--odds-out ci/odds.csv", "--odds-history-out ci/history/odds_history.csv", "--cache-dir ci/raw", "--mapping ci/footystats_teams.json"):
         assert option in product, option
     assert "--product-view --matches ci/matches.csv --fixtures ci/fixtures.csv" in product and "data/" not in product
+    reliability = steps["Affidabilità del modello (backtest walk-forward, solo metriche aggregate)"]
+    assert reliability.get("if") == "always()" and "--reliability --matches ci/matches.csv" in reliability["run"] and "data/" not in reliability["run"]
+    assert "> /dev/null" in reliability["run"], "only the aggregated Markdown summary reaches the log"
+    for required in ("src/engine/backtest.py", "src/engine/calibration.py", "src/engine/slips.py", "src/engine/fitgroups.py", "src/dashboard/state.py"):
+        assert required in paths, required
     assert "rm -rf ci" in steps["Pulizia (nessun dato FootyStats resta sul runner)"]["run"]
     # the key is only ever tested for emptiness, never printed; nothing is committed or pushed
     for line in text.splitlines():
@@ -420,3 +430,12 @@ def test_snapshot_dates_are_shown_in_rome_across_the_dst_change() -> None:
     winter = cs.kickoff_rome(int(datetime(2026, 10, 31, 14, 0, tzinfo=UTC).timestamp()))
     assert summer is not None and winter is not None and (summer.hour, winter.hour) == (15, 15)
     assert NOW.astimezone(ROME).utcoffset() == timedelta(hours=1)
+
+
+def test_public_summary_hides_odds_aggregates_below_the_minimum_sample():
+    from src.ingestion.calendar_snapshot import PUBLIC_MIN_QUOTED, _public
+
+    assert _public("1.234", PUBLIC_MIN_QUOTED) == "1.234"
+    assert _public("1.234", PUBLIC_MIN_QUOTED - 1) == f"n<{PUBLIC_MIN_QUOTED}"
+    assert _public("12.5%", 1) == f"n<{PUBLIC_MIN_QUOTED}"
+    assert _public("12.5%", None) == f"n<{PUBLIC_MIN_QUOTED}"

@@ -29,7 +29,25 @@ git-ignored):
   data of a failed competition is kept -- also when only one season of it
   failed: a failed current season keeps the previous current-season matches,
   fixtures and odds of that competition) and the timestamp. It never raises on
-  the failure of a single competition.
+  the failure of a single competition. The pre-match quotes FootyStats keeps on
+  the **completed** matches go to the odds history
+  (``odds_dir/history/odds_history.csv``, :func:`odds_history_file`), merged
+  with the history already there: the walk-forward backtest compares the
+  model with the market on it. It sits in a sub-folder because every ``*.csv``
+  directly in ``odds_dir`` is read as a list of current prices.
+
+The walk-forward backtest of the *Affidabilità modello* tab is persisted next
+to the data folder (:func:`save_backtest` / :func:`load_backtest`:
+``data/backtest.parquet`` and ``data/backtest.json``, git-ignored), keyed on
+the data version and the model settings, so a rerun or another session reads
+it back instead of refitting every past matchday; a refresh of the data
+changes the key and the next run recomputes it. The matchday-by-matchday
+out-of-sample recalibration of that backtest (:func:`save_rolling` /
+:func:`load_rolling`: ``data/backtest_rolling.parquet`` and
+``data/backtest_rolling.json``, same key) is persisted the same way, so a
+restart does not refit it either. :func:`load_odds_history_frame`
+reads the odds history for the comparison with the market (an empty frame when
+there is none).
 
 Pure of ``streamlit`` except for the optional ``st.secrets`` lookup, so the
 console and the tests use it without a Streamlit runtime; tests pass a fake
@@ -59,9 +77,24 @@ from src.common.schemas import Fixture, Girone, OddsQuote, empty_matches_frame, 
 from src.common.teams import DEFAULT_SEASON, load_registry, season_file_stem
 from src.engine.calendar import ROME
 from src.ingestion.footystats import DEFAULT_COMPETITIONS, DEFAULT_ENV_FILE, find_api_key, mask_key
-from src.ingestion.harvester import load_fixtures, load_processed, save_fixtures, save_odds, save_processed
+from src.engine.backtest import BacktestResult
+from src.engine.calibration import RecalibrationModel, RollingRecalibration
+from src.ingestion.harvester import (
+    load_fixtures,
+    load_odds_history,
+    load_processed,
+    odds_history_path,
+    save_fixtures,
+    save_odds,
+    save_odds_history,
+    save_processed,
+)
 
 __all__ = [
+    "BACKTEST_FILE",
+    "BACKTEST_META_FILE",
+    "ROLLING_FILE",
+    "ROLLING_META_FILE",
     "DEFAULT_MAX_AGE",
     "KEY_ENV",
     "ODDS_FILE",
@@ -73,14 +106,22 @@ __all__ = [
     "ProviderFactory",
     "RefreshResult",
     "age_text",
+    "backtest_paths",
     "data_age",
     "find_key",
     "kept_data_warnings",
     "last_refresh",
+    "load_backtest",
+    "load_odds_history_frame",
+    "load_rolling",
     "locate_key",
     "needs_refresh",
+    "odds_history_file",
     "refresh",
     "refresh_label",
+    "rolling_paths",
+    "save_backtest",
+    "save_rolling",
     "stale_warning",
     "supported_competitions",
 ]
@@ -97,6 +138,15 @@ STAMP_FILE: Final[str] = "refresh_stamp.json"
 ODDS_FILE: Final[str] = "footystats.csv"
 #: Seasons downloaded per competition (the current one and the two before it).
 DEFAULT_SEASONS: Final[int] = 3
+def odds_history_file(odds_dir: Path = ODDS_DIR) -> Path:
+    """The odds history :func:`refresh` writes for ``odds_dir``: ``odds_dir/history/odds_history.csv``.
+
+    A sub-folder, never a ``*.csv`` directly in ``odds_dir`` (that folder is read
+    as current prices by the dashboard); git-ignored like all of ``data/odds``.
+    """
+    return odds_history_path(odds_dir)
+
+
 #: Seconds between two progress reports while the provider downloads.
 PROGRESS_INTERVAL: float = 0.5
 
@@ -377,7 +427,10 @@ class RefreshResult:
     ``written`` says whether the CSVs were saved (``False`` when nothing at all
     could be downloaded: the previous files are then left untouched) and
     ``error`` is the reason of a run that failed as a whole (no key, every
-    competition failed). Timestamps are aware UTC.
+    competition failed). Timestamps are aware UTC. ``n_odds_history`` counts the
+    quotes (one per match and market) of completed matches written to the odds
+    history by this run (0 when the provider delivered none: the history file
+    is then left as it was).
     """
 
     started_at: datetime
@@ -396,6 +449,7 @@ class RefreshResult:
     written: bool = False
     error: str | None = None
     kept: dict[str, dict[str, Any]] = field(default_factory=dict)
+    n_odds_history: int = 0
 
     @property
     def ok(self) -> bool:
@@ -471,6 +525,7 @@ class RefreshResult:
             "n_matches": self.n_matches,
             "n_fixtures": self.n_fixtures,
             "n_odds": self.n_odds,
+            "n_odds_history": self.n_odds_history,
             "per_competition": self.per_competition,
             "errors": self.errors,
             "not_chosen": self.not_chosen,
@@ -627,6 +682,8 @@ class _Harvested:
     frames: list[pd.DataFrame] = field(default_factory=list)
     fixtures: list[Fixture] = field(default_factory=list)
     odds: list[OddsQuote] = field(default_factory=list)
+    #: Pre-match quotes of the completed matches of the competitions that delivered (the odds history).
+    odds_history: list[OddsQuote] = field(default_factory=list)
     per_competition: dict[str, dict[str, int]] = field(default_factory=dict)
     errors: dict[str, str] = field(default_factory=dict)
     season_failures: dict[str, str] = field(default_factory=dict)
@@ -686,6 +743,7 @@ async def _run(
         matches = pd.DataFrame(columns=["girone"])
     fixtures = list(getattr(result, "fixtures", None) or [])
     odds = list(getattr(result, "odds", None) or [])
+    history = list(getattr(result, "odds_history", None) or [])
     failures = dict(getattr(result, "failures", None) or {})
     problem_for = getattr(result, "problem_for", None)
     listed = getattr(result, "seasons", None)
@@ -714,6 +772,9 @@ async def _run(
         out.frames.append(mine)
         out.fixtures.extend(got_fixtures)
         out.odds.extend(got_odds)
+        if history and len(mine):
+            played = set(mine["match_id"].astype(str))
+            out.odds_history.extend(q for q in history if q.match_id in played)
         out.per_competition[code] = {"partite": int(len(mine)), "in_calendario": len(got_fixtures), "quote": len(got_odds)}
         log.info("competition refreshed", extra={"competition": code, **out.per_competition[code]})
         if code in out.current_failed:
@@ -775,7 +836,10 @@ def refresh(
     records the modification time of the ``matches.csv`` it describes
     (``matches_mtime``, see :func:`data_age`). The
     files written are ``processed_dir/matches.csv``, ``processed_dir/fixtures.csv``,
-    ``odds_dir/footystats.csv`` (:data:`ODDS_FILE`) and the stamp
+    ``odds_dir/footystats.csv`` (:data:`ODDS_FILE`), the odds history
+    ``odds_dir/history/odds_history.csv`` (:func:`odds_history_file`, only when
+    the provider delivered quotes of completed matches; merged with the rows
+    already there, see :func:`src.ingestion.harvester.save_odds_history`) and the stamp
     ``processed_dir/refresh_stamp.json`` (:data:`STAMP_FILE`), each replaced
     atomically. Nothing is written when no competition delivered anything.
     ``key`` defaults to :func:`find_key`; without a key the result carries the
@@ -846,6 +910,12 @@ def refresh(
             pd.concat([pd.read_csv(tmp, dtype="string"), old_odds.astype("string")], ignore_index=True).to_csv(tmp, index=False)
 
     _atomic_write(odds_path, write_odds)
+    if harvested.odds_history:
+        try:
+            save_odds_history(harvested.odds_history, odds_history_file(Path(odds_dir)))
+            result.n_odds_history = len(harvested.odds_history)
+        except (OSError, ValueError) as exc:  # the history is an extra: never lose the refresh for it
+            log.warning("odds history not written", extra={"path": str(odds_history_file(Path(odds_dir))), "error": str(exc)})
     result.n_matches = int(len(matches))
     result.n_fixtures = len(all_fixtures)
     kept_quotes = old_odds[["match_id", "bookmaker", "market"]].drop_duplicates() if len(old_odds) else old_odds
@@ -865,6 +935,7 @@ def refresh(
             "n_matches": result.n_matches,
             "n_fixtures": result.n_fixtures,
             "n_odds": result.n_odds,
+            "n_odds_history": result.n_odds_history,
             "competitions_ok": list(result.per_competition),
             "competitions_failed": list(result.errors),
             "competitions_kept": list(result.kept),
@@ -872,3 +943,192 @@ def refresh(
         },
     )
     return result
+
+
+# =============================================================================
+# Walk-forward backtest cache (data/backtest.parquet + data/backtest.json, git-ignored)
+# =============================================================================
+#: The persisted backtest frame and its metadata (cache key, run figures, recalibration), next to the data folder.
+BACKTEST_FILE: Final[str] = "backtest.parquet"
+BACKTEST_META_FILE: Final[str] = "backtest.json"
+_BACKTEST_SCHEMA: Final[int] = 1
+
+
+def backtest_paths(processed_dir: Path = PROCESSED_DIR) -> tuple[Path, Path]:
+    """``(frame, metadata)`` paths of the persisted backtest: ``data/backtest.parquet`` and ``data/backtest.json`` for ``data/processed``."""
+    base = Path(processed_dir).parent
+    return base / BACKTEST_FILE, base / BACKTEST_META_FILE
+
+
+def save_backtest(result: BacktestResult, recalibration: RecalibrationModel, *, key: str, processed_dir: Path = PROCESSED_DIR) -> Path | None:
+    """Persist a walk-forward backtest with its recalibration under ``key``; ``None`` (logged) when the files cannot be written.
+
+    Aggregates and out-of-sample probabilities of the user's own data, local
+    only (the paths are git-ignored, never committed). Written atomically.
+    """
+    frame_path, meta_path = backtest_paths(processed_dir)
+    meta = {
+        "schema": _BACKTEST_SCHEMA,
+        "key": str(key),
+        "written_at": datetime.now(UTC).isoformat(timespec="seconds"),
+        "seasons": list(result.seasons),
+        "block": result.block,
+        "n_blocks": int(result.n_blocks),
+        "n_skipped_blocks": int(result.n_skipped_blocks),
+        "skipped_matches": {str(k): int(v) for k, v in result.skipped_matches.items()},
+        "seconds": float(result.seconds),
+        "fit_seconds": float(result.fit_seconds),
+        "n_not_converged": int(result.n_not_converged),
+        "min_train_matches": int(result.min_train_matches),
+        "n_fits": int(result.n_fits),
+        "recalibration": recalibration.to_dict(),
+    }
+    try:
+        frame_path.parent.mkdir(parents=True, exist_ok=True)
+        _atomic_write(frame_path, lambda tmp: result.frame.to_parquet(tmp, index=False))
+        _atomic_write(meta_path, lambda tmp: tmp.write_text(json.dumps(meta, ensure_ascii=False, indent=1), encoding="utf-8"))
+    except (OSError, ValueError, ImportError) as exc:
+        log.warning("backtest not persisted", extra={"path": str(frame_path), "error": str(exc)})
+        return None
+    log.info("backtest persisted", extra={"path": str(frame_path), "n_matches": result.n_matches, "key": key})
+    return frame_path
+
+
+def _enabled_rows(frame: pd.DataFrame) -> pd.DataFrame:
+    """The rows of a persisted backtest frame whose competition is still enabled (a ``Girone`` member), logged when some are not."""
+    if frame.empty or "girone" not in frame.columns:
+        return frame
+    mask = frame["girone"].astype(str).isin({g.value for g in Girone}).to_numpy(dtype=bool)
+    if mask.all():
+        return frame
+    log.warning(
+        "persisted backtest rows of competitions not enabled skipped",
+        extra={"codes": sorted(set(frame.loc[~mask, "girone"].astype(str))), "rows": int((~mask).sum())},
+    )
+    return frame.loc[mask].reset_index(drop=True)
+
+
+def load_backtest(processed_dir: Path = PROCESSED_DIR, *, key: str) -> tuple[BacktestResult, RecalibrationModel] | None:
+    """The backtest persisted under ``key`` (``None`` when missing, unreadable or computed on other data / settings).
+
+    ``key`` carries the competition configuration (see
+    :func:`src.dashboard.state.reliability_key`), so a league switched off or
+    moved since misses the cache; rows of a competition that is no longer
+    enabled are dropped anyway (as the CSV loaders do), never handed to the views.
+    """
+    frame_path, meta_path = backtest_paths(processed_dir)
+    if not (frame_path.is_file() and meta_path.is_file()):
+        return None
+    try:
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        if int(meta.get("schema", 0)) != _BACKTEST_SCHEMA or str(meta.get("key")) != str(key):
+            return None
+        frame = _enabled_rows(pd.read_parquet(frame_path))
+        result = BacktestResult(
+            frame=frame,
+            seasons=tuple(str(s) for s in meta.get("seasons", [])),
+            block=str(meta.get("block", "week")),
+            n_blocks=int(meta.get("n_blocks", 0)),
+            n_skipped_blocks=int(meta.get("n_skipped_blocks", 0)),
+            skipped_matches={str(k): int(v) for k, v in (meta.get("skipped_matches") or {}).items()},
+            seconds=float(meta.get("seconds", 0.0)),
+            fit_seconds=float(meta.get("fit_seconds", 0.0)),
+            n_not_converged=int(meta.get("n_not_converged", 0)),
+            min_train_matches=int(meta.get("min_train_matches", 0)),
+            n_fits=int(meta.get("n_fits", 0)),
+        )
+        model = RecalibrationModel.from_dict(meta.get("recalibration") or {})
+    except (OSError, ValueError, KeyError, TypeError, ImportError) as exc:
+        log.warning("persisted backtest unreadable, recomputing", extra={"path": str(frame_path), "error": str(exc)})
+        return None
+    log.info("backtest read from disk", extra={"path": str(frame_path), "n_matches": result.n_matches, "key": key})
+    return result, model
+
+
+#: The persisted matchday-by-matchday recalibration of the backtest (its probability columns and steps), same key.
+ROLLING_FILE: Final[str] = "backtest_rolling.parquet"
+ROLLING_META_FILE: Final[str] = "backtest_rolling.json"
+_ROLLING_SCHEMA: Final[int] = 1
+_ROLLING_STEP_COLUMNS: Final[tuple[str, ...]] = ("matchday", "n_history", "enabled")
+
+
+def rolling_paths(processed_dir: Path = PROCESSED_DIR) -> tuple[Path, Path]:
+    """``(frame, metadata)`` paths of the persisted rolling recalibration, next to :func:`backtest_paths`."""
+    base = Path(processed_dir).parent
+    return base / ROLLING_FILE, base / ROLLING_META_FILE
+
+
+def save_rolling(rolling: RollingRecalibration, *, key: str, processed_dir: Path = PROCESSED_DIR) -> Path | None:
+    """Persist the out-of-sample recalibrated probabilities of a backtest (``match_id`` + ``p_*`` columns and the steps) under ``key``.
+
+    The key is the backtest's (:func:`save_backtest`): read back only together
+    with the backtest it was computed on. ``None`` (logged) when the files
+    cannot be written; local only, git-ignored.
+    """
+    frame_path, meta_path = rolling_paths(processed_dir)
+    columns = ["match_id", *[c for c in rolling.frame.columns if str(c).startswith("p_")]]
+    meta = {
+        "schema": _ROLLING_SCHEMA,
+        "key": str(key),
+        "written_at": datetime.now(UTC).isoformat(timespec="seconds"),
+        "n_matches": int(len(rolling.frame)),
+        "steps": [{c: (int(v) if c == "n_history" else str(v)) for c, v in row.items()} for row in rolling.steps[list(_ROLLING_STEP_COLUMNS)].to_dict(orient="records")],
+    }
+    try:
+        frame_path.parent.mkdir(parents=True, exist_ok=True)
+        probabilities = rolling.frame[columns].assign(match_id=rolling.frame["match_id"].astype(str))
+        _atomic_write(frame_path, lambda tmp: probabilities.to_parquet(tmp, index=False))
+        _atomic_write(meta_path, lambda tmp: tmp.write_text(json.dumps(meta, ensure_ascii=False, indent=1), encoding="utf-8"))
+    except (OSError, ValueError, KeyError, ImportError) as exc:
+        log.warning("rolling recalibration not persisted", extra={"path": str(frame_path), "error": str(exc)})
+        return None
+    log.info("rolling recalibration persisted", extra={"path": str(frame_path), "n_matches": int(len(rolling.frame)), "key": key})
+    return frame_path
+
+
+def load_rolling(processed_dir: Path = PROCESSED_DIR, *, key: str, frame: pd.DataFrame) -> RollingRecalibration | None:
+    """The rolling recalibration persisted under ``key``, rebuilt on ``frame`` (the backtest frame it was computed on).
+
+    ``None`` when missing, unreadable, saved under another key or not covering
+    exactly the matches of ``frame`` (then it is recomputed): the probability
+    columns are copied onto ``frame`` match by match, every other column is
+    ``frame``'s own.
+    """
+    frame_path, meta_path = rolling_paths(processed_dir)
+    if not (frame_path.is_file() and meta_path.is_file()):
+        return None
+    try:
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        if int(meta.get("schema", 0)) != _ROLLING_SCHEMA or str(meta.get("key")) != str(key):
+            return None
+        probabilities = pd.read_parquet(frame_path)
+        ids = frame["match_id"].astype(str)
+        saved = probabilities["match_id"].astype(str)
+        if len(probabilities) != len(frame) or saved.duplicated().any() or set(saved) != set(ids):
+            return None
+        aligned = probabilities.assign(match_id=saved).set_index("match_id").reindex(ids.to_numpy())
+        out = frame.copy()
+        for column in aligned.columns:
+            if column in out.columns:
+                out[column] = aligned[column].to_numpy(dtype=float)
+        steps = pd.DataFrame(meta.get("steps") or [], columns=list(_ROLLING_STEP_COLUMNS))
+        steps["n_history"] = pd.to_numeric(steps["n_history"], errors="coerce").fillna(0).astype(int)
+        steps["matchday"] = steps["matchday"].astype(str)
+        steps["enabled"] = steps["enabled"].fillna("").astype(str)
+    except (OSError, ValueError, KeyError, TypeError, ImportError) as exc:
+        log.warning("persisted rolling recalibration unreadable, recomputing", extra={"path": str(frame_path), "error": str(exc)})
+        return None
+    log.info("rolling recalibration read from disk", extra={"path": str(frame_path), "n_matches": int(len(out)), "key": key})
+    return RollingRecalibration(out, steps)
+
+
+def load_odds_history_frame(odds_dir: Path = ODDS_DIR) -> pd.DataFrame:
+    """The odds history of the completed matches (:func:`odds_history_file`), an empty frame when missing or unreadable."""
+    path = odds_history_file(Path(odds_dir))
+    if not path.is_file():
+        return pd.DataFrame()
+    try:
+        return load_odds_history(path)
+    except (OSError, ValueError, pd.errors.ParserError) as exc:
+        log.warning("odds history unreadable", extra={"path": str(path), "error": str(exc)})
+        return pd.DataFrame()
