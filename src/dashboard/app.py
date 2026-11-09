@@ -906,7 +906,8 @@ def render_ranking_tab(state: PipelineState, girone: Girone | None, section: str
         "Parametri Dixon-Coles: α = forza offensiva, β = solidità difensiva (più alto = subisce meno), γ = vantaggio casa della competizione; indici = exp(parametro). "
         f"Solo le squadre del perimetro {state.season_label} ({perimeter_text(state, section).removeprefix('Perimetro: ').split(' · ')[0]}) nella competizione del dizionario corrente; "
         f"le squadre delle stagioni passate ({state.n_historical_teams}) entrano nella stima solo come avversarie. "
-        "α e β sono centrati per competizione: confronta le squadre dentro la stessa competizione."
+        "α è centrato per competizione (0 = attacco medio); β no: si legge in confronto agli altri β della stessa "
+        "competizione (sopra la loro media = difesa migliore). Confronta le squadre dentro la stessa competizione."
     )
     table = ranking_table(state, girone, section)
     if table.empty:

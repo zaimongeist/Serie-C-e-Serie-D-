@@ -108,9 +108,12 @@ LEGEND: Final[tuple[LegendSection, ...]] = (
             ),
             _e(
                 "β (beta) · Solidità difensiva",
-                "quanto una squadra fa segnare meno della media: più alto = subisce meno (β = +0.3 ≈ 26% di gol subiti in "
-                "meno, β negativo = difesa che concede più della media). Entra nei gol attesi dell'avversario con il segno "
-                "meno (λ = exp(α_casa − β_ospite + γ)).",
+                "quanto una squadra fa segnare poco gli avversari: più alto = subisce meno. Entra nei gol attesi "
+                "dell'avversario con il segno meno (λ = exp(α_casa − β_ospite + γ)). A differenza di α, β NON è centrata "
+                "su zero: la media dei β di una competizione fa da livello base dei gol di quel campionato, quindi il "
+                "valore assoluto non dice nulla e β = 0 non significa \"difesa media\". Leggila in confronto: 0.3 di β in "
+                "più di un'altra squadra della stessa competizione ≈ 26% di gol subiti in meno (exp(−0.3) = 0.74); sopra "
+                "la media dei β del girone = difesa migliore della media, sotto = peggiore.",
             ),
             _e(
                 "γ (gamma) · Vantaggio casa",
@@ -120,8 +123,10 @@ LEGEND: Final[tuple[LegendSection, ...]] = (
             ),
             _e(
                 "Indice Attacco / Indice Difesa",
-                "exp(α) ed exp(β): gli stessi parametri in scala moltiplicativa, 1.00 = media del girone, 1.20 = +20%, "
-                "0.85 = −15%. Più comodi di α e β per farsi un'idea veloce.",
+                "exp(α) ed exp(β): gli stessi parametri in scala moltiplicativa. Indice Attacco 1.00 = attacco medio del "
+                "girone, 1.20 = +20%, 0.85 = −15%. L'Indice Difesa non ha 1.00 come media (β non è centrata): si legge "
+                "per rapporto, se una squadra ha indice difesa 1.20 volte quello di un'altra della stessa competizione, "
+                "a parità di avversario subisce circa 1/1.20 ≈ 17% di gol in meno.",
             ),
             _e(
                 "ρ (rho) · Correlazione bassi punteggi",
